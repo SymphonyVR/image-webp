@@ -1,0 +1,90 @@
+name: Cross-runner libwebp-style coefficient benchmark
+on:
+  push:
+    branches: [ bench-libwebp-coeff-matrix ]
+    paths: [ .github/workflows/bench-libwebp-coeff-matrix.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply and build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD);echo "$BASE" >/tmp/base-sha
+          mkdir -p /tmp/out
+          lscpu | sed -n 's/^Model name:[[:space:]]*//p' >/tmp/out/cpu-${{ matrix.slot }}.txt
+          curl -L --fail -o /tmp/ref.yml https://raw.githubusercontent.com/SymphonyVR/image-webp/9c133b5ccbc8b6cf0298b378d98751e7292a5767/.github/workflows/bench-libwebp-coeff-structure.yml
+          python3 - <<'PY'
+          from pathlib import Path
+          t=Path('/tmp/ref.yml').read_text();k="          python3 - <<'PY'\n";a=t.index(k)+len(k);b=t.index("\n          PY\n",a);Path('/tmp/apply.py').write_text('\n'.join(x[10:] if x.startswith('          ') else x for x in t[a:b].splitlines())+'\n')
+          PY
+          python3 /tmp/apply.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/arithmetic_decoder.rs');s=p.read_text()
+          for d in ('''    // Do not inline this because inlining seems to worsen performance.\n    #[inline(never)]\n    pub(crate) fn read_sign(&mut self) -> BitResult<bool> {\n        if let Some(b) = self.fast().read_sign() {\n            return BitResult::ok(b);\n        }\n\n        self.cold_read_flag()\n    }\n\n''','''    fn read_sign(mut self) -> Option<bool> {\n        let value = self.fast_read_sign();\n        self.commit_if_valid(value)\n    }\n\n'''):
+              if d not in s: raise SystemExit('dead sign wrapper missing')
+              s=s.replace(d,'',1)
+          p.write_text(s)
+          PY
+          cargo fmt;git diff --check;git add src/lossy/mod.rs src/lossy/arithmetic_decoder.rs;git -c user.name=bench -c user.email=bench@example.invalid commit -m candidate;CAND=$(git rev-parse HEAD)
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$CAND"
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};
+          #[inline]fn hb(mut h:u64,b:u8)->u64{h^=b as u64;h.wrapping_mul(1099511628211)}
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut h=1469598103934665603u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{for z in t.to_le_bytes(){h=hb(h,z)}for &z in &b{h=hb(h,z)}},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();for &z in &b{h=hb(h,z)}}h}
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{let m=b.len()/2;s=s.wrapping_add(t as u64)^b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();let m=b.len()/2;s=b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)}black_box(s)}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if mode=="hash"{println!("{:016x}",hash(&d));return}let n:usize=a.next().unwrap().parse().unwrap();for _ in 0..1{black_box(dec(&d))}let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/matrix.rs";(cd "$d"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example matrix);done
+      - name: Run paired benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/119;curl -L --fail --retry 5 -o /tmp/a.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/a.zip -d /tmp/119;I=$(find /tmp/119 -iname '*.webp'|head -n1);B=/tmp/base/target/release/examples/matrix;C=/tmp/cand/target/release/examples/matrix
+          HB=$($B hash "$I");HC=$($C hash "$I");test "$HB" = "$HC";echo "$HB" >/tmp/out/hash-${{ matrix.slot }}.txt;: >/tmp/out/result-${{ matrix.slot }}.tsv
+          for r in {1..7};do if ((r%2));then o='base cand';else o='cand base';fi;for v in $o;do [[ $v == base ]]&&x=$B||x=$C;u=$(taskset -c 0 "$x" bench "$I" 3);printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/out/result-${{ matrix.slot }}.tsv;done;done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slot-${{ matrix.slot }}
+          path: /tmp/out/*
+  aggregate:
+    needs: bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: slot-*
+          path: /tmp/results
+          merge-multiple: true
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          python3 - <<'PY'
+          import pathlib,statistics
+          root=pathlib.Path('/tmp/results');L=['# Cross-runner libwebp-style coefficient benchmark','','- issue119; full output hash equality checked on every runner','- release `target-cpu=native`; CPU 0; 7 alternating paired rounds','', '| Runner | CPU | baseline median | candidate median | paired median | paired range |','|---:|---|---:|---:|---:|---:|']
+          for i in range(1,7):
+              cpu=(root/f'cpu-{i}.txt').read_text().strip();rows=[]
+              for line in (root/f'result-{i}.tsv').read_text().splitlines():
+                  r,v,x=line.split('\t');rows.append((int(r),v,float(x)))
+              b=[x for _,v,x in rows if v=='base'];c=[x for _,v,x in rows if v=='cand'];pairs={}
+              for r,v,x in rows:pairs.setdefault(r,{})[v]=x
+              p=[z['base']/z['cand'] for _,z in sorted(pairs.items())]
+              L.append(f'| {i} | {cpu} | {statistics.median(b):.3f} us | {statistics.median(c):.3f} us | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+          pathlib.Path('benchmark-libwebp-coeff-matrix.md').write_text('\n'.join(L)+'\n')
+          PY
+          git add benchmark-libwebp-coeff-matrix.md;git commit -m 'Record cross-runner coefficient benchmark';git push origin HEAD:bench-libwebp-coeff-matrix
