@@ -1,0 +1,175 @@
+name: Temporary performance benchmark
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/perf-benchmark.yml
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare A/B worktrees
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git fetch origin main performance-optimizations
+          git worktree add /tmp/webp-main origin/main
+          git worktree add /tmp/webp-opt HEAD
+
+          cat >/tmp/decode_bench.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+
+          fn decode_once(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              let mut checksum = 0u64;
+              if decoder.is_animated() {
+                  loop {
+                      match decoder.read_frame(&mut buf) {
+                          Ok(duration) => {
+                              checksum = checksum.wrapping_add(u64::from(duration));
+                              if let Some(&byte) = buf.get(buf.len() / 2) {
+                                  checksum = checksum.wrapping_add(u64::from(byte));
+                              }
+                          }
+                          Err(DecodingError::NoMoreFrames) => break,
+                          Err(err) => panic!("decode failed: {err:?}"),
+                      }
+                  }
+              } else {
+                  decoder.read_image(&mut buf).unwrap();
+                  if let Some(&byte) = buf.get(buf.len() / 2) {
+                      checksum = checksum.wrapping_add(u64::from(byte));
+                  }
+              }
+              black_box(checksum)
+          }
+
+          fn main() {
+              let mut args = std::env::args().skip(1);
+              let path = args.next().unwrap();
+              let iterations: usize = args.next().unwrap().parse().unwrap();
+              let warmups: usize = args.next().unwrap().parse().unwrap();
+              let data = std::fs::read(path).unwrap();
+
+              for _ in 0..warmups {
+                  black_box(decode_once(&data));
+              }
+
+              let start = Instant::now();
+              let mut sum = 0u64;
+              for _ in 0..iterations {
+                  sum = sum.wrapping_add(decode_once(&data));
+              }
+              black_box(sum);
+              let elapsed = start.elapsed();
+              let us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+              println!("{us:.3}");
+          }
+          RS
+
+          for dir in /tmp/webp-main /tmp/webp-opt; do
+            mkdir -p "$dir/examples"
+            cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
+            (cd "$dir" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example decode_bench)
+          done
+
+      - name: Fetch issue 119 workload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/issue119
+          curl -L --fail --retry 3 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/sample.zip -d /tmp/issue119
+          find /tmp/issue119 -type f -iname '*.webp' -print
+          ISSUE119_FILE="$(find /tmp/issue119 -type f -iname '*.webp' | head -n 1)"
+          test -n "$ISSUE119_FILE"
+          echo "ISSUE119_FILE=$ISSUE119_FILE" >> "$GITHUB_ENV"
+
+      - name: Run alternating pinned benchmarks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          MAIN=/tmp/webp-main/target/release/examples/decode_bench
+          OPT=/tmp/webp-opt/target/release/examples/decode_bench
+          RANDOM="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
+          : > /tmp/results.tsv
+
+          # Warm the binaries/filesystem before measured alternating rounds.
+          taskset -c 0 "$MAIN" "$RANDOM" 200 10 >/dev/null
+          taskset -c 0 "$OPT" "$RANDOM" 200 10 >/dev/null
+          taskset -c 0 "$MAIN" "$ISSUE119_FILE" 1 1 >/dev/null
+          taskset -c 0 "$OPT" "$ISSUE119_FILE" 1 1 >/dev/null
+
+          for round in 1 2 3 4 5 6 7; do
+            if (( round % 2 )); then order="main opt"; else order="opt main"; fi
+            for variant in $order; do
+              if [[ "$variant" == main ]]; then bin="$MAIN"; else bin="$OPT"; fi
+              value="$(taskset -c 0 "$bin" "$RANDOM" 1000 0)"
+              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results.tsv
+              value="$(taskset -c 0 "$bin" "$ISSUE119_FILE" 3 0)"
+              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results.tsv
+            done
+          done
+
+          cat /tmp/results.tsv
+
+      - name: Summarize and persist results
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv, statistics, pathlib, subprocess, os
+
+          rows = list(csv.reader(open('/tmp/results.tsv'), delimiter='\t'))
+          groups = {}
+          for workload, round_no, variant, value in rows:
+              groups.setdefault((workload, variant), []).append(float(value))
+
+          def stats(values):
+              med = statistics.median(values)
+              lo, hi = min(values), max(values)
+              return med, lo, hi
+
+          main_sha = subprocess.check_output(['git', '-C', '/tmp/webp-main', 'rev-parse', 'HEAD'], text=True).strip()
+          opt_sha = subprocess.check_output(['git', '-C', '/tmp/webp-opt', 'rev-parse', 'HEAD'], text=True).strip()
+          lines = [
+              '# Controlled decode benchmark', '',
+              f'- main: `{main_sha}`',
+              f'- performance-optimizations baseline: `{opt_sha}`',
+              '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned to CPU 0',
+              '- method: 7 alternating rounds; values are microseconds per full decode', '',
+              '| Workload | main median | optimized median | speedup | main range | optimized range |',
+              '|---|---:|---:|---:|---:|---:|',
+          ]
+          for workload in ['random_lossless', 'issue119']:
+              m = groups[(workload, 'main')]
+              o = groups[(workload, 'opt')]
+              mm, ml, mh = stats(m)
+              om, ol, oh = stats(o)
+              speedup = mm / om
+              lines.append(f'| {workload} | {mm:.3f} us | {om:.3f} us | {speedup:.3f}x | {ml:.3f}–{mh:.3f} | {ol:.3f}–{oh:.3f} |')
+          lines += ['', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode']
+          lines += ['\t'.join(row) for row in rows]
+          lines += ['```', '']
+          pathlib.Path('benchmark-results.md').write_text('\n'.join(lines))
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- benchmark-results.md
+          git commit -m 'Record controlled decode benchmark baseline'
+          git push origin HEAD:performance-optimizations
