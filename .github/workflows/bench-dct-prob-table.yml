@@ -1,0 +1,118 @@
+name: Temporary compact VP8 coefficient probability benchmark
+on:
+  push:
+    branches: [ bench-dct-prob-table ]
+    paths: [ .github/workflows/bench-dct-prob-table.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Record environment and apply candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/mod.rs'); s=p.read_text()
+          block='''type TokenProbTreeNodes = [[[[TreeNode; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];\n\nconst COEFF_PROB_NODES: TokenProbTreeNodes = {\n    let mut output = [[[[TreeNode::UNINIT; 11]; 3]; 8]; 4];\n    let mut i = 0;\n    while i < output.len() {\n        let mut j = 0;\n        while j < output[i].len() {\n            let mut k = 0;\n            while k < output[i][j].len() {\n                output[i][j][k] = tree_nodes_from(DCT_TOKEN_TREE, COEFF_PROBS[i][j][k]);\n                k += 1;\n            }\n            j += 1;\n        }\n        i += 1;\n    }\n    output\n};\n\n'''
+          if block not in s: raise SystemExit('coefficient node table block missing')
+          s=s.replace(block,'',1)
+          for old,new in [
+            ('token_probs: Box<TokenProbTreeNodes>,','token_probs: Box<TokenProbTables>,'),
+            ('token_probs: Box::new(COEFF_PROB_NODES),','token_probs: Box::new(COEFF_PROBS),'),
+            ('self.token_probs[i][j][k][t].prob = v;','self.token_probs[i][j][k][t] = v;'),
+          ]:
+            if old not in s: raise SystemExit(f'missing mod pattern: {old}')
+            s=s.replace(old,new,1)
+          old='''            let tree = &probs[band][complexity];\n\n            let token = decoder\n                .read_with_tree_with_first_node(tree, tree[skip as usize])\n                .or_accumulate(&mut res);\n'''
+          new='''            let token_probs = &probs[band][complexity];\n\n            let token = decoder\n                .read_dct_token_probs(token_probs, skip)\n                .or_accumulate(&mut res);\n'''
+          if old not in s: raise SystemExit('coefficient decode marker missing')
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('src/lossy/arithmetic_decoder.rs'); s=p.read_text()
+          old='use super::TreeNode;'
+          new='''use super::{\n    common::{\n        DCT_0, DCT_1, DCT_2, DCT_3, DCT_4, DCT_CAT1, DCT_CAT2, DCT_CAT3, DCT_CAT4, DCT_CAT5,\n        DCT_CAT6, DCT_EOB,\n    },\n    TreeNode,\n};'''
+          if old not in s: raise SystemExit('import marker missing')
+          s=s.replace(old,new,1)
+
+          marker='''    // This is generic and inlined just to skip the first bounds check.\n'''
+          method='''    #[inline(never)]\n    pub(crate) fn read_dct_token_probs(&mut self, p: &[u8; 11], skip_eob: bool) -> BitResult<i8> {\n        if let Some(v) = self.fast().read_dct_token_probs(p, skip_eob) {\n            return BitResult::ok(v);\n        }\n        self.cold_read_dct_token_probs(p, skip_eob)\n    }\n\n'''+marker
+          if marker not in s: raise SystemExit('public insertion marker missing')
+          s=s.replace(marker,method,1)
+
+          marker='''    fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {\n'''
+          method='''    fn read_dct_token_probs(mut self, p: &[u8; 11], skip_eob: bool) -> Option<i8> {\n        let value = self.fast_read_dct_token_probs(p, skip_eob);\n        self.commit_if_valid(value)\n    }\n\n'''+marker
+          if marker not in s: raise SystemExit('fast wrapper marker missing')
+          s=s.replace(marker,method,1)
+
+          marker='''    #[cold]\n    #[inline(never)]\n    fn cold_read_with_tree(&mut self, tree: &[TreeNode], start: usize) -> BitResult<i8> {\n'''
+          cold='''    #[cold]\n    #[inline(never)]\n    fn cold_read_dct_token_probs(&mut self, p: &[u8; 11], skip_eob: bool) -> BitResult<i8> {\n        let mut res = self.start_accumulated_result();\n        if !skip_eob && !self.cold_read_bit(p[0]).or_accumulate(&mut res) {\n            return self.keep_accumulating(res, DCT_EOB);\n        }\n        if !self.cold_read_bit(p[1]).or_accumulate(&mut res) {\n            return self.keep_accumulating(res, DCT_0);\n        }\n        if !self.cold_read_bit(p[2]).or_accumulate(&mut res) {\n            return self.keep_accumulating(res, DCT_1);\n        }\n        let token = if !self.cold_read_bit(p[3]).or_accumulate(&mut res) {\n            if !self.cold_read_bit(p[4]).or_accumulate(&mut res) { DCT_2 }\n            else if !self.cold_read_bit(p[5]).or_accumulate(&mut res) { DCT_3 }\n            else { DCT_4 }\n        } else if !self.cold_read_bit(p[6]).or_accumulate(&mut res) {\n            if !self.cold_read_bit(p[7]).or_accumulate(&mut res) { DCT_CAT1 } else { DCT_CAT2 }\n        } else if !self.cold_read_bit(p[8]).or_accumulate(&mut res) {\n            if !self.cold_read_bit(p[9]).or_accumulate(&mut res) { DCT_CAT3 } else { DCT_CAT4 }\n        } else if !self.cold_read_bit(p[10]).or_accumulate(&mut res) { DCT_CAT5 } else { DCT_CAT6 };\n        self.keep_accumulating(res, token)\n    }\n\n'''+marker
+          if marker not in s: raise SystemExit('cold insertion marker missing')
+          s=s.replace(marker,cold,1)
+
+          marker='''    fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {\n'''
+          fast='''    fn fast_read_dct_token_probs(&mut self, p: &[u8; 11], skip_eob: bool) -> i8 {\n        if !skip_eob && !self.fast_read_bit(p[0]) { return DCT_EOB; }\n        if !self.fast_read_bit(p[1]) { return DCT_0; }\n        if !self.fast_read_bit(p[2]) { return DCT_1; }\n        if !self.fast_read_bit(p[3]) {\n            if !self.fast_read_bit(p[4]) { return DCT_2; }\n            return if !self.fast_read_bit(p[5]) { DCT_3 } else { DCT_4 };\n        }\n        if !self.fast_read_bit(p[6]) {\n            return if !self.fast_read_bit(p[7]) { DCT_CAT1 } else { DCT_CAT2 };\n        }\n        if !self.fast_read_bit(p[8]) {\n            return if !self.fast_read_bit(p[9]) { DCT_CAT3 } else { DCT_CAT4 };\n        }\n        if !self.fast_read_bit(p[10]) { DCT_CAT5 } else { DCT_CAT6 }\n    }\n\n'''+marker
+          if marker not in s: raise SystemExit('fast insertion marker missing')
+          p.write_text(s.replace(marker,fast,1))
+          PY
+          cargo fmt
+          git diff --check
+          git add src/lossy/mod.rs src/lossy/arithmetic_decoder.rs
+          git commit -m 'Store VP8 coefficient probabilities compactly'
+          echo "CAND=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Verify candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Build A/B harnesses
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASE"; git worktree add --detach /tmp/cand "$CAND"
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};
+          fn one(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>s=s.wrapping_add(t as u64).wrapping_add(b[b.len()/2]as u64),Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();s=b[b.len()/2]as u64}black_box(s)}
+          fn main(){let mut a=std::env::args().skip(1);let p=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let w:usize=a.next().unwrap().parse().unwrap();let d=std::fs::read(p).unwrap();for _ in 0..w{black_box(one(&d));}let t=Instant::now();let mut s=0u64;for _ in 0..n{s^=one(&d);}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/b.rs";(cd "$d"&&cargo build --release --example b);done
+      - name: Fetch fixtures and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 5 -o /tmp/119.zip https://github.com/user-attachments/files/17482915/sample.zip; unzip -q /tmp/119.zip -d /tmp/119
+          curl -L --fail --retry 5 -o /tmp/136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip; unzip -q /tmp/136.zip -d /tmp/136
+          I119=$(find /tmp/119 -iname '*.webp'|head -n1);I136=$(find /tmp/136 -iname '*.webp'|head -n1)
+          B=/tmp/base/target/release/examples/b;C=/tmp/cand/target/release/examples/b;: >/tmp/r.tsv
+          taskset -c 0 "$B" "$I119" 1 1 >/dev/null;taskset -c 0 "$C" "$I119" 1 1 >/dev/null
+          for r in {1..11};do if ((r%2));then o='base cand';else o='cand base';fi;for v in $o;do [[ $v == base ]]&&x=$B||x=$C;a=$(taskset -c 0 "$x" "$I119" 3 0);printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$a">>/tmp/r.tsv;a=$(taskset -c 0 "$x" "$I136" 16 0);printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$a">>/tmp/r.tsv;done;done
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# Compact VP8 coefficient probability benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`','- raw 11-byte probability rows + fixed DCT topology; safe Rust; MSRV 1.80.1','','| Workload | baseline | candidate | ratio | paired median | range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('issue119','issue136'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {b/c:.3f}x | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+          pathlib.Path('/tmp/out.md').write_text('\n'.join(L+['','```tsv']+['\t'.join(x) for x in rows]+['```','']))
+          PY
+          git reset --hard "$BASE";cp /tmp/out.md benchmark-dct-prob-table.md;git add benchmark-dct-prob-table.md;git commit -m 'Record compact coefficient probability benchmark';git push origin HEAD:bench-dct-prob-table
