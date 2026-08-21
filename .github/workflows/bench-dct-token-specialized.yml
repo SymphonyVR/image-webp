@@ -1,0 +1,103 @@
+name: Temporary specialized VP8 DCT token benchmark
+on:
+  push:
+    branches: [ bench-dct-token-specialized ]
+    paths: [ .github/workflows/bench-dct-token-specialized.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Record environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASELINE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+      - name: Apply specialized DCT tree candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/arithmetic_decoder.rs'); s=p.read_text()
+          marker='''    // This is generic and inlined just to skip the first bounds check.\n    #[inline]\n    pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {\n'''
+          method='''    // The coefficient token tree has fixed topology but frame-specific probabilities.\n    // Decode that topology directly while retaining the same speculative-reader fallback.\n    #[inline(never)]\n    pub(crate) fn read_dct_token(\n        &mut self,\n        tree: &[TreeNode; 11],\n        skip_eob: bool,\n    ) -> BitResult<i8> {\n        if let Some(v) = self.fast().read_dct_token(tree, skip_eob) {\n            return BitResult::ok(v);\n        }\n        self.cold_read_with_tree(tree, skip_eob as usize)\n    }\n\n'''+marker
+          if marker not in s: raise SystemExit('public tree marker not found')
+          s=s.replace(marker,method,1)
+          marker2='''    fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {\n'''
+          fastwrap='''    fn read_dct_token(mut self, tree: &[TreeNode; 11], skip_eob: bool) -> Option<i8> {\n        let value = self.fast_read_dct_token(tree, skip_eob);\n        self.commit_if_valid(value)\n    }\n\n'''+marker2
+          if marker2 not in s: raise SystemExit('fast wrapper marker not found')
+          s=s.replace(marker2,fastwrap,1)
+          marker3='''    fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {\n'''
+          helper='''    fn fast_read_dct_token(&mut self, tree: &[TreeNode; 11], skip_eob: bool) -> i8 {\n        if !skip_eob && !self.fast_read_bit(tree[0].prob) {\n            return TreeNode::value_from_branch(tree[0].left);\n        }\n        if !self.fast_read_bit(tree[1].prob) {\n            return TreeNode::value_from_branch(tree[1].left);\n        }\n        if !self.fast_read_bit(tree[2].prob) {\n            return TreeNode::value_from_branch(tree[2].left);\n        }\n        if !self.fast_read_bit(tree[3].prob) {\n            if !self.fast_read_bit(tree[4].prob) {\n                return TreeNode::value_from_branch(tree[4].left);\n            }\n            let node = tree[5];\n            let branch = if self.fast_read_bit(node.prob) { node.right } else { node.left };\n            return TreeNode::value_from_branch(branch);\n        }\n        if !self.fast_read_bit(tree[6].prob) {\n            let node = tree[7];\n            let branch = if self.fast_read_bit(node.prob) { node.right } else { node.left };\n            return TreeNode::value_from_branch(branch);\n        }\n        if !self.fast_read_bit(tree[8].prob) {\n            let node = tree[9];\n            let branch = if self.fast_read_bit(node.prob) { node.right } else { node.left };\n            return TreeNode::value_from_branch(branch);\n        }\n        let node = tree[10];\n        let branch = if self.fast_read_bit(node.prob) { node.right } else { node.left };\n        TreeNode::value_from_branch(branch)\n    }\n\n'''+marker3
+          if marker3 not in s: raise SystemExit('fast tree marker not found')
+          p.write_text(s.replace(marker3,helper,1))
+
+          p=Path('src/lossy/mod.rs'); s=p.read_text()
+          old='''            let token = decoder\n                .read_with_tree_with_first_node(tree, tree[skip as usize])\n                .or_accumulate(&mut res);\n'''
+          new='''            let token = decoder.read_dct_token(tree, skip).or_accumulate(&mut res);\n'''
+          if old not in s: raise SystemExit('coefficient call marker not found')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git diff --check
+          git add src/lossy/arithmetic_decoder.rs src/lossy/mod.rs
+          git commit -m 'Specialize VP8 coefficient token tree decoding'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Build A/B
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASELINE_SHA"; git worktree add --detach /tmp/cand "$CANDIDATE_SHA"
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};
+          fn one(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>s=s.wrapping_add(t as u64).wrapping_add(b[b.len()/2]as u64),Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();s=b[b.len()/2]as u64}black_box(s)}
+          fn main(){let mut a=std::env::args().skip(1);let p=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let w:usize=a.next().unwrap().parse().unwrap();let d=std::fs::read(p).unwrap();for _ in 0..w{black_box(one(&d));}let t=Instant::now();let mut s=0;for _ in 0..n{s^=one(&d);}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/b.rs";(cd "$d"&&cargo build --release --example b);done
+      - name: Fetch fixtures
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 3 -o /tmp/119.zip https://github.com/user-attachments/files/17482915/sample.zip; unzip -q /tmp/119.zip -d /tmp/119
+          curl -L --fail --retry 3 -o /tmp/136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip; unzip -q /tmp/136.zip -d /tmp/136
+          echo "I119=$(find /tmp/119 -iname '*.webp'|head -n1)" >> "$GITHUB_ENV"; echo "I136=$(find /tmp/136 -iname '*.webp'|head -n1)" >> "$GITHUB_ENV"
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          B=/tmp/base/target/release/examples/b;C=/tmp/cand/target/release/examples/b;: >/tmp/r.tsv
+          taskset -c 0 "$B" "$I119" 1 1 >/dev/null;taskset -c 0 "$C" "$I119" 1 1 >/dev/null
+          for r in {1..11};do if ((r%2));then o='baseline candidate';else o='candidate baseline';fi;for v in $o;do [[ $v == baseline ]]&&x=$B||x=$C;a=$(taskset -c 0 "$x" "$I119" 3 0);printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$a">>/tmp/r.tsv;a=$(taskset -c 0 "$x" "$I136" 20 0);printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$a">>/tmp/r.tsv;done;done
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# Specialized VP8 DCT token benchmark','',f'- baseline: `{os.environ["BASELINE_SHA"]}`',f'- candidate: `{os.environ["CANDIDATE_SHA"]}`',f'- CPU: `{os.environ.get("CPU_MODEL")}`','- safe Rust; MSRV 1.80.1; normal release target','','| Workload | baseline | candidate | ratio | paired median | range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('issue119','issue136'):
+            b=statistics.median(g[w,'baseline']);c=statistics.median(g[w,'candidate']);p=[z['baseline']/z['candidate'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {b/c:.3f}x | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+          pathlib.Path('/tmp/out.md').write_text('\n'.join(L+['','```tsv','workload\tround\tvariant\tus']+['\t'.join(x) for x in rows]+['```','']))
+          PY
+          git reset --hard "$BASELINE_SHA";cp /tmp/out.md benchmark-dct-token-specialized.md;git add benchmark-dct-token-specialized.md;git commit -m 'Record specialized VP8 DCT token benchmark';git push origin HEAD:bench-dct-token-specialized
