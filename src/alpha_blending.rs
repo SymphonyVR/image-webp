@@ -32,13 +32,19 @@ fn blend_pixel_nonpremult(src: u32, dst: u32) -> u32 {
         dst
     } else {
         let dst_a = ((dst >> channel_shift(3)) & 0xff) as u8;
-        // Approximate integer arithmetic for: dst_factor_a = (dst_a * (255 - src_a)) / 255
-        // libwebp used the following formula here:
-        //let dst_factor_a = (dst_a as u32 * (256 - src_a as u32)) >> 8;
-        // however, we've found that we can use a more precise approximation without losing performance:
-        let dst_factor_a = div_by_255(u32::from(dst_a) * (255 - u32::from(src_a)));
-        let blend_a = u32::from(src_a) + dst_factor_a;
-        let scale = (1u32 << 24) / blend_a;
+        let (dst_factor_a, blend_a, scale) = if dst_a == 255 {
+            // For an opaque destination, div_by_255(255 * (255 - src_a)) is
+            // exactly 255 - src_a and the resulting alpha is always 255.
+            let dst_factor_a = 255 - u32::from(src_a);
+            (dst_factor_a, 255, (1u32 << 24) / 255)
+        } else {
+            // Approximate integer arithmetic for:
+            // dst_factor_a = (dst_a * (255 - src_a)) / 255
+            let dst_factor_a = div_by_255(u32::from(dst_a) * (255 - u32::from(src_a)));
+            let blend_a = u32::from(src_a) + dst_factor_a;
+            let scale = (1u32 << 24) / blend_a;
+            (dst_factor_a, blend_a, scale)
+        };
 
         let blend_r =
             blend_channel_nonpremult(src, src_a, dst, dst_factor_a as u8, scale, channel_shift(0));
