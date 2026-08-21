@@ -1,0 +1,68 @@
+name: Diagnose libwebp-style coefficient benchmark
+on:
+  push:
+    branches: [ bench-dct-value-fused-v2 ]
+    paths: [ .github/workflows/diagnose-libwebp-coeff.yml ]
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Apply candidate and capture verification
+        shell: bash
+        run: |
+          set -u
+          BASE=$(git rev-parse HEAD)
+          CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+          text=Path('.github/workflows/bench-libwebp-coeff-structure.yml').read_text()
+          start=text.index("          python3 - <<'PY'\n") + len("          python3 - <<'PY'\n")
+          end=text.index("\n          PY\n", start)
+          body=text[start:end]
+          body='\n'.join(line[10:] if line.startswith('          ') else line for line in body.splitlines())
+          Path('/tmp/apply.py').write_text(body+'\n')
+          PY
+
+          set +e
+          python3 /tmp/apply.py >/tmp/apply.log 2>&1
+          APPLY=$?
+          if [ "$APPLY" -eq 0 ]; then cargo fmt >/tmp/fmt.log 2>&1; FMT=$?; else FMT=99; : >/tmp/fmt.log; fi
+          if [ "$APPLY" -eq 0 ] && [ "$FMT" -eq 0 ]; then cargo test -v >/tmp/test.log 2>&1; TEST=$?; else TEST=99; : >/tmp/test.log; fi
+          if [ "$APPLY" -eq 0 ] && [ "$FMT" -eq 0 ]; then cargo clippy --all-features -- -D warnings >/tmp/clippy.log 2>&1; CLIPPY=$?; else CLIPPY=99; : >/tmp/clippy.log; fi
+          rustup toolchain install 1.80.1 --profile minimal >/tmp/rustup.log 2>&1
+          if [ "$APPLY" -eq 0 ] && [ "$FMT" -eq 0 ]; then cargo +1.80.1 build -v >/tmp/msrv.log 2>&1; MSRV=$?; else MSRV=99; : >/tmp/msrv.log; fi
+          set -e
+
+          git reset --hard "$BASE"
+          {
+            echo '# Libwebp-style VP8 coefficient diagnostic'
+            echo
+            echo "- CPU: \`$CPU\`"
+            echo "- apply: \`$APPLY\`"
+            echo "- fmt: \`$FMT\`"
+            echo "- tests: \`$TEST\`"
+            echo "- clippy: \`$CLIPPY\`"
+            echo "- MSRV build: \`$MSRV\`"
+            for f in apply fmt test clippy msrv; do
+              echo
+              echo "## $f tail"
+              echo '```text'
+              tail -n 80 "/tmp/$f.log" 2>/dev/null || true
+              echo '```'
+            done
+          } > diagnostic-libwebp-coeff.md
+          git add diagnostic-libwebp-coeff.md
+          git commit -m 'Record libwebp-style coefficient diagnostic'
+          git push origin HEAD:bench-dct-value-fused-v2
