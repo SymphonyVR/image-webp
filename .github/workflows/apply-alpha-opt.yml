@@ -1,4 +1,4 @@
-name: Temporary alpha-plane optimization
+name: Temporary alpha blending benchmark
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  optimize-and-benchmark:
+  benchmark:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,95 +20,24 @@ jobs:
         with:
           components: clippy,rustfmt
 
-      - name: Apply reconstructed alpha-plane optimization
+      - name: Verify candidate
         shell: bash
         run: |
           set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          decoder_path = Path('src/decoder.rs')
-          decoder = decoder_path.read_text()
-          decoder = decoder.replace(
-              'use crate::extended::{self, get_alpha_predictor, read_alpha_chunk, WebPExtendedInfo};',
-              'use crate::extended::{self, read_alpha_chunk, WebPExtendedInfo};',
-          )
-
-          marker = 'use super::lossy::Vp8Decoder;\n\n'
-          helper = '''use super::lossy::Vp8Decoder;\n\n#[inline]\nfn copy_alpha_plane(rgba: &mut [u8], alpha: &[u8]) {\n    assert_eq!(rgba.len(), alpha.len() * 4);\n    for (pixel, alpha) in rgba.chunks_exact_mut(4).zip(alpha.iter().copied()) {\n        pixel[3] = alpha;\n    }\n}\n\n'''
-          if marker not in decoder:
-              raise SystemExit('decoder helper insertion marker not found')
-          decoder = decoder.replace(marker, helper, 1)
-
-          old_still = '''                for y in 0..frame.height {\n                    for x in 0..frame.width {\n                        let predictor: u8 = get_alpha_predictor(\n                            x.into(),\n                            y.into(),\n                            frame.width.into(),\n                            alpha_chunk.filtering_method,\n                            buf,\n                        );\n\n                        let alpha_index =\n                            usize::from(y) * usize::from(frame.width) + usize::from(x);\n                        let buffer_index = alpha_index * 4 + 3;\n\n                        buf[buffer_index] = predictor.wrapping_add(alpha_chunk.data[alpha_index]);\n                    }\n                }\n'''
-          if old_still not in decoder:
-              raise SystemExit('still alpha loop not found')
-          decoder = decoder.replace(old_still, '                copy_alpha_plane(buf, &alpha_chunk.data);\n', 1)
-
-          old_animation = '''                for y in 0..frame.height {\n                    for x in 0..frame.width {\n                        let predictor: u8 = get_alpha_predictor(\n                            x.into(),\n                            y.into(),\n                            frame.width.into(),\n                            alpha_chunk.filtering_method,\n                            &rgba_frame,\n                        );\n\n                        let alpha_index =\n                            usize::from(y) * usize::from(frame.width) + usize::from(x);\n                        let buffer_index = alpha_index * 4 + 3;\n\n                        rgba_frame[buffer_index] =\n                            predictor.wrapping_add(alpha_chunk.data[alpha_index]);\n                    }\n                }\n'''
-          if old_animation not in decoder:
-              raise SystemExit('animation alpha loop not found')
-          decoder = decoder.replace(
-              old_animation,
-              '                copy_alpha_plane(&mut rgba_frame, &alpha_chunk.data);\n',
-              1,
-          )
-          decoder_path.write_text(decoder)
-
-          extended_path = Path('src/extended.rs')
-          extended = extended_path.read_text()
-          start = extended.find('#[inline]\npub(crate) fn get_alpha_predictor(')
-          end = extended.find('fn reconstruct_alpha', start)
-          if start < 0 or end < 0:
-              raise SystemExit('alpha predictor function not found')
-          extended = extended[:start] + extended[end:]
-
-          field = '    pub(crate) filtering_method: FilteringMethod,\n'
-          if field not in extended:
-              raise SystemExit('AlphaChunk filtering_method field not found')
-          extended = extended.replace(field, '', 1)
-
-          old_chunk = '''    let chunk = AlphaChunk {\n        _preprocessing: preprocessing,\n        // The plane has already been reconstructed contiguously above. Keep\n        // the existing decoder loop compatible by making its predictor a no-op.\n        filtering_method: FilteringMethod::None,\n        data,\n    };\n'''
-          new_chunk = '''    let chunk = AlphaChunk {\n        _preprocessing: preprocessing,\n        data,\n    };\n'''
-          if old_chunk not in extended:
-              raise SystemExit('AlphaChunk construction not found')
-          extended = extended.replace(old_chunk, new_chunk, 1)
-          extended_path.write_text(extended)
-          PY
-
-          cargo fmt
-          git diff --check
-          git diff -- src/decoder.rs src/extended.rs
-
-      - name: Verify correctness and lint
-        shell: bash
-        run: |
-          set -euxo pipefail
-          # Match the repository's stable CI behavior. `_benchmarks` is an
-          # internal nightly-only feature and must not be enabled for cargo test.
           cargo test -v
           cargo doc -v
           cargo clippy --all-features -- -D warnings
           cargo fmt -- --check
 
-      - name: Commit optimization locally
+      - name: Prepare controlled worktrees
         shell: bash
         run: |
           set -euxo pipefail
-          git config user.name SymphonyVR
-          git config user.email 47229536+SymphonyVR@users.noreply.github.com
-          git add -- src/decoder.rs src/extended.rs
-          git commit -m 'Write reconstructed alpha planes directly'
-
-      - name: Prepare three-way benchmark
-        shell: bash
-        run: |
-          set -euxo pipefail
-          BASELINE=362dc4f475a69c258eee78c7e882d0b4b2f8adb0
+          BASELINE=f0dd1dcd1a1788668b3f12c13e4759d60679eaf4
           git fetch origin main
           git worktree add --detach /tmp/webp-main origin/main
           git worktree add --detach /tmp/webp-base "$BASELINE"
-          git worktree add --detach /tmp/webp-alpha HEAD
+          git worktree add --detach /tmp/webp-inline HEAD
 
           cat >/tmp/decode_bench.rs <<'RS'
           use image_webp::{DecodingError, WebPDecoder};
@@ -148,23 +77,20 @@ jobs:
               let iterations: usize = args.next().unwrap().parse().unwrap();
               let warmups: usize = args.next().unwrap().parse().unwrap();
               let data = std::fs::read(path).unwrap();
-
               for _ in 0..warmups {
                   black_box(decode_once(&data));
               }
-
               let start = Instant::now();
               let mut sum = 0u64;
               for _ in 0..iterations {
                   sum = sum.wrapping_add(decode_once(&data));
               }
               black_box(sum);
-              let us = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
-              println!("{us:.3}");
+              println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64);
           }
           RS
 
-          for dir in /tmp/webp-main /tmp/webp-base /tmp/webp-alpha; do
+          for dir in /tmp/webp-main /tmp/webp-base /tmp/webp-inline; do
             mkdir -p "$dir/examples"
             cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
             (cd "$dir" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example decode_bench)
@@ -181,84 +107,78 @@ jobs:
           test -n "$ISSUE119_FILE"
           echo "ISSUE119_FILE=$ISSUE119_FILE" >> "$GITHUB_ENV"
 
-      - name: Run three-way alternating benchmarks
+      - name: Run rotating benchmarks
         shell: bash
         run: |
           set -euxo pipefail
           MAIN=/tmp/webp-main/target/release/examples/decode_bench
           BASE=/tmp/webp-base/target/release/examples/decode_bench
-          ALPHA=/tmp/webp-alpha/target/release/examples/decode_bench
+          INLINE=/tmp/webp-inline/target/release/examples/decode_bench
           RANDOM_FILE="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
-          : > /tmp/results-alpha.tsv
+          : > /tmp/results-inline.tsv
 
-          for bin in "$MAIN" "$BASE" "$ALPHA"; do
+          for bin in "$MAIN" "$BASE" "$INLINE"; do
             taskset -c 0 "$bin" "$RANDOM_FILE" 200 10 >/dev/null
             taskset -c 0 "$bin" "$ISSUE119_FILE" 1 1 >/dev/null
           done
 
           for round in 1 2 3 4 5 6 7; do
             case $((round % 3)) in
-              1) order="main baseline alpha" ;;
-              2) order="baseline alpha main" ;;
-              0) order="alpha main baseline" ;;
+              1) order="main baseline inline" ;;
+              2) order="baseline inline main" ;;
+              0) order="inline main baseline" ;;
             esac
             for variant in $order; do
               case "$variant" in
                 main) bin="$MAIN" ;;
                 baseline) bin="$BASE" ;;
-                alpha) bin="$ALPHA" ;;
+                inline) bin="$INLINE" ;;
               esac
               value="$(taskset -c 0 "$bin" "$RANDOM_FILE" 1000 0)"
-              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-alpha.tsv
+              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-inline.tsv
               value="$(taskset -c 0 "$bin" "$ISSUE119_FILE" 3 0)"
-              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-alpha.tsv
+              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-inline.tsv
             done
           done
-          cat /tmp/results-alpha.tsv
+          cat /tmp/results-inline.tsv
 
-      - name: Persist optimization and benchmark
+      - name: Persist benchmark
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           import csv, statistics, pathlib, subprocess
-
-          rows = list(csv.reader(open('/tmp/results-alpha.tsv'), delimiter='\t'))
+          rows = list(csv.reader(open('/tmp/results-inline.tsv'), delimiter='\t'))
           groups = {}
           for workload, round_no, variant, value in rows:
               groups.setdefault((workload, variant), []).append(float(value))
-
-          def median(values):
-              return statistics.median(values)
-
+          med = lambda w, v: statistics.median(groups[(w, v)])
           shas = {
               'main': subprocess.check_output(['git', '-C', '/tmp/webp-main', 'rev-parse', 'HEAD'], text=True).strip(),
               'baseline': subprocess.check_output(['git', '-C', '/tmp/webp-base', 'rev-parse', 'HEAD'], text=True).strip(),
-              'alpha': subprocess.check_output(['git', '-C', '/tmp/webp-alpha', 'rev-parse', 'HEAD'], text=True).strip(),
+              'inline': subprocess.check_output(['git', '-C', '/tmp/webp-inline', 'rev-parse', 'HEAD'], text=True).strip(),
           }
           lines = [
-              '# Reconstructed alpha-plane benchmark', '',
+              '# Alpha blending inline benchmark', '',
               f'- main: `{shas["main"]}`',
-              f'- pre-change performance baseline: `{shas["baseline"]}`',
-              f'- direct alpha-plane write: `{shas["alpha"]}`',
+              f'- direct-alpha baseline: `{shas["baseline"]}`',
+              f'- inline candidate: `{shas["inline"]}`',
               '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned to CPU 0',
               '- method: 7 rotating-order rounds; values are microseconds per full decode', '',
-              '| Workload | main median | baseline median | alpha median | branch vs main | alpha vs baseline |',
+              '| Workload | main median | baseline median | inline median | branch vs main | inline vs baseline |',
               '|---|---:|---:|---:|---:|---:|',
           ]
           for workload in ['random_lossless', 'issue119']:
-              mm = median(groups[(workload, 'main')])
-              bm = median(groups[(workload, 'baseline')])
-              am = median(groups[(workload, 'alpha')])
-              lines.append(
-                  f'| {workload} | {mm:.3f} us | {bm:.3f} us | {am:.3f} us | {mm/am:.3f}x | {bm/am:.3f}x |'
-              )
+              mm, bm, im = med(workload, 'main'), med(workload, 'baseline'), med(workload, 'inline')
+              lines.append(f'| {workload} | {mm:.3f} us | {bm:.3f} us | {im:.3f} us | {mm/im:.3f}x | {bm/im:.3f}x |')
           lines += ['', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode']
           lines += ['\t'.join(row) for row in rows]
           lines += ['```', '']
-          pathlib.Path('benchmark-alpha-plane.md').write_text('\n'.join(lines))
+          pathlib.Path('benchmark-alpha-inline.md').write_text('\n'.join(lines))
           PY
 
-          git add -- benchmark-alpha-plane.md
-          git commit -m 'Record reconstructed alpha-plane benchmark'
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- benchmark-alpha-inline.md
+          git commit -m 'Record alpha blending inline benchmark'
           git push origin HEAD:performance-optimizations
