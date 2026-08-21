@@ -35,7 +35,7 @@ jobs:
           )
 
           marker = 'use super::lossy::Vp8Decoder;\n\n'
-          helper = '''use super::lossy::Vp8Decoder;\n\n#[inline]\nfn copy_alpha_plane(rgba: &mut [u8], alpha: &[u8]) {\n    debug_assert_eq!(rgba.len(), alpha.len() * 4);\n    for (pixel, alpha) in rgba.chunks_exact_mut(4).zip(alpha.iter().copied()) {\n        pixel[3] = alpha;\n    }\n}\n\n'''
+          helper = '''use super::lossy::Vp8Decoder;\n\n#[inline]\nfn copy_alpha_plane(rgba: &mut [u8], alpha: &[u8]) {\n    assert_eq!(rgba.len(), alpha.len() * 4);\n    for (pixel, alpha) in rgba.chunks_exact_mut(4).zip(alpha.iter().copied()) {\n        pixel[3] = alpha;\n    }\n}\n\n'''
           if marker not in decoder:
               raise SystemExit('decoder helper insertion marker not found')
           decoder = decoder.replace(marker, helper, 1)
@@ -62,10 +62,12 @@ jobs:
           if start < 0 or end < 0:
               raise SystemExit('alpha predictor function not found')
           extended = extended[:start] + extended[end:]
+
           field = '    pub(crate) filtering_method: FilteringMethod,\n'
           if field not in extended:
               raise SystemExit('AlphaChunk filtering_method field not found')
           extended = extended.replace(field, '', 1)
+
           old_chunk = '''    let chunk = AlphaChunk {\n        _preprocessing: preprocessing,\n        // The plane has already been reconstructed contiguously above. Keep\n        // the existing decoder loop compatible by making its predictor a no-op.\n        filtering_method: FilteringMethod::None,\n        data,\n    };\n'''
           new_chunk = '''    let chunk = AlphaChunk {\n        _preprocessing: preprocessing,\n        data,\n    };\n'''
           if old_chunk not in extended:
@@ -73,6 +75,7 @@ jobs:
           extended = extended.replace(old_chunk, new_chunk, 1)
           extended_path.write_text(extended)
           PY
+
           cargo fmt
           git diff --check
           git diff -- src/decoder.rs src/extended.rs
@@ -81,7 +84,10 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          cargo test --all-features
+          # Match the repository's stable CI behavior. `_benchmarks` is an
+          # internal nightly-only feature and must not be enabled for cargo test.
+          cargo test -v
+          cargo doc -v
           cargo clippy --all-features -- -D warnings
           cargo fmt -- --check
 
@@ -93,7 +99,6 @@ jobs:
           git config user.email 47229536+SymphonyVR@users.noreply.github.com
           git add -- src/decoder.rs src/extended.rs
           git commit -m 'Write reconstructed alpha planes directly'
-          echo "OPT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Prepare three-way benchmark
         shell: bash
@@ -143,9 +148,11 @@ jobs:
               let iterations: usize = args.next().unwrap().parse().unwrap();
               let warmups: usize = args.next().unwrap().parse().unwrap();
               let data = std::fs::read(path).unwrap();
+
               for _ in 0..warmups {
                   black_box(decode_once(&data));
               }
+
               let start = Instant::now();
               let mut sum = 0u64;
               for _ in 0..iterations {
@@ -209,7 +216,7 @@ jobs:
           done
           cat /tmp/results-alpha.tsv
 
-      - name: Persist incremental benchmark
+      - name: Persist optimization and benchmark
         shell: bash
         run: |
           set -euxo pipefail
@@ -221,8 +228,8 @@ jobs:
           for workload, round_no, variant, value in rows:
               groups.setdefault((workload, variant), []).append(float(value))
 
-          def stats(values):
-              return statistics.median(values), min(values), max(values)
+          def median(values):
+              return statistics.median(values)
 
           shas = {
               'main': subprocess.check_output(['git', '-C', '/tmp/webp-main', 'rev-parse', 'HEAD'], text=True).strip(),
@@ -240,9 +247,9 @@ jobs:
               '|---|---:|---:|---:|---:|---:|',
           ]
           for workload in ['random_lossless', 'issue119']:
-              mm, _, _ = stats(groups[(workload, 'main')])
-              bm, _, _ = stats(groups[(workload, 'baseline')])
-              am, _, _ = stats(groups[(workload, 'alpha')])
+              mm = median(groups[(workload, 'main')])
+              bm = median(groups[(workload, 'baseline')])
+              am = median(groups[(workload, 'alpha')])
               lines.append(
                   f'| {workload} | {mm:.3f} us | {bm:.3f} us | {am:.3f} us | {mm/am:.3f}x | {bm/am:.3f}x |'
               )
