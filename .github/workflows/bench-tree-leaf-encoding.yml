@@ -1,0 +1,156 @@
+name: Temporary VP8 tree leaf benchmark
+
+on:
+  push:
+    branches: [ bench-tree-leaf-encoding-v5 ]
+    paths:
+      - .github/workflows/bench-tree-leaf-encoding.yml
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Record baseline and CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASELINE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          echo "CPU_COUNT=$(nproc)" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          lscpu
+
+      - name: Apply direct leaf-bit candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/arithmetic_decoder.rs')
+          s=p.read_text()
+          old='''            let i = if b { node.right } else { node.left };\n            let Some(next_node) = tree.get(usize::from(i)) else {\n                return TreeNode::value_from_branch(i);\n            };\n            node = *next_node;\n'''
+          new='''            let i = if b { node.right } else { node.left };\n            if i & 0x80 != 0 {\n                return TreeNode::value_from_branch(i);\n            }\n            node = tree[usize::from(i)];\n'''
+          if old not in s:
+              raise SystemExit('fast tree pattern not found')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git diff --check
+          git add src/lossy/arithmetic_decoder.rs
+          git commit -m 'Use encoded leaf bit in VP8 tree decoder'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+
+      - name: Prepare A/B binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/webp-base "$BASELINE_SHA"
+          git worktree add --detach /tmp/webp-cand "$CANDIDATE_SHA"
+          cat >/tmp/decode_bench.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+          fn once(data:&[u8])->u64 {
+              let mut d=WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut out=vec![0; d.output_buffer_size().unwrap()];
+              let mut sum=0u64;
+              if d.is_animated() {
+                  loop { match d.read_frame(&mut out) {
+                      Ok(t)=>{sum=sum.wrapping_add(t as u64).wrapping_add(out[out.len()/2] as u64)},
+                      Err(DecodingError::NoMoreFrames)=>break,
+                      Err(e)=>panic!("{e:?}"),
+                  }}
+              } else { d.read_image(&mut out).unwrap(); sum=out[out.len()/2] as u64; }
+              black_box(sum)
+          }
+          fn main(){
+              let mut a=std::env::args().skip(1);
+              let path=a.next().unwrap(); let n:usize=a.next().unwrap().parse().unwrap(); let warm:usize=a.next().unwrap().parse().unwrap();
+              let data=std::fs::read(path).unwrap();
+              for _ in 0..warm { black_box(once(&data)); }
+              let t=Instant::now(); let mut s=0u64; for _ in 0..n {s=s.wrapping_add(once(&data));} black_box(s);
+              println!("{:.3}", t.elapsed().as_secs_f64()*1_000_000.0/n as f64);
+          }
+          RS
+          for dir in /tmp/webp-base /tmp/webp-cand; do
+            mkdir -p "$dir/examples"; cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
+            (cd "$dir" && cargo build --release --example decode_bench)
+          done
+
+      - name: Fetch fixtures
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/i119 /tmp/i136
+          curl -L --fail --retry 3 -o /tmp/i119.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/i119.zip -d /tmp/i119
+          curl -L --fail --retry 3 -o /tmp/i136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip
+          unzip -q /tmp/i136.zip -d /tmp/i136
+          echo "I119=$(find /tmp/i119 -type f -iname '*.webp' | head -n1)" >> "$GITHUB_ENV"
+          echo "I136=$(find /tmp/i136 -type f -iname '*.webp' | head -n1)" >> "$GITHUB_ENV"
+
+      - name: Run alternating A/B
+        shell: bash
+        run: |
+          set -euxo pipefail
+          B=/tmp/webp-base/target/release/examples/decode_bench
+          C=/tmp/webp-cand/target/release/examples/decode_bench
+          : >/tmp/results.tsv
+          taskset -c 0 "$B" "$I119" 1 1 >/dev/null
+          taskset -c 0 "$C" "$I119" 1 1 >/dev/null
+          taskset -c 0 "$B" "$I136" 2 1 >/dev/null
+          taskset -c 0 "$C" "$I136" 2 1 >/dev/null
+          for r in 1 2 3 4 5 6 7 8 9 10 11; do
+            if ((r%2)); then order='baseline candidate'; else order='candidate baseline'; fi
+            for v in $order; do
+              if [[ $v == baseline ]]; then bin=$B; else bin=$C; fi
+              x=$(taskset -c 0 "$bin" "$I119" 3 0); printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$x" >>/tmp/results.tsv
+              x=$(taskset -c 0 "$bin" "$I136" 20 0); printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$x" >>/tmp/results.tsv
+            done
+          done
+          cat /tmp/results.tsv
+
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/results.tsv'),delimiter='\t'))
+          g={}; rounds={}
+          for w,r,v,x in rows:
+              x=float(x); g.setdefault((w,v),[]).append(x); rounds.setdefault((w,int(r)),{})[v]=x
+          lines=['# Direct VP8 tree leaf benchmark','',f'- baseline: `{os.environ["BASELINE_SHA"]}`',f'- candidate: `{os.environ["CANDIDATE_SHA"]}`',f'- CPU: `{os.environ.get("CPU_MODEL","unknown")}`',f'- vCPUs: `{os.environ.get("CPU_COUNT","unknown")}`','- candidate is 100% safe Rust; MSRV 1.80.1; normal release target','', '| Workload | baseline | candidate | ratio | paired median | paired range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('issue119','issue136'):
+              b=statistics.median(g[(w,'baseline')]); c=statistics.median(g[(w,'candidate')]); p=[z['baseline']/z['candidate'] for (ww,_),z in sorted(rounds.items()) if ww==w]
+              lines.append(f'| {w} | {b:.3f} us | {c:.3f} us | {b/c:.3f}x | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+          lines += ['','```tsv','workload\tround\tvariant\tus'] + ['\t'.join(r) for r in rows] + ['```','']
+          pathlib.Path('/tmp/benchmark-tree-leaf-encoding.md').write_text('\n'.join(lines))
+          PY
+          git reset --hard "$BASELINE_SHA"
+          cp /tmp/benchmark-tree-leaf-encoding.md benchmark-tree-leaf-encoding.md
+          git add benchmark-tree-leaf-encoding.md
+          git commit -m 'Record direct VP8 tree leaf benchmark'
+          git push origin HEAD:bench-tree-leaf-encoding-v5
