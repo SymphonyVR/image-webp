@@ -1,0 +1,49 @@
+name: Temporary issue 119 exclusive Callgrind profile
+on:
+  push:
+    branches: [ profile-issue119-exclusive ]
+    paths: [ .github/workflows/profile-issue119-exclusive.yml ]
+permissions:
+  contents: write
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and profile
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          sudo apt-get update -qq; sudo apt-get install -y valgrind
+          mkdir -p examples /tmp/119
+          cat >examples/exclusive_profile.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor};
+          fn main(){let d=std::fs::read(std::env::args().nth(1).unwrap()).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>s=s.wrapping_add(t as u64).wrapping_add(b[b.len()/2]as u64),Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();s=b[b.len()/2]as u64}black_box(s)}
+          RS
+          RUSTFLAGS='-C debuginfo=1 -C force-frame-pointers=yes' cargo build --release --example exclusive_profile
+          curl -L --fail --retry 5 -o /tmp/a.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/a.zip -d /tmp/119
+          I=$(find /tmp/119 -iname '*.webp'|head -n1)
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/p.callgrind target/release/examples/exclusive_profile "$I"
+          callgrind_annotate --inclusive=no --threshold=0.05 /tmp/p.callgrind >/tmp/exclusive.txt
+          callgrind_annotate --inclusive=yes --threshold=0.05 /tmp/p.callgrind >/tmp/inclusive.txt
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import os,pathlib,re
+          def filtered(path,limit=120):
+              ls=pathlib.Path(path).read_text(errors='replace').splitlines()
+              return '\n'.join([x for x in ls if 'PROGRAM TOTALS' in x or 'image_webp::' in x][:limit])
+          txt=pathlib.Path('/tmp/exclusive.txt').read_text(errors='replace')
+          m=re.search(r'^([0-9,]+) \(100\.0%\).*PROGRAM TOTALS',txt,re.M);total=m.group(1) if m else 'unknown'
+          out=['# Issue 119 exclusive Callgrind profile','',f'- branch: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`',f'- total instruction references: `{total}`','- exact issue #119 animation; release build; CPU 0','','## Exclusive image-webp functions','','```text',filtered('/tmp/exclusive.txt'),'```','','## Inclusive image-webp functions','','```text',filtered('/tmp/inclusive.txt'),'```','']
+          pathlib.Path('/tmp/out.md').write_text('\n'.join(out))
+          PY
+          git reset --hard "$BASE";cp /tmp/out.md profile-issue119-exclusive.md;git add profile-issue119-exclusive.md;git commit -m 'Record exclusive issue 119 profile';git push origin HEAD:profile-issue119-exclusive
