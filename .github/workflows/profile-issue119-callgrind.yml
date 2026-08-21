@@ -30,6 +30,8 @@ jobs:
             echo "CPU_ARCH=$(uname -m)"
             echo "CPU_COUNT=$(nproc)"
           } >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           lscpu
 
       - name: Install Callgrind
