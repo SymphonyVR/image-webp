@@ -1,0 +1,231 @@
+name: Temporary safe subtract-green confirmation
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/perf-subtract-green-confirm.yml
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Record baseline and runner CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASELINE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          lscpu
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "CPU_ARCH=$(uname -m)"
+            echo "CPU_COUNT=$(nproc)"
+          } >> "$GITHUB_ENV"
+
+      - name: Apply safe fixed-width subtract-green candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/lossless/decoder/reverse_transform.rs')
+          text = path.read_text()
+          old = '''pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {\n    for pixel in image_data.chunks_exact_mut(4) {\n        pixel[0] = pixel[0].wrapping_add(pixel[1]);\n        pixel[2] = pixel[2].wrapping_add(pixel[1]);\n    }\n}\n'''
+          new = '''#[inline(always)]\nfn add_green_four_pixels(pixels: &mut [u8; 16]) {\n    let g0 = pixels[1];\n    let g1 = pixels[5];\n    let g2 = pixels[9];\n    let g3 = pixels[13];\n\n    pixels[0] = pixels[0].wrapping_add(g0);\n    pixels[2] = pixels[2].wrapping_add(g0);\n    pixels[4] = pixels[4].wrapping_add(g1);\n    pixels[6] = pixels[6].wrapping_add(g1);\n    pixels[8] = pixels[8].wrapping_add(g2);\n    pixels[10] = pixels[10].wrapping_add(g2);\n    pixels[12] = pixels[12].wrapping_add(g3);\n    pixels[14] = pixels[14].wrapping_add(g3);\n}\n\npub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {\n    let mut chunks32 = image_data.chunks_exact_mut(32);\n    for chunk in &mut chunks32 {\n        let (first, second) = chunk.split_at_mut(16);\n        let first: &mut [u8; 16] = first.try_into().unwrap();\n        let second: &mut [u8; 16] = second.try_into().unwrap();\n        add_green_four_pixels(first);\n        add_green_four_pixels(second);\n    }\n\n    let mut chunks16 = chunks32.into_remainder().chunks_exact_mut(16);\n    for chunk in &mut chunks16 {\n        let chunk: &mut [u8; 16] = chunk.try_into().unwrap();\n        add_green_four_pixels(chunk);\n    }\n\n    for pixel in chunks16.into_remainder().chunks_exact_mut(4) {\n        pixel[0] = pixel[0].wrapping_add(pixel[1]);\n        pixel[2] = pixel[2].wrapping_add(pixel[1]);\n    }\n}\n'''
+          if old not in text:
+              raise SystemExit('subtract-green transform block not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+          cargo fmt
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- src/lossless/decoder/reverse_transform.rs
+          git commit -m 'Expose subtract-green lanes to SLP vectorization'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify stable and MSRV
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+
+      - name: Prepare default-target A/B binaries and corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/webp-base "$BASELINE_SHA"
+          git worktree add --detach /tmp/webp-candidate "$CANDIDATE_SHA"
+
+          cat >/tmp/decode_corpus.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+
+          fn decode_once(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              decoder.read_image(&mut buf).unwrap();
+              let mut checksum = buf.len() as u64;
+              if let Some(&byte) = buf.get(buf.len() / 2) {
+                  checksum = checksum.wrapping_add(u64::from(byte));
+              }
+              black_box(checksum)
+          }
+
+          fn main() {
+              let mut args = std::env::args().skip(1);
+              let iterations: usize = args.next().unwrap().parse().unwrap();
+              let warmups: usize = args.next().unwrap().parse().unwrap();
+              let paths: Vec<_> = args.collect();
+              let images: Vec<Vec<u8>> = paths.iter().map(|path| std::fs::read(path).unwrap()).collect();
+              for _ in 0..warmups {
+                  for data in &images { black_box(decode_once(data)); }
+              }
+              let start = Instant::now();
+              let mut checksum = 0u64;
+              for _ in 0..iterations {
+                  for data in &images { checksum = checksum.wrapping_add(decode_once(data)); }
+              }
+              black_box(checksum);
+              let decodes = iterations * images.len();
+              println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / decodes as f64);
+          }
+          RS
+
+          for dir in /tmp/webp-base /tmp/webp-candidate; do
+            mkdir -p "$dir/examples"
+            cp /tmp/decode_corpus.rs "$dir/examples/decode_corpus.rs"
+            (cd "$dir" && cargo build --release --example decode_corpus)
+          done
+
+          python3 - <<'PY' >/tmp/vp8l-files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data) < 12 or data[:4] != b'RIFF' or data[8:12] != b'WEBP': return []
+              out=[]; pos=12
+              while pos + 8 <= len(data):
+                  fourcc=data[pos:pos+4]; size=int.from_bytes(data[pos+4:pos+8], 'little')
+                  out.append(fourcc); pos += 8 + size + (size & 1)
+              return out
+          selected=[]
+          for path in sorted(Path('tests/images').rglob('*.webp')):
+              c=chunks(path.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: selected.append(path)
+          if not selected: raise SystemExit('no static VP8L fixtures found')
+          for path in selected: print(path.resolve())
+          PY
+          echo "VP8L_COUNT=$(wc -l </tmp/vp8l-files.txt)" >> "$GITHUB_ENV"
+
+      - name: Run default-target A/B corpus benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=/tmp/webp-base/target/release/examples/decode_corpus
+          CAND=/tmp/webp-candidate/target/release/examples/decode_corpus
+          mapfile -t FILES </tmp/vp8l-files.txt
+          : > /tmp/corpus.tsv
+
+          taskset -c 0 "$BASE" 5 2 "${FILES[@]}" >/dev/null
+          taskset -c 0 "$CAND" 5 2 "${FILES[@]}" >/dev/null
+          for round in 1 2 3 4 5 6 7 8 9 10 11; do
+            if (( round % 2 )); then order="baseline candidate"; else order="candidate baseline"; fi
+            for variant in $order; do
+              if [[ "$variant" == baseline ]]; then bin="$BASE"; else bin="$CAND"; fi
+              value="$(taskset -c 0 "$bin" 100 0 "${FILES[@]}")"
+              printf 'vp8l_default\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/corpus.tsv
+            done
+          done
+          cat /tmp/corpus.tsv
+
+      - name: Run nightly transform microbenchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rustup toolchain install nightly --profile minimal
+          : > /tmp/micro.tsv
+
+          run_bench() {
+            local dir="$1"
+            (cd "$dir" && taskset -c 0 cargo +nightly bench --features _benchmarks -- subtract_green 2>&1) \
+              | awk '/subtract_green.*bench:/ { for (i=1; i<=NF; i++) if ($i == "bench:") { gsub(",", "", $(i+1)); print $(i+1); exit } }'
+          }
+
+          run_bench /tmp/webp-base >/dev/null
+          run_bench /tmp/webp-candidate >/dev/null
+          for round in 1 2 3 4 5 6 7; do
+            if (( round % 2 )); then order="baseline candidate"; else order="candidate baseline"; fi
+            for variant in $order; do
+              if [[ "$variant" == baseline ]]; then dir=/tmp/webp-base; else dir=/tmp/webp-candidate; fi
+              value="$(run_bench "$dir")"
+              test -n "$value"
+              printf 'subtract_green_ns\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/micro.tsv
+            done
+          done
+          cat /tmp/micro.tsv
+
+      - name: Persist confirmation without candidate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv, os, statistics, pathlib
+
+          def summarize(path, workload):
+              rows=list(csv.reader(open(path), delimiter='\t'))
+              groups={}; rounds={}
+              for w, round_no, variant, value in rows:
+                  value=float(value)
+                  groups.setdefault(variant, []).append(value)
+                  rounds.setdefault(int(round_no), {})[variant]=value
+              bm=statistics.median(groups['baseline']); cm=statistics.median(groups['candidate'])
+              paired=[vals['baseline']/vals['candidate'] for _, vals in sorted(rounds.items())]
+              return rows, bm, cm, paired
+
+          corpus_rows, cb, cc, cp = summarize('/tmp/corpus.tsv', 'vp8l_default')
+          micro_rows, mb, mc, mp = summarize('/tmp/micro.tsv', 'subtract_green_ns')
+          lines=[
+              '# Safe subtract-green confirmation', '',
+              f'- branch baseline: `{os.environ["BASELINE_SHA"]}`',
+              f'- ephemeral candidate: `{os.environ["CANDIDATE_SHA"]}`',
+              f'- CPU: `{os.environ.get("CPU_MODEL", "unknown")}`',
+              f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH", "unknown")}` / `{os.environ.get("CPU_COUNT", "unknown")}`',
+              f'- static VP8L fixtures: `{os.environ.get("VP8L_COUNT", "unknown")}`',
+              '- candidate remains 100% safe Rust and builds on MSRV 1.80.1',
+              '- corpus confirmation uses normal release target (no `target-cpu=native`)', '',
+              '| Workload | baseline median | candidate median | ratio of medians | paired median | paired range |',
+              '|---|---:|---:|---:|---:|---:|',
+              f'| VP8L default-target corpus (us/decode) | {cb:.3f} | {cc:.3f} | {cb/cc:.3f}x | {statistics.median(cp):.3f}x | {min(cp):.3f}–{max(cp):.3f}x |',
+              f'| subtract_green microbench (ns/iter) | {mb:.3f} | {mc:.3f} | {mb/mc:.3f}x | {statistics.median(mp):.3f}x | {min(mp):.3f}–{max(mp):.3f}x |',
+              '', '## Corpus raw samples', '', '```tsv', 'workload\tround\tvariant\tvalue',
+          ]
+          lines += ['\t'.join(r) for r in corpus_rows]
+          lines += ['```', '', '## Microbenchmark raw samples', '', '```tsv', 'workload\tround\tvariant\tvalue']
+          lines += ['\t'.join(r) for r in micro_rows]
+          lines += ['```', '']
+          pathlib.Path('/tmp/benchmark-subtract-green-confirm.md').write_text('\n'.join(lines))
+          PY
+
+          git reset --hard "$BASELINE_SHA"
+          cp /tmp/benchmark-subtract-green-confirm.md benchmark-subtract-green-confirm.md
+          git add -- benchmark-subtract-green-confirm.md
+          git commit -m 'Confirm safe subtract-green optimization'
+          git push origin HEAD:performance-optimizations
