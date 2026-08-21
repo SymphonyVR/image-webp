@@ -1,0 +1,189 @@
+name: Temporary issue 119 VP8 line profile
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/profile-issue119-vp8-lines.yml
+
+permissions:
+  contents: write
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Record branch and CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BRANCH_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          echo "CPU_ARCH=$(uname -m)" >> "$GITHUB_ENV"
+          echo "CPU_COUNT=$(nproc)" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          lscpu
+
+      - name: Install Callgrind
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! command -v valgrind >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y valgrind
+          fi
+
+      - name: Build profiling target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >examples/decode_profile.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::hint::black_box;
+          use std::io::Cursor;
+
+          fn main() {
+              let path = std::env::args().nth(1).unwrap();
+              let data = std::fs::read(path).unwrap();
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              let mut checksum = 0u64;
+              if decoder.is_animated() {
+                  loop {
+                      match decoder.read_frame(&mut buf) {
+                          Ok(duration) => {
+                              checksum = checksum.wrapping_add(u64::from(duration));
+                              checksum = checksum.wrapping_add(u64::from(buf[buf.len() / 2]));
+                          }
+                          Err(DecodingError::NoMoreFrames) => break,
+                          Err(err) => panic!("decode failed: {err:?}"),
+                      }
+                  }
+              } else {
+                  decoder.read_image(&mut buf).unwrap();
+                  checksum = checksum.wrapping_add(u64::from(buf[buf.len() / 2]));
+              }
+              black_box(checksum);
+          }
+          RS
+          RUSTFLAGS='-C debuginfo=2 -C force-frame-pointers=yes' cargo build --release --example decode_profile
+
+      - name: Fetch issue 119 workload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/issue119
+          curl -L --fail --retry 3 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/sample.zip -d /tmp/issue119
+          ISSUE119_FILE="$(find /tmp/issue119 -type f -iname '*.webp' | head -n 1)"
+          test -n "$ISSUE119_FILE"
+          echo "ISSUE119_FILE=$ISSUE119_FILE" >> "$GITHUB_ENV"
+
+      - name: Collect Callgrind data
+        shell: bash
+        run: |
+          set -euxo pipefail
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/vp8.callgrind \
+            target/release/examples/decode_profile "$ISSUE119_FILE"
+
+          for source in mod arithmetic_decoder yuv loop_filter transform prediction; do
+            callgrind_annotate \
+              --inclusive=no \
+              --show=Ir \
+              --show-percs=yes \
+              --threshold=0.00 \
+              --context=0 \
+              /tmp/vp8.callgrind "$GITHUB_WORKSPACE/src/lossy/${source}.rs" \
+              > "/tmp/${source}.annotate" || true
+          done
+
+          callgrind_annotate --inclusive=no --show=Ir --show-percs=yes --threshold=0.05 \
+            /tmp/vp8.callgrind > /tmp/functions.annotate
+
+      - name: Persist ranked source-line report
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+
+          total_text = pathlib.Path('/tmp/functions.annotate').read_text(errors='replace')
+          m = re.search(r'^([0-9,]+) \(100\.0%\).*PROGRAM TOTALS', total_text, re.M)
+          total = int(m.group(1).replace(',', '')) if m else None
+
+          count_re = re.compile(r'^\s*([0-9,]+)\s+\(\s*([0-9.]+)%\)\s+(.*)$')
+
+          def ranked(name):
+              path = pathlib.Path(f'/tmp/{name}.annotate')
+              if not path.exists():
+                  return ['(annotation unavailable)']
+              rows = []
+              for line in path.read_text(errors='replace').splitlines():
+                  m = count_re.match(line)
+                  if not m:
+                      continue
+                  count = int(m.group(1).replace(',', ''))
+                  pct = float(m.group(2))
+                  text = m.group(3).strip()
+                  if not text or 'PROGRAM TOTALS' in text:
+                      continue
+                  # Keep source-attributed statements and discard repeated report headers.
+                  if text.startswith('Ir') or set(text) <= {'-'}:
+                      continue
+                  rows.append((count, pct, text))
+              # Deduplicate identical report rows while keeping the highest count.
+              best = {}
+              for count, pct, text in rows:
+                  prev = best.get(text)
+                  if prev is None or count > prev[0]:
+                      best[text] = (count, pct)
+              out = sorted(((c, p, t) for t, (c, p) in best.items()), reverse=True)
+              return [f'{c:,} ({p:.2f}%)  {t}' for c, p, t in out[:60]] or ['(no attributed source lines found)']
+
+          functions = []
+          for line in total_text.splitlines():
+              mm = count_re.match(line)
+              if not mm:
+                  continue
+              count = int(mm.group(1).replace(',', ''))
+              pct = float(mm.group(2))
+              text = mm.group(3).strip()
+              if 'PROGRAM TOTALS' in text:
+                  continue
+              if 'image_webp' in text or '/src/lossy/' in text:
+                  functions.append((count, pct, text))
+          functions.sort(reverse=True)
+
+          lines = [
+              '# Issue 119 VP8 source-line profile', '',
+              f'- optimized branch: `{os.environ["BRANCH_SHA"]}`',
+              f'- CPU: `{os.environ.get("CPU_MODEL", "unknown")}`',
+              f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH", "unknown")}` / `{os.environ.get("CPU_COUNT", "unknown")}`',
+              '- workload: exact issue #119 animated WebP',
+              '- Callgrind, one full animation decode, normal release codegen, CPU 0',
+              '- source-line costs are exclusive instruction references from optimized code',
+          ]
+          if total is not None:
+              lines.append(f'- program instruction references: `{total:,}`')
+          lines += ['', '## Hot image-webp functions', '', '```text']
+          lines += [f'{c:,} ({p:.2f}%)  {t}' for c,p,t in functions[:80]] or ['(no function attribution found)']
+          lines += ['```']
+
+          for name in ['mod', 'arithmetic_decoder', 'yuv', 'loop_filter', 'transform', 'prediction']:
+              lines += ['', f'## `src/lossy/{name}.rs`', '', '```text']
+              lines += ranked(name)
+              lines += ['```']
+
+          pathlib.Path('/tmp/profile-issue119-vp8-lines.md').write_text('\n'.join(lines) + '\n')
+          PY
+
+          cp /tmp/profile-issue119-vp8-lines.md profile-issue119-vp8-lines.md
+          git add profile-issue119-vp8-lines.md
+          git commit -m 'Record issue 119 VP8 line profile'
+          git push origin HEAD:performance-optimizations
