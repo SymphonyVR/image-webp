@@ -1,0 +1,86 @@
+name: Temporary libwebp-style DC-only IDCT benchmark
+on:
+  push:
+    branches: [ bench-dct-value-fused-v2 ]
+    paths: [ .github/workflows/bench-idct-dc-only.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/transform.rs');s=p.read_text()
+          marker='// inverse discrete cosine transform, used in decoding\n'
+          helper='''// Simplified inverse transform for a block whose only non-zero input is DC.\n// This is algebraically identical to idct4x4 for that input shape.\npub(crate) fn idct4x4_dc(block: &mut [i32]) {\n    assert!(block.len() >= 16);\n    let dc = ((i64::from(block[0]) + 4) >> 3) as i32;\n    block[..16].fill(dc);\n}\n\n'''
+          if marker not in s: raise SystemExit('transform marker missing')
+          p.write_text(s.replace(marker,helper+marker,1))
+          p=Path('src/lossy/mod.rs');s=p.read_text()
+          old='''                if block[0] != 0 || n {\n                    mb.non_zero_dct = true;\n                    transform::idct4x4(block);\n                }\n'''
+          new='''                if block[0] != 0 || n {\n                    mb.non_zero_dct = true;\n                    if n {\n                        transform::idct4x4(block);\n                    } else {\n                        transform::idct4x4_dc(block);\n                    }\n                }\n'''
+          count=s.count(old)
+          if count != 1: raise SystemExit(f'expected one luma marker, got {count}')
+          s=s.replace(old,new,1)
+          old2='''                    if block[0] != 0 || n {\n                        mb.non_zero_dct = true;\n                        transform::idct4x4(block);\n                    }\n'''
+          new2='''                    if block[0] != 0 || n {\n                        mb.non_zero_dct = true;\n                        if n {\n                            transform::idct4x4(block);\n                        } else {\n                            transform::idct4x4_dc(block);\n                        }\n                    }\n'''
+          count=s.count(old2)
+          if count != 1: raise SystemExit(f'expected one chroma marker, got {count}')
+          p.write_text(s.replace(old2,new2,1))
+          PY
+          cargo fmt;git diff --check
+          git add src/lossy/transform.rs src/lossy/mod.rs
+          git commit -m 'Use simplified IDCT for DC-only VP8 blocks'
+          echo "CAND=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          cargo test -v
+          cargo clippy --all-features -- -D warnings
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Build and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$CAND"
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};
+          #[inline]fn hb(mut h:u64,b:u8)->u64{h^=b as u64;h.wrapping_mul(1099511628211)}
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut h=1469598103934665603u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{for z in t.to_le_bytes(){h=hb(h,z)}for &z in &b{h=hb(h,z)}},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();for &z in &b{h=hb(h,z)}}black_box(h)}
+          fn main(){let mut a=std::env::args().skip(1);let p=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let w:usize=a.next().unwrap().parse().unwrap();let d=std::fs::read(p).unwrap();for _ in 0..w{black_box(dec(&d));}let t=Instant::now();let mut h=0;for _ in 0..n{h^=dec(&d)}println!("{:.3}\t{:016x}",t.elapsed().as_secs_f64()*1e6/n as f64,h);}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/dc_bench.rs";(cd "$d"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example dc_bench);done
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 5 -o /tmp/119.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/119.zip -d /tmp/119
+          curl -L --fail --retry 5 -o /tmp/136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip;unzip -q /tmp/136.zip -d /tmp/136
+          I119=$(find /tmp/119 -iname '*.webp'|head -n1);I136=$(find /tmp/136 -iname '*.webp'|head -n1)
+          B=/tmp/base/target/release/examples/dc_bench;C=/tmp/cand/target/release/examples/dc_bench
+          H1=$($B "$I119" 1 0|cut -f2);test "$H1" = "$($C "$I119" 1 0|cut -f2)"
+          H2=$($B "$I136" 1 0|cut -f2);test "$H2" = "$($C "$I136" 1 0|cut -f2)"
+          echo "HASH119=$H1" >> "$GITHUB_ENV";echo "HASH136=$H2" >> "$GITHUB_ENV"
+          : >/tmp/r.tsv
+          for r in {1..11};do if ((r%2));then o='base cand';else o='cand base';fi;for v in $o;do [[ $v == base ]]&&x=$B||x=$C;u=$(taskset -c 0 "$x" "$I119" 3 0|cut -f1);printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$x" "$I136" 16 0|cut -f1);printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# Libwebp-style DC-only IDCT benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`','- full output hashes match before timing','','| Workload | baseline | candidate | ratio | paired median | range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('issue119','issue136'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {b/c:.3f}x | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+          pathlib.Path('/tmp/out.md').write_text('\n'.join(L+['','```tsv']+['\t'.join(r) for r in rows]+['```','']))
+          PY
+          git reset --hard "$BASE";cp /tmp/out.md benchmark-idct-dc-only.md;git add benchmark-idct-dc-only.md;git commit -m 'Record DC-only IDCT benchmark';git push origin HEAD:bench-dct-value-fused-v2
