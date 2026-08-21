@@ -1,0 +1,244 @@
+name: Temporary safe lossless color-transform benchmark
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/perf-lossless-color-safe.yml
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Record baseline and runner CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASELINE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          lscpu
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "CPU_ARCH=$(uname -m)"
+            echo "CPU_COUNT=$(nproc)"
+          } >> "$GITHUB_ENV"
+
+      - name: Apply safe color-transform candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/lossless/decoder/reverse_transform.rs')
+          text = path.read_text()
+
+          old_delta = '''/// Does color transform on 2 numbers\nfn color_transform_delta(t: i8, c: i8) -> u32 {\n    (i32::from(t) * i32::from(c)) as u32 >> 5\n}\n'''
+          new_delta = '''/// Computes the low byte of the signed color-transform delta.\n///\n/// The transform is defined modulo 256 when written back to a channel, so keeping only\n/// the low byte is exactly equivalent to the previous u32 shift/add/mask sequence while\n/// exposing wrapping byte arithmetic directly to the optimizer.\n#[inline(always)]\nfn color_transform_delta(t: i8, c: u8) -> u8 {\n    ((i32::from(t) * i32::from(c as i8)) >> 5) as u8\n}\n'''
+          if old_delta not in text:
+              raise SystemExit('color_transform_delta block not found')
+          text = text.replace(old_delta, new_delta, 1)
+
+          old_loop = '''            for pixel in block.chunks_exact_mut(4) {\n                let green = u32::from(pixel[1]);\n                let mut temp_red = u32::from(pixel[0]);\n                let mut temp_blue = u32::from(pixel[2]);\n\n                temp_red += color_transform_delta(green_to_red as i8, green as i8);\n                temp_blue += color_transform_delta(green_to_blue as i8, green as i8);\n                temp_blue += color_transform_delta(red_to_blue as i8, temp_red as i8);\n\n                pixel[0] = (temp_red & 0xff) as u8;\n                pixel[2] = (temp_blue & 0xff) as u8;\n            }\n'''
+          new_loop = '''            for pixel in block.chunks_exact_mut(4) {\n                let green = pixel[1];\n                let red = pixel[0]\n                    .wrapping_add(color_transform_delta(green_to_red as i8, green));\n                let blue = pixel[2]\n                    .wrapping_add(color_transform_delta(green_to_blue as i8, green))\n                    .wrapping_add(color_transform_delta(red_to_blue as i8, red));\n\n                pixel[0] = red;\n                pixel[2] = blue;\n            }\n'''
+          if old_loop not in text:
+              raise SystemExit('color transform inner loop not found')
+          text = text.replace(old_loop, new_loop, 1)
+
+          # Add an exhaustive low-byte equivalence test for every signed transform coefficient
+          # and every possible channel byte.
+          test_marker = '''    #[bench]\n    fn color_transform(b: &mut Bencher) {\n'''
+          equivalence_test = '''    #[test]\n    fn color_transform_delta_matches_previous_low_byte() {\n        for t_byte in 0u8..=u8::MAX {\n            let t = t_byte as i8;\n            for c in 0u8..=u8::MAX {\n                let old = ((i32::from(t) * i32::from(c as i8)) as u32 >> 5) as u8;\n                assert_eq!(super::color_transform_delta(t, c), old);\n            }\n        }\n    }\n\n    #[bench]\n    fn color_transform(b: &mut Bencher) {\n'''
+          if test_marker not in text:
+              raise SystemExit('color transform benchmark marker not found')
+          text = text.replace(test_marker, equivalence_test, 1)
+
+          path.write_text(text)
+          PY
+
+          cargo fmt
+          git diff --check
+          git diff -- src/lossless/decoder/reverse_transform.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- src/lossless/decoder/reverse_transform.rs
+          git commit -m 'Simplify lossless color transform arithmetic'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+
+      - name: Prepare A/B binaries and VP8L corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/webp-base "$BASELINE_SHA"
+          git worktree add --detach /tmp/webp-candidate "$CANDIDATE_SHA"
+
+          cat >/tmp/decode_corpus.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+
+          fn decode_once(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              decoder.read_image(&mut buf).unwrap();
+              let mut checksum = buf.len() as u64;
+              if let Some(&byte) = buf.get(buf.len() / 2) {
+                  checksum = checksum.wrapping_add(u64::from(byte));
+              }
+              black_box(checksum)
+          }
+
+          fn main() {
+              let mut args = std::env::args().skip(1);
+              let iterations: usize = args.next().unwrap().parse().unwrap();
+              let warmups: usize = args.next().unwrap().parse().unwrap();
+              let paths: Vec<_> = args.collect();
+              let images: Vec<Vec<u8>> = paths
+                  .iter()
+                  .map(|path| std::fs::read(path).unwrap())
+                  .collect();
+
+              for _ in 0..warmups {
+                  for data in &images {
+                      black_box(decode_once(data));
+                  }
+              }
+
+              let start = Instant::now();
+              let mut checksum = 0u64;
+              for _ in 0..iterations {
+                  for data in &images {
+                      checksum = checksum.wrapping_add(decode_once(data));
+                  }
+              }
+              black_box(checksum);
+              let decodes = iterations * images.len();
+              println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / decodes as f64);
+          }
+          RS
+
+          for dir in /tmp/webp-base /tmp/webp-candidate; do
+            mkdir -p "$dir/examples"
+            cp /tmp/decode_corpus.rs "$dir/examples/decode_corpus.rs"
+            (cd "$dir" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example decode_corpus)
+          done
+
+          python3 - <<'PY' >/tmp/vp8l-files.txt
+          from pathlib import Path
+
+          def top_level_chunks(data: bytes):
+              if len(data) < 12 or data[:4] != b'RIFF' or data[8:12] != b'WEBP':
+                  return []
+              out = []
+              pos = 12
+              while pos + 8 <= len(data):
+                  fourcc = data[pos:pos+4]
+                  size = int.from_bytes(data[pos+4:pos+8], 'little')
+                  out.append(fourcc)
+                  pos += 8 + size + (size & 1)
+              return out
+
+          selected = []
+          for path in sorted(Path('tests/images').rglob('*.webp')):
+              chunks = top_level_chunks(path.read_bytes())
+              if b'VP8L' in chunks and b'ANIM' not in chunks:
+                  selected.append(path)
+
+          if not selected:
+              raise SystemExit('no static VP8L fixtures found')
+          for path in selected:
+              print(path.resolve())
+          PY
+          cat /tmp/vp8l-files.txt
+          echo "VP8L_COUNT=$(wc -l </tmp/vp8l-files.txt)" >> "$GITHUB_ENV"
+
+      - name: Run alternating VP8L corpus benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=/tmp/webp-base/target/release/examples/decode_corpus
+          CAND=/tmp/webp-candidate/target/release/examples/decode_corpus
+          mapfile -t FILES </tmp/vp8l-files.txt
+          : > /tmp/results.tsv
+
+          taskset -c 0 "$BASE" 2 1 "${FILES[@]}" >/dev/null
+          taskset -c 0 "$CAND" 2 1 "${FILES[@]}" >/dev/null
+
+          for round in 1 2 3 4 5 6 7 8 9 10 11; do
+            if (( round % 2 )); then order="baseline candidate"; else order="candidate baseline"; fi
+            for variant in $order; do
+              if [[ "$variant" == baseline ]]; then bin="$BASE"; else bin="$CAND"; fi
+              value="$(taskset -c 0 "$bin" 10 0 "${FILES[@]}")"
+              printf 'vp8l_corpus\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results.tsv
+            done
+          done
+          cat /tmp/results.tsv
+
+      - name: Persist benchmark without candidate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv, os, statistics, pathlib
+
+          rows = list(csv.reader(open('/tmp/results.tsv'), delimiter='\t'))
+          groups = {}
+          rounds = {}
+          for workload, round_no, variant, value in rows:
+              value = float(value)
+              groups.setdefault((workload, variant), []).append(value)
+              rounds.setdefault((workload, int(round_no)), {})[variant] = value
+
+          bm = statistics.median(groups[('vp8l_corpus', 'baseline')])
+          cm = statistics.median(groups[('vp8l_corpus', 'candidate')])
+          paired = [
+              vals['baseline'] / vals['candidate']
+              for (workload, _), vals in sorted(rounds.items())
+              if workload == 'vp8l_corpus'
+          ]
+
+          lines = [
+              '# Safe lossless color-transform benchmark', '',
+              f'- branch baseline: `{os.environ["BASELINE_SHA"]}`',
+              f'- ephemeral candidate: `{os.environ["CANDIDATE_SHA"]}`',
+              f'- CPU: `{os.environ.get("CPU_MODEL", "unknown")}`',
+              f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH", "unknown")}` / `{os.environ.get("CPU_COUNT", "unknown")}`',
+              f'- static VP8L fixtures: `{os.environ.get("VP8L_COUNT", "unknown")}`',
+              '- candidate remains 100% safe Rust; crate-level `forbid(unsafe_code)` is unchanged',
+              '- candidate source is intentionally not retained on the branch pending benchmark review',
+              '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned to CPU 0',
+              '- method: 11 alternating A/B rounds over the full static VP8L fixture corpus', '',
+              '| Workload | baseline median | candidate median | ratio of medians | paired median | paired range |',
+              '|---|---:|---:|---:|---:|---:|',
+              f'| VP8L corpus | {bm:.3f} us | {cm:.3f} us | {bm/cm:.3f}x | {statistics.median(paired):.3f}x | {min(paired):.3f}–{max(paired):.3f}x |',
+              '', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode',
+          ]
+          lines += ['\t'.join(row) for row in rows]
+          lines += ['```', '']
+          pathlib.Path('/tmp/benchmark-lossless-color-safe.md').write_text('\n'.join(lines))
+          PY
+
+          git reset --hard "$BASELINE_SHA"
+          cp /tmp/benchmark-lossless-color-safe.md benchmark-lossless-color-safe.md
+          git add -- benchmark-lossless-color-safe.md
+          git commit -m 'Record safe lossless color-transform benchmark'
+          git push origin HEAD:performance-optimizations
