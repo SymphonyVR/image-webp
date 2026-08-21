@@ -1,0 +1,163 @@
+name: Temporary VP8 hot-path runner matrix
+
+on:
+  push:
+    branches: [ bench-vp8-hotpath-matrix ]
+    paths: [ .github/workflows/bench-vp8-hotpath-matrix.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          CPU="$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+          printf '%s\n' "$CPU" > "/tmp/cpu-${{ matrix.replica }}.txt"
+          lscpu
+          for v in base leaf range combined; do
+            git worktree add --detach "/tmp/$v" "$BASE"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          def patch(root, leaf=False, rng=False):
+              p=Path(root)/'src/lossy/arithmetic_decoder.rs'
+              s=p.read_text()
+              if leaf:
+                  old='''            let i = if b { node.right } else { node.left };\n            let Some(next_node) = tree.get(usize::from(i)) else {\n                return TreeNode::value_from_branch(i);\n            };\n            node = *next_node;\n'''
+                  new='''            let i = if b { node.right } else { node.left };\n            if i & 0x80 != 0 {\n                return TreeNode::value_from_branch(i);\n            }\n            node = tree[usize::from(i)];\n'''
+                  if old not in s: raise SystemExit(f'leaf pattern missing in {root}')
+                  s=s.replace(old,new,1)
+              if rng:
+                  old='let shift = range.leading_zeros().saturating_sub(24);'
+                  if s.count(old)!=1: raise SystemExit(f'range pattern count {s.count(old)} in {root}')
+                  s=s.replace(old,'let shift = range.leading_zeros() - 24;',1)
+              p.write_text(s)
+          patch('/tmp/leaf', leaf=True)
+          patch('/tmp/range', rng=True)
+          patch('/tmp/combined', leaf=True, rng=True)
+          PY
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::{hint::black_box, io::Cursor, time::Instant};
+          fn one(data: &[u8]) -> u64 {
+              let mut d=WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut out=vec![0; d.output_buffer_size().unwrap()];
+              let mut sum=0u64;
+              if d.is_animated() {
+                  loop { match d.read_frame(&mut out) {
+                      Ok(t)=>sum=sum.wrapping_add(t as u64).wrapping_add(out[out.len()/2] as u64),
+                      Err(DecodingError::NoMoreFrames)=>break,
+                      Err(e)=>panic!("{e:?}"),
+                  }}
+              } else { d.read_image(&mut out).unwrap(); sum=out[out.len()/2] as u64; }
+              black_box(sum)
+          }
+          fn main() {
+              let mut a=std::env::args().skip(1);
+              let path=a.next().unwrap(); let n:usize=a.next().unwrap().parse().unwrap(); let warm:usize=a.next().unwrap().parse().unwrap();
+              let data=std::fs::read(path).unwrap(); for _ in 0..warm { black_box(one(&data)); }
+              let t=Instant::now(); let mut s=0u64; for _ in 0..n { s=s.wrapping_add(one(&data)); } black_box(s);
+              println!("{:.3}", t.elapsed().as_secs_f64()*1_000_000.0/n as f64);
+          }
+          RS
+          for v in base leaf range combined; do
+            mkdir -p "/tmp/$v/examples"; cp /tmp/bench.rs "/tmp/$v/examples/bench.rs"
+            (cd "/tmp/$v" && cargo build --release --example bench)
+          done
+      - name: Fetch fixtures
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/i119 /tmp/i136
+          curl -L --fail --retry 3 -o /tmp/i119.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/i119.zip -d /tmp/i119
+          curl -L --fail --retry 3 -o /tmp/i136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip
+          unzip -q /tmp/i136.zip -d /tmp/i136
+          echo "I119=$(find /tmp/i119 -type f -iname '*.webp' | head -n1)" >> "$GITHUB_ENV"
+          echo "I136=$(find /tmp/i136 -type f -iname '*.webp' | head -n1)" >> "$GITHUB_ENV"
+      - name: Benchmark four variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="/tmp/result-${{ matrix.replica }}.tsv"; : > "$OUT"
+          declare -A BIN
+          for v in base leaf range combined; do BIN[$v]="/tmp/$v/target/release/examples/bench"; done
+          for v in base leaf range combined; do
+            taskset -c 0 "${BIN[$v]}" "$I119" 1 1 >/dev/null
+            taskset -c 0 "${BIN[$v]}" "$I136" 2 1 >/dev/null
+          done
+          for r in 1 2 3 4 5 6 7; do
+            case $((r % 4)) in
+              1) order='base leaf range combined';;
+              2) order='range combined base leaf';;
+              3) order='combined range leaf base';;
+              0) order='leaf base combined range';;
+            esac
+            for v in $order; do
+              x=$(taskset -c 0 "${BIN[$v]}" "$I119" 2 0); printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$x" >> "$OUT"
+              x=$(taskset -c 0 "${BIN[$v]}" "$I136" 12 0); printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$x" >> "$OUT"
+            done
+          done
+          cat "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vp8-hotpath-${{ matrix.replica }}
+          path: |
+            /tmp/result-${{ matrix.replica }}.tsv
+            /tmp/cpu-${{ matrix.replica }}.txt
+
+  aggregate:
+    needs: bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vp8-hotpath-*
+          path: /tmp/results
+          merge-multiple: true
+      - name: Aggregate and persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          python3 - <<'PY'
+          import csv, pathlib, statistics
+          root=pathlib.Path('/tmp/results')
+          lines=['# VP8 hot-path cross-runner matrix','', '- normal release target; CPU 0; 7 rotating-order rounds per runner', '- all candidates are safe Rust and keep MSRV 1.80.1','']
+          for result in sorted(root.glob('result-*.tsv')):
+              rid=result.stem.split('-')[-1]
+              cpu=(root/f'cpu-{rid}.txt').read_text().strip()
+              rows=list(csv.reader(result.open(), delimiter='\t'))
+              g={}; rr={}
+              for w,r,v,x in rows:
+                  x=float(x); g.setdefault((w,v),[]).append(x); rr.setdefault((w,int(r)),{})[v]=x
+              lines += [f'## Runner {rid}: `{cpu}`','', '| Workload | Variant | median | ratio vs baseline median | paired baseline/variant median | paired range |','|---|---|---:|---:|---:|---:|']
+              for w in ('issue119','issue136'):
+                  base=statistics.median(g[w,'base'])
+                  lines.append(f'| {w} | baseline | {base:.3f} us | 1.000x | 1.000x | — |')
+                  for v in ('leaf','range','combined'):
+                      med=statistics.median(g[w,v]); p=[vals['base']/vals[v] for (ww,_),vals in sorted(rr.items()) if ww==w]
+                      lines.append(f'| {w} | {v} | {med:.3f} us | {base/med:.3f}x | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+              lines += ['']
+          pathlib.Path('benchmark-vp8-hotpath-matrix.md').write_text('\n'.join(lines)+'\n')
+          PY
+          git add benchmark-vp8-hotpath-matrix.md
+          git commit -m 'Record VP8 hot-path runner matrix'
+          git push origin HEAD:bench-vp8-hotpath-matrix
