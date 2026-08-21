@@ -1,0 +1,220 @@
+name: Temporary VP8 coefficient fast-span benchmark
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/perf-coeff-fast-span.yml
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Record baseline and runner CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASELINE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          lscpu
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "CPU_ARCH=$(uname -m)"
+            echo "CPU_COUNT=$(nproc)"
+          } >> "$GITHUB_ENV"
+
+      - name: Apply batched fast-decoder candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/lossy/arithmetic_decoder.rs')
+          text = path.read_text()
+          replacements = [
+              ("struct FastDecoder<'a> {", "pub(super) struct FastDecoder<'a> {"),
+              ("    fn fast(&mut self) -> FastDecoder<'_> {", "    pub(super) fn fast(&mut self) -> FastDecoder<'_> {"),
+              ("    fn commit_if_valid<T>(self, value_if_not_past_eof: T) -> Option<T> {", "    pub(super) fn commit_if_valid<T>(self, value_if_not_past_eof: T) -> Option<T> {"),
+              ("    fn fast_read_bit(&mut self, probability: u8) -> bool {", "    pub(super) fn fast_read_bit(&mut self, probability: u8) -> bool {"),
+              ("    fn fast_read_sign(&mut self) -> bool {", "    pub(super) fn fast_read_sign(&mut self) -> bool {"),
+              ("    fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {", "    pub(super) fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {"),
+          ]
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit(f'missing arithmetic decoder pattern: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          path = Path('src/lossy/mod.rs')
+          text = path.read_text()
+          marker = '''        let decoder = &mut self.partitions[p];\n\n        let mut res = decoder.start_accumulated_result();\n'''
+          candidate = '''        let decoder = &mut self.partitions[p];\n\n        // Most coefficient blocks are nowhere near the end of the partition. Decode the\n        // whole block against one speculative arithmetic-decoder state and commit it once.\n        // If the speculative reader crosses EOF, discard the temporary block and retry\n        // below with the existing checked path.\n        let mut fast_block = [0i32; 16];\n        let fast_result = {\n            let mut fast = decoder.fast();\n            let mut complexity = complexity;\n            let mut has_coefficients = false;\n            let mut skip = false;\n\n            for i in first_coeff..16usize {\n                let band = COEFF_BANDS[i] as usize;\n                let tree = &probs[band][complexity];\n                let token = fast.fast_read_with_tree(tree, tree[skip as usize]);\n\n                let mut abs_value = i32::from(match token {\n                    DCT_EOB => break,\n                    DCT_0 => {\n                        skip = true;\n                        has_coefficients = true;\n                        complexity = 0;\n                        continue;\n                    }\n                    literal @ DCT_1..=DCT_4 => i16::from(literal),\n                    category @ DCT_CAT1..=DCT_CAT6 => {\n                        let probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];\n                        let mut extra = 0i16;\n                        for t in probs.iter().copied() {\n                            if t == 0 {\n                                break;\n                            }\n                            let b = fast.fast_read_bit(t);\n                            extra = extra + extra + i16::from(b);\n                        }\n                        i16::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]) + extra\n                    }\n                    c => panic!("unknown token: {c}"),\n                });\n\n                skip = false;\n                complexity = if abs_value == 1 { 1 } else { 2 };\n\n                if fast.fast_read_sign() {\n                    abs_value = -abs_value;\n                }\n\n                let zigzag = ZIGZAG[i] as usize;\n                fast_block[zigzag] =\n                    abs_value * i32::from(if zigzag > 0 { acq } else { dcq });\n                has_coefficients = true;\n            }\n\n            fast.commit_if_valid(has_coefficients)\n        };\n\n        if let Some(has_coefficients) = fast_result {\n            *block = fast_block;\n            return Ok(has_coefficients);\n        }\n\n        let mut res = decoder.start_accumulated_result();\n'''
+          if marker not in text:
+              raise SystemExit('read_coefficients insertion point not found')
+          path.write_text(text.replace(marker, candidate, 1))
+          PY
+
+          cargo fmt
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- src/lossy/arithmetic_decoder.rs src/lossy/mod.rs
+          git commit -m 'Batch speculative VP8 coefficient reads'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+
+      - name: Prepare A/B binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/webp-base "$BASELINE_SHA"
+          git worktree add --detach /tmp/webp-candidate "$CANDIDATE_SHA"
+
+          cat >/tmp/decode_bench.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+
+          fn decode_once(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              let mut checksum = 0u64;
+              if decoder.is_animated() {
+                  loop {
+                      match decoder.read_frame(&mut buf) {
+                          Ok(duration) => {
+                              checksum = checksum.wrapping_add(u64::from(duration));
+                              checksum = checksum.wrapping_add(u64::from(buf[buf.len() / 2]));
+                          }
+                          Err(DecodingError::NoMoreFrames) => break,
+                          Err(err) => panic!("decode failed: {err:?}"),
+                      }
+                  }
+              } else {
+                  decoder.read_image(&mut buf).unwrap();
+                  checksum = checksum.wrapping_add(u64::from(buf[buf.len() / 2]));
+              }
+              black_box(checksum)
+          }
+
+          fn main() {
+              let mut args = std::env::args().skip(1);
+              let path = args.next().unwrap();
+              let iterations: usize = args.next().unwrap().parse().unwrap();
+              let warmups: usize = args.next().unwrap().parse().unwrap();
+              let data = std::fs::read(path).unwrap();
+              for _ in 0..warmups { black_box(decode_once(&data)); }
+              let start = Instant::now();
+              let mut checksum = 0u64;
+              for _ in 0..iterations { checksum = checksum.wrapping_add(decode_once(&data)); }
+              black_box(checksum);
+              println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64);
+          }
+          RS
+
+          for dir in /tmp/webp-base /tmp/webp-candidate; do
+            mkdir -p "$dir/examples"
+            cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
+            (cd "$dir" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example decode_bench)
+          done
+
+      - name: Fetch issue 119 workload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/issue119
+          curl -L --fail --retry 3 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/sample.zip -d /tmp/issue119
+          ISSUE119_FILE="$(find /tmp/issue119 -type f -iname '*.webp' | head -n 1)"
+          test -n "$ISSUE119_FILE"
+          echo "ISSUE119_FILE=$ISSUE119_FILE" >> "$GITHUB_ENV"
+
+      - name: Run alternating A/B benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=/tmp/webp-base/target/release/examples/decode_bench
+          CAND=/tmp/webp-candidate/target/release/examples/decode_bench
+          RANDOM_FILE="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
+          : > /tmp/results.tsv
+
+          for bin in "$BASE" "$CAND"; do
+            taskset -c 0 "$bin" "$RANDOM_FILE" 200 10 >/dev/null
+            taskset -c 0 "$bin" "$ISSUE119_FILE" 1 1 >/dev/null
+          done
+
+          for round in 1 2 3 4 5 6 7 8 9 10 11; do
+            if (( round % 2 )); then order="baseline candidate"; else order="candidate baseline"; fi
+            for variant in $order; do
+              if [[ "$variant" == baseline ]]; then bin="$BASE"; else bin="$CAND"; fi
+              value="$(taskset -c 0 "$bin" "$RANDOM_FILE" 1000 0)"
+              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results.tsv
+              value="$(taskset -c 0 "$bin" "$ISSUE119_FILE" 3 0)"
+              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results.tsv
+            done
+          done
+          cat /tmp/results.tsv
+
+      - name: Persist benchmark without candidate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv, os, statistics, pathlib
+          rows = list(csv.reader(open('/tmp/results.tsv'), delimiter='\t'))
+          groups, rounds = {}, {}
+          for workload, round_no, variant, value in rows:
+              value = float(value)
+              groups.setdefault((workload, variant), []).append(value)
+              rounds.setdefault((workload, int(round_no)), {})[variant] = value
+          med = lambda w, v: statistics.median(groups[(w, v)])
+          paired_values = lambda w: [
+              vals['baseline'] / vals['candidate']
+              for (workload, _), vals in sorted(rounds.items()) if workload == w
+          ]
+          lines = [
+              '# Batched VP8 coefficient fast-span benchmark', '',
+              f'- branch baseline: `{os.environ["BASELINE_SHA"]}`',
+              f'- ephemeral candidate: `{os.environ["CANDIDATE_SHA"]}`',
+              f'- CPU: `{os.environ.get("CPU_MODEL", "unknown")}`',
+              f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH", "unknown")}` / `{os.environ.get("CPU_COUNT", "unknown")}`',
+              '- candidate source is intentionally not retained on the branch pending benchmark review',
+              '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned to CPU 0',
+              '- method: 11 alternating A/B rounds; paired speedup is baseline/candidate for the same round', '',
+              '| Workload | baseline median | candidate median | ratio of medians | paired median | paired range |',
+              '|---|---:|---:|---:|---:|---:|',
+          ]
+          for workload in ['random_lossless', 'issue119']:
+              bm, cm = med(workload, 'baseline'), med(workload, 'candidate')
+              pv = paired_values(workload)
+              lines.append(f'| {workload} | {bm:.3f} us | {cm:.3f} us | {bm/cm:.3f}x | {statistics.median(pv):.3f}x | {min(pv):.3f}–{max(pv):.3f}x |')
+          lines += ['', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode']
+          lines += ['\t'.join(row) for row in rows]
+          lines += ['```', '']
+          pathlib.Path('/tmp/benchmark-coeff-fast-span.md').write_text('\n'.join(lines))
+          PY
+
+          git reset --hard "$BASELINE_SHA"
+          cp /tmp/benchmark-coeff-fast-span.md benchmark-coeff-fast-span.md
+          git add -- benchmark-coeff-fast-span.md
+          git commit -m 'Record batched VP8 coefficient benchmark'
+          git push origin HEAD:performance-optimizations
