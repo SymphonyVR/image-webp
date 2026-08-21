@@ -6,6 +6,18 @@ const fn channel_shift(i: u32) -> u32 {
     i * 8
 }
 
+const fn make_blend_scale_table() -> [u32; 256] {
+    let mut table = [0; 256];
+    let mut i = 1;
+    while i < table.len() {
+        table[i] = (1u32 << 24) / i as u32;
+        i += 1;
+    }
+    table
+}
+
+const BLEND_SCALE: [u32; 256] = make_blend_scale_table();
+
 /// Blend a single channel of `src` over `dst`, given their alpha channel values.
 /// `src` and `dst` are assumed to be NOT pre-multiplied by alpha.
 fn blend_channel_nonpremult(
@@ -38,7 +50,7 @@ fn blend_pixel_nonpremult(src: u32, dst: u32) -> u32 {
         // however, we've found that we can use a more precise approximation without losing performance:
         let dst_factor_a = div_by_255(u32::from(dst_a) * (255 - u32::from(src_a)));
         let blend_a = u32::from(src_a) + dst_factor_a;
-        let scale = (1u32 << 24) / blend_a;
+        let scale = BLEND_SCALE[blend_a as usize];
 
         let blend_r =
             blend_channel_nonpremult(src, src_a, dst, dst_factor_a as u8, scale, channel_shift(0));
