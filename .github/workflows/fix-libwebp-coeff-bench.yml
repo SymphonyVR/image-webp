@@ -1,0 +1,24 @@
+name: Fix libwebp coefficient benchmark generator
+on:
+  push:
+    branches: [ bench-dct-value-fused-v2 ]
+    paths: [ .github/workflows/fix-libwebp-coeff-bench.yml ]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch and retrigger benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          sed -i 's/usize::from(hi)/(hi as usize)/g; s/usize::from(lo)/(lo as usize)/g' .github/workflows/bench-libwebp-coeff-structure.yml
+          git add .github/workflows/bench-libwebp-coeff-structure.yml
+          git commit -m 'Fix bool indexing in coefficient benchmark candidate'
+          git push origin HEAD:bench-dct-value-fused-v2
