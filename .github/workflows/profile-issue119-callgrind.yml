@@ -1,0 +1,155 @@
+name: Temporary issue 119 Callgrind profile
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/profile-issue119-callgrind.yml
+
+permissions:
+  contents: write
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Record refs and CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BRANCH_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git fetch origin main
+          echo "MAIN_SHA=$(git rev-parse origin/main)" >> "$GITHUB_ENV"
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "CPU_ARCH=$(uname -m)"
+            echo "CPU_COUNT=$(nproc)"
+          } >> "$GITHUB_ENV"
+          lscpu
+
+      - name: Install Callgrind
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! command -v valgrind >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y valgrind
+          fi
+          valgrind --version
+
+      - name: Prepare profiled binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/webp-main origin/main
+          git worktree add --detach /tmp/webp-branch "$BRANCH_SHA"
+
+          cat >/tmp/decode_profile.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::hint::black_box;
+          use std::io::Cursor;
+
+          fn main() {
+              let path = std::env::args().nth(1).unwrap();
+              let data = std::fs::read(path).unwrap();
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              let mut checksum = 0u64;
+              if decoder.is_animated() {
+                  loop {
+                      match decoder.read_frame(&mut buf) {
+                          Ok(duration) => {
+                              checksum = checksum.wrapping_add(u64::from(duration));
+                              checksum = checksum.wrapping_add(u64::from(buf[buf.len() / 2]));
+                          }
+                          Err(DecodingError::NoMoreFrames) => break,
+                          Err(err) => panic!("decode failed: {err:?}"),
+                      }
+                  }
+              } else {
+                  decoder.read_image(&mut buf).unwrap();
+                  checksum = checksum.wrapping_add(u64::from(buf[buf.len() / 2]));
+              }
+              black_box(checksum);
+          }
+          RS
+
+          for dir in /tmp/webp-main /tmp/webp-branch; do
+            mkdir -p "$dir/examples"
+            cp /tmp/decode_profile.rs "$dir/examples/decode_profile.rs"
+            (cd "$dir" && RUSTFLAGS='-C debuginfo=1 -C force-frame-pointers=yes' cargo build --release --example decode_profile)
+          done
+
+      - name: Fetch issue 119 workload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/issue119
+          curl -L --fail --retry 3 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/sample.zip -d /tmp/issue119
+          ISSUE119_FILE="$(find /tmp/issue119 -type f -iname '*.webp' | head -n 1)"
+          test -n "$ISSUE119_FILE"
+          echo "ISSUE119_FILE=$ISSUE119_FILE" >> "$GITHUB_ENV"
+
+      - name: Run Callgrind profiles
+        shell: bash
+        run: |
+          set -euxo pipefail
+          MAIN=/tmp/webp-main/target/release/examples/decode_profile
+          BRANCH=/tmp/webp-branch/target/release/examples/decode_profile
+
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/main.callgrind "$MAIN" "$ISSUE119_FILE"
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/branch.callgrind "$BRANCH" "$ISSUE119_FILE"
+
+          callgrind_annotate --inclusive=yes --threshold=0.10 /tmp/main.callgrind > /tmp/main.annotate
+          callgrind_annotate --inclusive=yes --threshold=0.10 /tmp/branch.callgrind > /tmp/branch.annotate
+
+          echo '=== MAIN IMAGE-WEBP FUNCTIONS ==='
+          grep -E 'PROGRAM TOTALS|image_webp::|image_webp\b' /tmp/main.annotate | head -n 160 || true
+          echo '=== BRANCH IMAGE-WEBP FUNCTIONS ==='
+          grep -E 'PROGRAM TOTALS|image_webp::|image_webp\b' /tmp/branch.annotate | head -n 160 || true
+
+      - name: Persist profile summary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+
+          def total(path):
+              text=pathlib.Path(path).read_text(errors='replace')
+              m=re.search(r'^([0-9,]+) \(100\.0%\).*PROGRAM TOTALS', text, re.M)
+              return int(m.group(1).replace(',','')) if m else None
+
+          def filtered(path):
+              lines=pathlib.Path(path).read_text(errors='replace').splitlines()
+              selected=[line for line in lines if 'PROGRAM TOTALS' in line or 'image_webp::' in line or 'image_webp' in line]
+              return '\n'.join(selected[:180])
+
+          mt=total('/tmp/main.annotate'); bt=total('/tmp/branch.annotate')
+          ratio=(mt/bt) if mt and bt else None
+          lines=[
+              '# Issue 119 post-optimization Callgrind profile','',
+              f'- main: `{os.environ["MAIN_SHA"]}`',
+              f'- optimized branch: `{os.environ["BRANCH_SHA"]}`',
+              f'- CPU: `{os.environ.get("CPU_MODEL","unknown")}`',
+              f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH","unknown")}` / `{os.environ.get("CPU_COUNT","unknown")}`',
+              '- workload: exact issue #119 animated WebP',
+              '- profiler: Callgrind, one complete animation decode per variant, pinned to CPU 0',
+              '- release builds with line debug info; no source candidate applied','',
+          ]
+          if mt and bt:
+              lines += [f'- main instruction references: `{mt:,}`', f'- optimized instruction references: `{bt:,}`', f'- instruction-count improvement: `{ratio:.3f}x` ({(1-bt/mt)*100:.2f}% fewer)','']
+          lines += ['## Main filtered attribution','','```text',filtered('/tmp/main.annotate'),'```','','## Optimized branch filtered attribution','','```text',filtered('/tmp/branch.annotate'),'```','']
+          pathlib.Path('/tmp/profile-issue119-callgrind.md').write_text('\n'.join(lines))
+          PY
+
+          cp /tmp/profile-issue119-callgrind.md profile-issue119-callgrind.md
+          git add profile-issue119-callgrind.md
+          git commit -m 'Record optimized issue 119 profile'
+          git push origin HEAD:performance-optimizations
