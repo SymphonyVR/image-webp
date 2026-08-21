@@ -87,19 +87,31 @@ pub(crate) fn composite_frame(
     let height = frame_height.min(canvas_height.saturating_sub(frame_offset_y)) as usize;
 
     if frame_has_alpha && frame_use_alpha_blending {
+        let frame_stride = frame_width as usize * 4;
+        let canvas_stride = canvas_width as usize * 4;
+
         for y in 0..height {
-            for x in 0..width {
-                let frame_index = (x + y * frame_width as usize) * 4;
-                let canvas_index = ((x + frame_offset_x as usize)
-                    + (y + frame_offset_y as usize) * canvas_width as usize)
-                    * 4;
+            let frame_start = y * frame_stride;
+            let canvas_start =
+                (y + frame_offset_y as usize) * canvas_stride + frame_offset_x as usize * 4;
+            let input_row = &frame[frame_start..][..width * 4];
+            let output_row = &mut canvas[canvas_start..][..width * 4];
 
-                let input = &frame[frame_index..][..4];
-                let output = &mut canvas[canvas_index..][..4];
-
-                let blended =
-                    do_alpha_blending(input.try_into().unwrap(), output.try_into().unwrap());
-                output.copy_from_slice(&blended);
+            for (input, output) in input_row
+                .chunks_exact(4)
+                .zip(output_row.chunks_exact_mut(4))
+            {
+                match input[3] {
+                    0 => {}
+                    255 => output.copy_from_slice(input),
+                    _ => {
+                        let blended = do_alpha_blending(
+                            input.try_into().unwrap(),
+                            output.try_into().unwrap(),
+                        );
+                        output.copy_from_slice(&blended);
+                    }
+                }
             }
         }
     } else if frame_has_alpha {
@@ -128,6 +140,7 @@ pub(crate) fn composite_frame(
     }
 }
 
+#[inline]
 pub(crate) fn get_alpha_predictor(
     x: usize,
     y: usize,
@@ -186,6 +199,58 @@ pub(crate) fn get_alpha_predictor(
 
             let combination = i16::from(left) + i16::from(top) - i16::from(top_left);
             i16::clamp(combination, 0, 255).try_into().unwrap()
+        }
+    }
+}
+
+fn reconstruct_alpha(data: &mut [u8], width: usize, filtering_method: FilteringMethod) {
+    if data.is_empty() || width == 0 {
+        return;
+    }
+
+    debug_assert_eq!(data.len() % width, 0);
+    let height = data.len() / width;
+
+    match filtering_method {
+        FilteringMethod::None => {}
+        FilteringMethod::Horizontal => {
+            for y in 0..height {
+                let row = y * width;
+                if y != 0 {
+                    data[row] = data[row].wrapping_add(data[row - width]);
+                }
+                for x in 1..width {
+                    let i = row + x;
+                    data[i] = data[i].wrapping_add(data[i - 1]);
+                }
+            }
+        }
+        FilteringMethod::Vertical => {
+            for x in 1..width {
+                data[x] = data[x].wrapping_add(data[x - 1]);
+            }
+            for y in 1..height {
+                let row = y * width;
+                for x in 0..width {
+                    let i = row + x;
+                    data[i] = data[i].wrapping_add(data[i - width]);
+                }
+            }
+        }
+        FilteringMethod::Gradient => {
+            for x in 1..width {
+                data[x] = data[x].wrapping_add(data[x - 1]);
+            }
+            for y in 1..height {
+                let row = y * width;
+                data[row] = data[row].wrapping_add(data[row - width]);
+                for x in 1..width {
+                    let i = row + x;
+                    let predictor = i16::from(data[i - 1]) + i16::from(data[i - width])
+                        - i16::from(data[i - width - 1]);
+                    data[i] = data[i].wrapping_add(predictor.clamp(0, 255) as u8);
+                }
+            }
         }
     }
 }
@@ -281,16 +346,14 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
         _ => return Err(DecodingError::InvalidCompressionMethod),
     };
 
-    let data = if lossless_compression {
+    let mut data = if lossless_compression {
         let mut decoder = LosslessDecoder::new(reader);
 
         let mut data = vec![0; usize::from(width) * usize::from(height) * 4];
         decoder.decode_frame(u32::from(width), u32::from(height), true, &mut data)?;
 
-        let mut green = vec![0; usize::from(width) * usize::from(height)];
-        for (rgba_val, green_val) in data.chunks_exact(4).zip(green.iter_mut()) {
-            *green_val = rgba_val[1];
-        }
+        let mut green = Vec::with_capacity(usize::from(width) * usize::from(height));
+        green.extend(data.chunks_exact(4).map(|rgba| rgba[1]));
         green
     } else {
         let mut framedata = vec![0; width as usize * height as usize];
@@ -298,9 +361,13 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
         framedata
     };
 
+    reconstruct_alpha(&mut data, usize::from(width), filtering_method);
+
     let chunk = AlphaChunk {
         _preprocessing: preprocessing,
-        filtering_method,
+        // The plane has already been reconstructed contiguously above. Keep
+        // the existing decoder loop compatible by making its predictor a no-op.
+        filtering_method: FilteringMethod::None,
         data,
     };
 
@@ -310,6 +377,59 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconstruct_alpha_filters() {
+        let residuals = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let cases = [
+            (
+                FilteringMethod::None,
+                [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            ),
+            (
+                FilteringMethod::Horizontal,
+                [1, 3, 6, 10, 6, 12, 19, 27, 15, 25, 36, 48],
+            ),
+            (
+                FilteringMethod::Vertical,
+                [1, 3, 6, 10, 6, 9, 13, 18, 15, 19, 24, 30],
+            ),
+            (
+                FilteringMethod::Gradient,
+                [1, 3, 6, 10, 6, 14, 24, 36, 15, 33, 54, 78],
+            ),
+        ];
+
+        for (filter, expected) in cases {
+            let mut data = residuals;
+            reconstruct_alpha(&mut data, 4, filter);
+            assert_eq!(data, expected);
+        }
+    }
+
+    #[test]
+    fn binary_alpha_blend_selects_exact_pixel() {
+        let mut canvas = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let frame = vec![1, 2, 3, 0, 200, 201, 202, 255];
+        composite_frame(
+            &mut canvas,
+            2,
+            1,
+            None,
+            &frame,
+            0,
+            0,
+            2,
+            1,
+            true,
+            true,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(canvas, [10, 20, 30, 40, 200, 201, 202, 255]);
+    }
 
     /// Regression test: clearing the canvas for a non-alpha frame used 3-byte
     /// stride on the always-RGBA canvas, corrupting pixel alignment.
