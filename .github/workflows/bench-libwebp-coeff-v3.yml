@@ -1,0 +1,126 @@
+name: Libwebp-style VP8 coefficient A-B v3
+on:
+  push:
+    branches: [ bench-dct-value-fused-v2 ]
+    paths: [ .github/workflows/bench-libwebp-coeff-v3.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Build candidate source from verified patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          python3 - <<'PY'
+          from pathlib import Path
+          text=Path('.github/workflows/bench-libwebp-coeff-structure.yml').read_text()
+          start=text.index("          python3 - <<'PY'\n") + len("          python3 - <<'PY'\n")
+          end=text.index("\n          PY\n", start)
+          body=text[start:end]
+          body='\n'.join(line[10:] if line.startswith('          ') else line for line in body.splitlines())
+          Path('/tmp/apply.py').write_text(body+'\n')
+          PY
+          python3 /tmp/apply.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/arithmetic_decoder.rs'); s=p.read_text()
+          dead1='''    // Do not inline this because inlining seems to worsen performance.\n    #[inline(never)]\n    pub(crate) fn read_sign(&mut self) -> BitResult<bool> {\n        if let Some(b) = self.fast().read_sign() {\n            return BitResult::ok(b);\n        }\n\n        self.cold_read_flag()\n    }\n\n'''
+          dead2='''    fn read_sign(mut self) -> Option<bool> {\n        let value = self.fast_read_sign();\n        self.commit_if_valid(value)\n    }\n\n'''
+          for dead in (dead1,dead2):
+              if dead not in s: raise SystemExit('dead sign wrapper marker missing')
+              s=s.replace(dead,'',1)
+          p.write_text(s)
+          PY
+          cargo fmt
+          git diff --check
+          git add src/lossy/mod.rs src/lossy/arithmetic_decoder.rs
+          git commit -m 'Decode VP8 coefficients with libwebp-style structure'
+          echo "CAND=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Verify candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Build A/B executables
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$CAND"
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::{hint::black_box, io::Cursor, time::Instant};
+          #[inline] fn hb(mut h:u64,b:u8)->u64{h^=u64::from(b);h.wrapping_mul(1099511628211)}
+          fn decode(data:&[u8])->u64{
+              let mut d=WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf=vec![0;d.output_buffer_size().unwrap()];
+              let mut h=1469598103934665603u64;
+              if d.is_animated(){loop{match d.read_frame(&mut buf){Ok(ts)=>{for b in ts.to_le_bytes(){h=hb(h,b);}for &b in &buf{h=hb(h,b);}},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}
+              else{d.read_image(&mut buf).unwrap();for &b in &buf{h=hb(h,b);}}
+              black_box(h)
+          }
+          fn main(){let mut a=std::env::args().skip(1);let p=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let w:usize=a.next().unwrap().parse().unwrap();let data=std::fs::read(p).unwrap();for _ in 0..w{black_box(decode(&data));}let t=Instant::now();let mut h=0u64;for _ in 0..n{h^=decode(&data);}println!("{:.3}\t{:016x}",t.elapsed().as_secs_f64()*1e6/n as f64,h);}
+          RS
+          for d in /tmp/base /tmp/cand; do
+            mkdir -p "$d/examples"; cp /tmp/bench.rs "$d/examples/libwebp_coeff_v3.rs"
+            (cd "$d" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example libwebp_coeff_v3)
+          done
+      - name: Fetch fixtures and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 5 -o /tmp/119.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/119.zip -d /tmp/119
+          curl -L --fail --retry 5 -o /tmp/136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip
+          unzip -q /tmp/136.zip -d /tmp/136
+          I119=$(find /tmp/119 -iname '*.webp'|head -n1); I136=$(find /tmp/136 -iname '*.webp'|head -n1)
+          B=/tmp/base/target/release/examples/libwebp_coeff_v3; C=/tmp/cand/target/release/examples/libwebp_coeff_v3
+          H119B=$(taskset -c 0 "$B" "$I119" 1 0|cut -f2); H119C=$(taskset -c 0 "$C" "$I119" 1 0|cut -f2)
+          H136B=$(taskset -c 0 "$B" "$I136" 1 0|cut -f2); H136C=$(taskset -c 0 "$C" "$I136" 1 0|cut -f2)
+          test "$H119B" = "$H119C"; test "$H136B" = "$H136C"
+          echo "HASH119=$H119B" >> "$GITHUB_ENV"; echo "HASH136=$H136B" >> "$GITHUB_ENV"
+          : >/tmp/r.tsv
+          for r in {1..13}; do
+            if ((r%2));then order='base cand';else order='cand base';fi
+            for v in $order;do [[ $v == base ]]&&x=$B||x=$C
+              us=$(taskset -c 0 "$x" "$I119" 3 0|cut -f1); printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$us">>/tmp/r.tsv
+              us=$(taskset -c 0 "$x" "$I136" 16 0|cut -f1); printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$us">>/tmp/r.tsv
+            done
+          done
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t')); g={}; rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# Libwebp-style VP8 coefficient A/B','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`','- full decoded output hashes match before timing',f'- issue119 hash: `{os.environ["HASH119"]}`',f'- issue136 hash: `{os.environ["HASH136"]}`','', '| Workload | baseline | candidate | ratio | paired median | paired range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('issue119','issue136'):
+              b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w]
+              L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {b/c:.3f}x | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+          L+=['','```tsv','workload\tround\tvariant\tus']+['\t'.join(r) for r in rows]+['```','']
+          pathlib.Path('/tmp/out.md').write_text('\n'.join(L))
+          PY
+          git reset --hard "$BASE"
+          cp /tmp/out.md benchmark-libwebp-coeff-v3.md
+          git add benchmark-libwebp-coeff-v3.md
+          git commit -m 'Record libwebp-style VP8 coefficient A/B'
+          git push origin HEAD:bench-dct-value-fused-v2
