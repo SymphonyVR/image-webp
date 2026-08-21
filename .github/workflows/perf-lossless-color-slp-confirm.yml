@@ -1,0 +1,220 @@
+name: Temporary safe color-transform SLP confirmation
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/perf-lossless-color-slp-confirm.yml
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Record baseline and runner CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASELINE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "CPU_ARCH=$(uname -m)"
+            echo "CPU_COUNT=$(nproc)"
+          } >> "$GITHUB_ENV"
+          lscpu
+
+      - name: Apply fixed-width safe color-transform candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/lossless/decoder/reverse_transform.rs')
+          text = path.read_text()
+
+          marker = '''pub(crate) fn apply_color_transform(\n    image_data: &mut [u8],\n    width: u16,\n    size_bits: u8,\n    transform_data: &[u8],\n) {\n'''
+          helper = '''#[inline(always)]\nfn transform_color_four_pixels(\n    pixels: &mut [u8; 16],\n    red_to_blue: i8,\n    green_to_blue: i8,\n    green_to_red: i8,\n) {\n    let green0 = pixels[1] as i8;\n    let green1 = pixels[5] as i8;\n    let green2 = pixels[9] as i8;\n    let green3 = pixels[13] as i8;\n\n    let red0 = u32::from(pixels[0]) + color_transform_delta(green_to_red, green0);\n    let red1 = u32::from(pixels[4]) + color_transform_delta(green_to_red, green1);\n    let red2 = u32::from(pixels[8]) + color_transform_delta(green_to_red, green2);\n    let red3 = u32::from(pixels[12]) + color_transform_delta(green_to_red, green3);\n\n    let blue0 = u32::from(pixels[2])\n        + color_transform_delta(green_to_blue, green0)\n        + color_transform_delta(red_to_blue, red0 as i8);\n    let blue1 = u32::from(pixels[6])\n        + color_transform_delta(green_to_blue, green1)\n        + color_transform_delta(red_to_blue, red1 as i8);\n    let blue2 = u32::from(pixels[10])\n        + color_transform_delta(green_to_blue, green2)\n        + color_transform_delta(red_to_blue, red2 as i8);\n    let blue3 = u32::from(pixels[14])\n        + color_transform_delta(green_to_blue, green3)\n        + color_transform_delta(red_to_blue, red3 as i8);\n\n    pixels[0] = (red0 & 0xff) as u8;\n    pixels[2] = (blue0 & 0xff) as u8;\n    pixels[4] = (red1 & 0xff) as u8;\n    pixels[6] = (blue1 & 0xff) as u8;\n    pixels[8] = (red2 & 0xff) as u8;\n    pixels[10] = (blue2 & 0xff) as u8;\n    pixels[12] = (red3 & 0xff) as u8;\n    pixels[14] = (blue3 & 0xff) as u8;\n}\n\npub(crate) fn apply_color_transform(\n    image_data: &mut [u8],\n    width: u16,\n    size_bits: u8,\n    transform_data: &[u8],\n) {\n'''
+          if marker not in text:
+              raise SystemExit('apply_color_transform marker not found')
+          text = text.replace(marker, helper, 1)
+
+          old_loop = '''            for pixel in block.chunks_exact_mut(4) {\n                let green = u32::from(pixel[1]);\n                let mut temp_red = u32::from(pixel[0]);\n                let mut temp_blue = u32::from(pixel[2]);\n\n                temp_red += color_transform_delta(green_to_red as i8, green as i8);\n                temp_blue += color_transform_delta(green_to_blue as i8, green as i8);\n                temp_blue += color_transform_delta(red_to_blue as i8, temp_red as i8);\n\n                pixel[0] = (temp_red & 0xff) as u8;\n                pixel[2] = (temp_blue & 0xff) as u8;\n            }\n'''
+          new_loop = '''            let red_to_blue = red_to_blue as i8;\n            let green_to_blue = green_to_blue as i8;\n            let green_to_red = green_to_red as i8;\n\n            let mut chunks32 = block.chunks_exact_mut(32);\n            for chunk in &mut chunks32 {\n                let (first, second) = chunk.split_at_mut(16);\n                let first: &mut [u8; 16] = first.try_into().unwrap();\n                let second: &mut [u8; 16] = second.try_into().unwrap();\n                transform_color_four_pixels(first, red_to_blue, green_to_blue, green_to_red);\n                transform_color_four_pixels(second, red_to_blue, green_to_blue, green_to_red);\n            }\n\n            let mut chunks16 = chunks32.into_remainder().chunks_exact_mut(16);\n            for chunk in &mut chunks16 {\n                let chunk: &mut [u8; 16] = chunk.try_into().unwrap();\n                transform_color_four_pixels(chunk, red_to_blue, green_to_blue, green_to_red);\n            }\n\n            for pixel in chunks16.into_remainder().chunks_exact_mut(4) {\n                let green = u32::from(pixel[1]);\n                let mut temp_red = u32::from(pixel[0]);\n                let mut temp_blue = u32::from(pixel[2]);\n\n                temp_red += color_transform_delta(green_to_red, green as i8);\n                temp_blue += color_transform_delta(green_to_blue, green as i8);\n                temp_blue += color_transform_delta(red_to_blue, temp_red as i8);\n\n                pixel[0] = (temp_red & 0xff) as u8;\n                pixel[2] = (temp_blue & 0xff) as u8;\n            }\n'''
+          if old_loop not in text:
+              raise SystemExit('color transform scalar loop not found')
+          text = text.replace(old_loop, new_loop, 1)
+
+          delta = '''fn color_transform_delta(t: i8, c: i8) -> u32 {\n    (i32::from(t) * i32::from(c)) as u32 >> 5\n}\n'''
+          delta_inline = '''#[inline(always)]\nfn color_transform_delta(t: i8, c: i8) -> u32 {\n    (i32::from(t) * i32::from(c)) as u32 >> 5\n}\n'''
+          if delta not in text:
+              raise SystemExit('color_transform_delta not found')
+          path.write_text(text.replace(delta, delta_inline, 1))
+          PY
+
+          cargo fmt
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- src/lossless/decoder/reverse_transform.rs
+          git commit -m 'Expose lossless color-transform lanes to SLP'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify stable and MSRV
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+
+      - name: Prepare benchmark worktrees and corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/webp-base "$BASELINE_SHA"
+          git worktree add --detach /tmp/webp-candidate "$CANDIDATE_SHA"
+          cat >/tmp/decode_corpus.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+
+          fn decode_once(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              decoder.read_image(&mut buf).unwrap();
+              let checksum = (buf.len() as u64).wrapping_add(u64::from(buf[buf.len() / 2]));
+              black_box(checksum)
+          }
+
+          fn main() {
+              let mut args = std::env::args().skip(1);
+              let iterations: usize = args.next().unwrap().parse().unwrap();
+              let warmups: usize = args.next().unwrap().parse().unwrap();
+              let paths: Vec<_> = args.collect();
+              let images: Vec<Vec<u8>> = paths.iter().map(std::fs::read).collect::<Result<_, _>>().unwrap();
+              for _ in 0..warmups { for data in &images { black_box(decode_once(data)); } }
+              let start = Instant::now();
+              let mut checksum = 0u64;
+              for _ in 0..iterations { for data in &images { checksum = checksum.wrapping_add(decode_once(data)); } }
+              black_box(checksum);
+              println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / (iterations * images.len()) as f64);
+          }
+          RS
+          for dir in /tmp/webp-base /tmp/webp-candidate; do
+            mkdir -p "$dir/examples"
+            cp /tmp/decode_corpus.rs "$dir/examples/decode_corpus.rs"
+            (cd "$dir" && cargo build --release --example decode_corpus)
+          done
+          python3 - <<'PY' >/tmp/vp8l-files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data) < 12 or data[:4] != b'RIFF' or data[8:12] != b'WEBP': return []
+              out=[]; p=12
+              while p+8 <= len(data):
+                  fourcc=data[p:p+4]; n=int.from_bytes(data[p+4:p+8], 'little'); out.append(fourcc); p += 8+n+(n&1)
+              return out
+          files=[]
+          for path in sorted(Path('tests/images').rglob('*.webp')):
+              c=chunks(path.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: files.append(path.resolve())
+          if not files: raise SystemExit('no static VP8L fixtures')
+          print(*files, sep='\n')
+          PY
+          echo "VP8L_COUNT=$(wc -l </tmp/vp8l-files.txt)" >> "$GITHUB_ENV"
+
+      - name: Run high-precision default-target corpus A/B
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=/tmp/webp-base/target/release/examples/decode_corpus
+          CAND=/tmp/webp-candidate/target/release/examples/decode_corpus
+          mapfile -t FILES </tmp/vp8l-files.txt
+          : >/tmp/corpus.tsv
+          taskset -c 0 "$BASE" 10 3 "${FILES[@]}" >/dev/null
+          taskset -c 0 "$CAND" 10 3 "${FILES[@]}" >/dev/null
+          for round in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+            if (( round % 2 )); then order="baseline candidate"; else order="candidate baseline"; fi
+            for variant in $order; do
+              [[ "$variant" == baseline ]] && bin="$BASE" || bin="$CAND"
+              value="$(taskset -c 0 "$bin" 150 0 "${FILES[@]}")"
+              printf 'vp8l_default\t%s\t%s\t%s\n' "$round" "$variant" "$value" >>/tmp/corpus.tsv
+            done
+          done
+          cat /tmp/corpus.tsv
+
+      - name: Run nightly color-transform microbenchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rustup toolchain install nightly --profile minimal
+          run_bench() {
+            local dir="$1"
+            (cd "$dir" && taskset -c 0 cargo +nightly bench --features _benchmarks -- color_transform 2>&1) \
+              | awk '/color_transform.*bench:/ { for (i=1; i<=NF; i++) if ($i == "bench:") { gsub(",", "", $(i+1)); print $(i+1); exit } }'
+          }
+          : >/tmp/micro.tsv
+          run_bench /tmp/webp-base >/dev/null
+          run_bench /tmp/webp-candidate >/dev/null
+          for round in 1 2 3 4 5; do
+            if (( round % 2 )); then order="baseline candidate"; else order="candidate baseline"; fi
+            for variant in $order; do
+              [[ "$variant" == baseline ]] && dir=/tmp/webp-base || dir=/tmp/webp-candidate
+              value="$(run_bench "$dir")"
+              test -n "$value"
+              printf 'color_transform_ns\t%s\t%s\t%s\n' "$round" "$variant" "$value" >>/tmp/micro.tsv
+            done
+          done
+          cat /tmp/micro.tsv
+
+      - name: Persist confirmation without candidate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv, os, statistics, pathlib
+          def summary(path):
+              rows=list(csv.reader(open(path), delimiter='\t')); groups={}; rounds={}
+              for _, r, v, x in rows:
+                  x=float(x); groups.setdefault(v,[]).append(x); rounds.setdefault(int(r),{})[v]=x
+              b=statistics.median(groups['baseline']); c=statistics.median(groups['candidate'])
+              p=[x['baseline']/x['candidate'] for _,x in sorted(rounds.items())]
+              return rows,b,c,p
+          cr,cb,cc,cp=summary('/tmp/corpus.tsv'); mr,mb,mc,mp=summary('/tmp/micro.tsv')
+          lines=[
+              '# Safe color-transform SLP confirmation','',
+              f'- branch baseline: `{os.environ["BASELINE_SHA"]}`',
+              f'- ephemeral candidate: `{os.environ["CANDIDATE_SHA"]}`',
+              f'- CPU: `{os.environ.get("CPU_MODEL","unknown")}`',
+              f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH","unknown")}` / `{os.environ.get("CPU_COUNT","unknown")}`',
+              f'- static VP8L fixtures: `{os.environ.get("VP8L_COUNT","unknown")}`',
+              '- candidate remains 100% safe Rust and builds on MSRV 1.80.1',
+              '- normal release target; 13 alternating high-precision corpus rounds','',
+              '| Workload | baseline median | candidate median | ratio | paired median | paired range |',
+              '|---|---:|---:|---:|---:|---:|',
+              f'| VP8L corpus (us/decode) | {cb:.3f} | {cc:.3f} | {cb/cc:.3f}x | {statistics.median(cp):.3f}x | {min(cp):.3f}–{max(cp):.3f}x |',
+              f'| color_transform (ns/iter) | {mb:.3f} | {mc:.3f} | {mb/mc:.3f}x | {statistics.median(mp):.3f}x | {min(mp):.3f}–{max(mp):.3f}x |','',
+              '## Corpus raw samples','','```tsv','workload\tround\tvariant\tvalue',
+              *['\t'.join(r) for r in cr],'```','','## Microbenchmark raw samples','','```tsv','workload\tround\tvariant\tvalue',
+              *['\t'.join(r) for r in mr],'```',''
+          ]
+          pathlib.Path('/tmp/benchmark-lossless-color-slp-confirm.md').write_text('\n'.join(lines))
+          PY
+          git reset --hard "$BASELINE_SHA"
+          cp /tmp/benchmark-lossless-color-slp-confirm.md benchmark-lossless-color-slp-confirm.md
+          git add benchmark-lossless-color-slp-confirm.md
+          git commit -m 'Confirm safe color-transform SLP benchmark'
+          git push origin HEAD:performance-optimizations
