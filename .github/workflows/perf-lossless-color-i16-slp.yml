@@ -1,0 +1,171 @@
+name: Temporary safe i16 color-transform SLP benchmark
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/perf-lossless-color-i16-slp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Record baseline and CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASELINE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "CPU_ARCH=$(uname -m)"
+            echo "CPU_COUNT=$(nproc)"
+          } >> "$GITHUB_ENV"
+          lscpu
+
+      - name: Apply safe i16 SLP candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/lossless/decoder/reverse_transform.rs')
+          text = path.read_text()
+
+          old_delta = '''/// Does color transform on 2 numbers\nfn color_transform_delta(t: i8, c: i8) -> u32 {\n    (i32::from(t) * i32::from(c)) as u32 >> 5\n}\n'''
+          new_delta = '''/// Low byte of the signed color-transform delta.\n/// The i8 product fits exactly in i16, and the transform is observed modulo 256.\n#[inline(always)]\nfn color_transform_delta(t: i8, c: i8) -> u8 {\n    ((i16::from(t) * i16::from(c)) >> 5) as u8\n}\n'''
+          if old_delta not in text:
+              raise SystemExit('color_transform_delta block not found')
+          text = text.replace(old_delta, new_delta, 1)
+
+          marker = '''pub(crate) fn apply_color_transform(\n    image_data: &mut [u8],\n    width: u16,\n    size_bits: u8,\n    transform_data: &[u8],\n) {\n'''
+          helper = '''#[inline(always)]\nfn transform_color_four_pixels_i16(\n    pixels: &mut [u8; 16],\n    red_to_blue: i8,\n    green_to_blue: i8,\n    green_to_red: i8,\n) {\n    let g0 = pixels[1] as i8;\n    let g1 = pixels[5] as i8;\n    let g2 = pixels[9] as i8;\n    let g3 = pixels[13] as i8;\n\n    let r0 = pixels[0].wrapping_add(color_transform_delta(green_to_red, g0));\n    let r1 = pixels[4].wrapping_add(color_transform_delta(green_to_red, g1));\n    let r2 = pixels[8].wrapping_add(color_transform_delta(green_to_red, g2));\n    let r3 = pixels[12].wrapping_add(color_transform_delta(green_to_red, g3));\n\n    let b0 = pixels[2]\n        .wrapping_add(color_transform_delta(green_to_blue, g0))\n        .wrapping_add(color_transform_delta(red_to_blue, r0 as i8));\n    let b1 = pixels[6]\n        .wrapping_add(color_transform_delta(green_to_blue, g1))\n        .wrapping_add(color_transform_delta(red_to_blue, r1 as i8));\n    let b2 = pixels[10]\n        .wrapping_add(color_transform_delta(green_to_blue, g2))\n        .wrapping_add(color_transform_delta(red_to_blue, r2 as i8));\n    let b3 = pixels[14]\n        .wrapping_add(color_transform_delta(green_to_blue, g3))\n        .wrapping_add(color_transform_delta(red_to_blue, r3 as i8));\n\n    pixels[0] = r0;\n    pixels[2] = b0;\n    pixels[4] = r1;\n    pixels[6] = b1;\n    pixels[8] = r2;\n    pixels[10] = b2;\n    pixels[12] = r3;\n    pixels[14] = b3;\n}\n\npub(crate) fn apply_color_transform(\n    image_data: &mut [u8],\n    width: u16,\n    size_bits: u8,\n    transform_data: &[u8],\n) {\n'''
+          if marker not in text:
+              raise SystemExit('apply_color_transform marker not found')
+          text = text.replace(marker, helper, 1)
+
+          old_loop = '''            for pixel in block.chunks_exact_mut(4) {\n                let green = u32::from(pixel[1]);\n                let mut temp_red = u32::from(pixel[0]);\n                let mut temp_blue = u32::from(pixel[2]);\n\n                temp_red += color_transform_delta(green_to_red as i8, green as i8);\n                temp_blue += color_transform_delta(green_to_blue as i8, green as i8);\n                temp_blue += color_transform_delta(red_to_blue as i8, temp_red as i8);\n\n                pixel[0] = (temp_red & 0xff) as u8;\n                pixel[2] = (temp_blue & 0xff) as u8;\n            }\n'''
+          new_loop = '''            let red_to_blue = red_to_blue as i8;\n            let green_to_blue = green_to_blue as i8;\n            let green_to_red = green_to_red as i8;\n\n            let mut chunks32 = block.chunks_exact_mut(32);\n            for chunk in &mut chunks32 {\n                let (first, second) = chunk.split_at_mut(16);\n                let first: &mut [u8; 16] = first.try_into().unwrap();\n                let second: &mut [u8; 16] = second.try_into().unwrap();\n                transform_color_four_pixels_i16(first, red_to_blue, green_to_blue, green_to_red);\n                transform_color_four_pixels_i16(second, red_to_blue, green_to_blue, green_to_red);\n            }\n\n            let mut chunks16 = chunks32.into_remainder().chunks_exact_mut(16);\n            for chunk in &mut chunks16 {\n                let chunk: &mut [u8; 16] = chunk.try_into().unwrap();\n                transform_color_four_pixels_i16(chunk, red_to_blue, green_to_blue, green_to_red);\n            }\n\n            for pixel in chunks16.into_remainder().chunks_exact_mut(4) {\n                let green = pixel[1] as i8;\n                let red = pixel[0].wrapping_add(color_transform_delta(green_to_red, green));\n                let blue = pixel[2]\n                    .wrapping_add(color_transform_delta(green_to_blue, green))\n                    .wrapping_add(color_transform_delta(red_to_blue, red as i8));\n                pixel[0] = red;\n                pixel[2] = blue;\n            }\n'''
+          if old_loop not in text:
+              raise SystemExit('color transform loop not found')
+          text = text.replace(old_loop, new_loop, 1)
+
+          bench_marker = '''    #[bench]\n    fn color_transform(b: &mut Bencher) {\n'''
+          test = '''    #[test]\n    fn color_transform_delta_i16_is_bit_exact() {\n        for t_byte in 0u8..=u8::MAX {\n            let t = t_byte as i8;\n            for c_byte in 0u8..=u8::MAX {\n                let c = c_byte as i8;\n                let old = ((i32::from(t) * i32::from(c)) as u32 >> 5) as u8;\n                assert_eq!(super::color_transform_delta(t, c), old);\n            }\n        }\n    }\n\n    #[bench]\n    fn color_transform(b: &mut Bencher) {\n'''
+          if bench_marker not in text:
+              raise SystemExit('color_transform bench marker not found')
+          path.write_text(text.replace(bench_marker, test, 1))
+          PY
+
+          cargo fmt
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/reverse_transform.rs
+          git commit -m 'Use safe i16 lanes for lossless color transform'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify candidate and MSRV
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+
+      - name: Prepare worktrees and VP8L corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/webp-base "$BASELINE_SHA"
+          git worktree add --detach /tmp/webp-candidate "$CANDIDATE_SHA"
+          cat >/tmp/decode_corpus.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+          fn decode_once(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              decoder.read_image(&mut buf).unwrap();
+              black_box((buf.len() as u64).wrapping_add(u64::from(buf[buf.len()/2])))
+          }
+          fn main() {
+              let mut a=std::env::args().skip(1); let it:usize=a.next().unwrap().parse().unwrap(); let warm:usize=a.next().unwrap().parse().unwrap();
+              let paths:Vec<_>=a.collect(); let imgs:Vec<Vec<u8>>=paths.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();
+              for _ in 0..warm { for d in &imgs { black_box(decode_once(d)); } }
+              let start=Instant::now(); let mut sum=0u64;
+              for _ in 0..it { for d in &imgs { sum=sum.wrapping_add(decode_once(d)); } }
+              black_box(sum); println!("{:.3}", start.elapsed().as_secs_f64()*1_000_000.0/(it*imgs.len()) as f64);
+          }
+          RS
+          for dir in /tmp/webp-base /tmp/webp-candidate; do mkdir -p "$dir/examples"; cp /tmp/decode_corpus.rs "$dir/examples/decode_corpus.rs"; (cd "$dir" && cargo build --release --example decode_corpus); done
+          python3 - <<'PY' >/tmp/vp8l-files.txt
+          from pathlib import Path
+          def chunks(d):
+              if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP': return []
+              out=[]; p=12
+              while p+8<=len(d):
+                  cc=d[p:p+4]; n=int.from_bytes(d[p+4:p+8],'little'); out.append(cc); p += 8+n+(n&1)
+              return out
+          fs=[]
+          for p in sorted(Path('tests/images').rglob('*.webp')):
+              c=chunks(p.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: fs.append(p.resolve())
+          if not fs: raise SystemExit('no VP8L fixtures')
+          print(*fs,sep='\n')
+          PY
+          echo "VP8L_COUNT=$(wc -l </tmp/vp8l-files.txt)" >> "$GITHUB_ENV"
+
+      - name: Run default-target corpus A/B
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=/tmp/webp-base/target/release/examples/decode_corpus; CAND=/tmp/webp-candidate/target/release/examples/decode_corpus; mapfile -t FILES </tmp/vp8l-files.txt; : >/tmp/corpus.tsv
+          taskset -c 0 "$BASE" 10 3 "${FILES[@]}" >/dev/null; taskset -c 0 "$CAND" 10 3 "${FILES[@]}" >/dev/null
+          for round in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+            if ((round%2)); then order="baseline candidate"; else order="candidate baseline"; fi
+            for v in $order; do [[ "$v" == baseline ]] && bin="$BASE" || bin="$CAND"; x="$(taskset -c 0 "$bin" 150 0 "${FILES[@]}")"; printf 'vp8l\t%s\t%s\t%s\n' "$round" "$v" "$x" >>/tmp/corpus.tsv; done
+          done
+          cat /tmp/corpus.tsv
+
+      - name: Run nightly color-transform microbenchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rustup toolchain install nightly --profile minimal
+          run_bench() { (cd "$1" && taskset -c 0 cargo +nightly bench --features _benchmarks -- color_transform 2>&1) | awk '/color_transform.*bench:/ {for(i=1;i<=NF;i++) if($i=="bench:"){gsub(",","",$(i+1));print $(i+1);exit}}'; }
+          : >/tmp/micro.tsv; run_bench /tmp/webp-base >/dev/null; run_bench /tmp/webp-candidate >/dev/null
+          for round in 1 2 3 4 5 6 7; do
+            if ((round%2)); then order="baseline candidate"; else order="candidate baseline"; fi
+            for v in $order; do [[ "$v" == baseline ]] && dir=/tmp/webp-base || dir=/tmp/webp-candidate; x="$(run_bench "$dir")"; test -n "$x"; printf 'color_transform\t%s\t%s\t%s\n' "$round" "$v" "$x" >>/tmp/micro.tsv; done
+          done
+          cat /tmp/micro.tsv
+
+      - name: Persist result without candidate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          def s(p):
+              r=list(csv.reader(open(p),delimiter='\t')); g={}; q={}
+              for _,n,v,x in r: x=float(x);g.setdefault(v,[]).append(x);q.setdefault(int(n),{})[v]=x
+              b=statistics.median(g['baseline']);c=statistics.median(g['candidate']);z=[x['baseline']/x['candidate'] for _,x in sorted(q.items())];return r,b,c,z
+          cr,cb,cc,cp=s('/tmp/corpus.tsv');mr,mb,mc,mp=s('/tmp/micro.tsv')
+          L=['# Safe i16 color-transform SLP benchmark','',f'- branch baseline: `{os.environ["BASELINE_SHA"]}`',f'- ephemeral candidate: `{os.environ["CANDIDATE_SHA"]}`',f'- CPU: `{os.environ.get("CPU_MODEL","unknown")}`',f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH","unknown")}` / `{os.environ.get("CPU_COUNT","unknown")}`',f'- static VP8L fixtures: `{os.environ.get("VP8L_COUNT","unknown")}`','- 100% safe Rust; MSRV 1.80.1; normal release target','', '| Workload | baseline median | candidate median | ratio | paired median | paired range |','|---|---:|---:|---:|---:|---:|',f'| VP8L corpus (us/decode) | {cb:.3f} | {cc:.3f} | {cb/cc:.3f}x | {statistics.median(cp):.3f}x | {min(cp):.3f}–{max(cp):.3f}x |',f'| color_transform (ns/iter) | {mb:.3f} | {mc:.3f} | {mb/mc:.3f}x | {statistics.median(mp):.3f}x | {min(mp):.3f}–{max(mp):.3f}x |','','## Corpus raw','','```tsv','workload\tround\tvariant\tvalue',*['\t'.join(x) for x in cr],'```','','## Micro raw','','```tsv','workload\tround\tvariant\tvalue',*['\t'.join(x) for x in mr],'```','']
+          pathlib.Path('/tmp/benchmark-lossless-color-i16-slp.md').write_text('\n'.join(L))
+          PY
+          git reset --hard "$BASELINE_SHA"; cp /tmp/benchmark-lossless-color-i16-slp.md benchmark-lossless-color-i16-slp.md; git add benchmark-lossless-color-i16-slp.md; git commit -m 'Record safe i16 color-transform benchmark'; git push origin HEAD:performance-optimizations
