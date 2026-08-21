@@ -43,6 +43,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          mkdir -p examples
           cat >examples/decode_profile.rs <<'RS'
           use image_webp::{DecodingError, WebPDecoder};
           use std::hint::black_box;
@@ -133,11 +134,9 @@ jobs:
                   text = m.group(3).strip()
                   if not text or 'PROGRAM TOTALS' in text:
                       continue
-                  # Keep source-attributed statements and discard repeated report headers.
                   if text.startswith('Ir') or set(text) <= {'-'}:
                       continue
                   rows.append((count, pct, text))
-              # Deduplicate identical report rows while keeping the highest count.
               best = {}
               for count, pct, text in rows:
                   prev = best.get(text)
