@@ -1,4 +1,4 @@
-name: Temporary alpha blending scale benchmark
+name: Temporary opaque alpha-blend benchmark
 
 on:
   push:
@@ -20,6 +20,19 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Record runner CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          lscpu
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "CPU_ARCH=$(uname -m)"
+            echo "CPU_COUNT=$(nproc)"
+            echo "CPU_MAX_MHZ=$(lscpu | sed -n 's/^CPU max MHz:[[:space:]]*//p')"
+            echo "CPU_MIN_MHZ=$(lscpu | sed -n 's/^CPU min MHz:[[:space:]]*//p')"
+          } >> "$GITHUB_ENV"
+
       - name: Verify candidate
         shell: bash
         run: |
@@ -33,11 +46,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          BASELINE=a94cdcfb25019388271151e32fc5065f6d995143
+          BASELINE=9e43c7d255506ed2889b50d754b0069dda7c0ff0
           git fetch origin main
           git worktree add --detach /tmp/webp-main origin/main
           git worktree add --detach /tmp/webp-base "$BASELINE"
-          git worktree add --detach /tmp/webp-scale HEAD
+          git worktree add --detach /tmp/webp-opaque HEAD
 
           cat >/tmp/decode_bench.rs <<'RS'
           use image_webp::{DecodingError, WebPDecoder};
@@ -77,16 +90,20 @@ jobs:
               let iterations: usize = args.next().unwrap().parse().unwrap();
               let warmups: usize = args.next().unwrap().parse().unwrap();
               let data = std::fs::read(path).unwrap();
-              for _ in 0..warmups { black_box(decode_once(&data)); }
+              for _ in 0..warmups {
+                  black_box(decode_once(&data));
+              }
               let start = Instant::now();
               let mut sum = 0u64;
-              for _ in 0..iterations { sum = sum.wrapping_add(decode_once(&data)); }
+              for _ in 0..iterations {
+                  sum = sum.wrapping_add(decode_once(&data));
+              }
               black_box(sum);
               println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64);
           }
           RS
 
-          for dir in /tmp/webp-main /tmp/webp-base /tmp/webp-scale; do
+          for dir in /tmp/webp-main /tmp/webp-base /tmp/webp-opaque; do
             mkdir -p "$dir/examples"
             cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
             (cd "$dir" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example decode_bench)
@@ -109,42 +126,43 @@ jobs:
           set -euxo pipefail
           MAIN=/tmp/webp-main/target/release/examples/decode_bench
           BASE=/tmp/webp-base/target/release/examples/decode_bench
-          SCALE=/tmp/webp-scale/target/release/examples/decode_bench
+          OPAQUE=/tmp/webp-opaque/target/release/examples/decode_bench
           RANDOM_FILE="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
-          : > /tmp/results-scale.tsv
+          : > /tmp/results-opaque.tsv
 
-          for bin in "$MAIN" "$BASE" "$SCALE"; do
+          for bin in "$MAIN" "$BASE" "$OPAQUE"; do
             taskset -c 0 "$bin" "$RANDOM_FILE" 200 10 >/dev/null
             taskset -c 0 "$bin" "$ISSUE119_FILE" 1 1 >/dev/null
           done
 
           for round in 1 2 3 4 5 6 7; do
             case $((round % 3)) in
-              1) order="main baseline scale" ;;
-              2) order="baseline scale main" ;;
-              0) order="scale main baseline" ;;
+              1) order="main baseline opaque" ;;
+              2) order="baseline opaque main" ;;
+              0) order="opaque main baseline" ;;
             esac
             for variant in $order; do
               case "$variant" in
                 main) bin="$MAIN" ;;
                 baseline) bin="$BASE" ;;
-                scale) bin="$SCALE" ;;
+                opaque) bin="$OPAQUE" ;;
               esac
               value="$(taskset -c 0 "$bin" "$RANDOM_FILE" 1000 0)"
-              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-scale.tsv
+              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-opaque.tsv
               value="$(taskset -c 0 "$bin" "$ISSUE119_FILE" 3 0)"
-              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-scale.tsv
+              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-opaque.tsv
             done
           done
-          cat /tmp/results-scale.tsv
+          cat /tmp/results-opaque.tsv
 
       - name: Persist benchmark
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
-          import csv, statistics, pathlib, subprocess
-          rows = list(csv.reader(open('/tmp/results-scale.tsv'), delimiter='\t'))
+          import csv, os, statistics, pathlib, subprocess
+
+          rows = list(csv.reader(open('/tmp/results-opaque.tsv'), delimiter='\t'))
           groups = {}
           for workload, round_no, variant, value in rows:
               groups.setdefault((workload, variant), []).append(float(value))
@@ -152,29 +170,32 @@ jobs:
           shas = {
               'main': subprocess.check_output(['git', '-C', '/tmp/webp-main', 'rev-parse', 'HEAD'], text=True).strip(),
               'baseline': subprocess.check_output(['git', '-C', '/tmp/webp-base', 'rev-parse', 'HEAD'], text=True).strip(),
-              'scale': subprocess.check_output(['git', '-C', '/tmp/webp-scale', 'rev-parse', 'HEAD'], text=True).strip(),
+              'opaque': subprocess.check_output(['git', '-C', '/tmp/webp-opaque', 'rev-parse', 'HEAD'], text=True).strip(),
           }
           lines = [
-              '# Alpha blending scale-table benchmark', '',
+              '# Opaque destination alpha-blend benchmark', '',
               f'- main: `{shas["main"]}`',
               f'- inline baseline: `{shas["baseline"]}`',
-              f'- scale-table candidate: `{shas["scale"]}`',
+              f'- opaque-destination candidate: `{shas["opaque"]}`',
+              f'- CPU: `{os.environ.get("CPU_MODEL", "unknown")}`',
+              f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH", "unknown")}` / `{os.environ.get("CPU_COUNT", "unknown")}`',
+              f'- reported CPU MHz range: `{os.environ.get("CPU_MIN_MHZ", "")}`–`{os.environ.get("CPU_MAX_MHZ", "")}`',
               '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned to CPU 0',
               '- method: 7 rotating-order rounds; values are microseconds per full decode', '',
-              '| Workload | main median | baseline median | scale median | branch vs main | scale vs baseline |',
+              '| Workload | main median | baseline median | opaque median | branch vs main | opaque vs baseline |',
               '|---|---:|---:|---:|---:|---:|',
           ]
           for workload in ['random_lossless', 'issue119']:
-              mm, bm, sm = med(workload, 'main'), med(workload, 'baseline'), med(workload, 'scale')
-              lines.append(f'| {workload} | {mm:.3f} us | {bm:.3f} us | {sm:.3f} us | {mm/sm:.3f}x | {bm/sm:.3f}x |')
+              mm, bm, om = med(workload, 'main'), med(workload, 'baseline'), med(workload, 'opaque')
+              lines.append(f'| {workload} | {mm:.3f} us | {bm:.3f} us | {om:.3f} us | {mm/om:.3f}x | {bm/om:.3f}x |')
           lines += ['', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode']
           lines += ['\t'.join(row) for row in rows]
           lines += ['```', '']
-          pathlib.Path('benchmark-alpha-scale.md').write_text('\n'.join(lines))
+          pathlib.Path('benchmark-alpha-opaque.md').write_text('\n'.join(lines))
           PY
 
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -- benchmark-alpha-scale.md
-          git commit -m 'Record alpha blending scale-table benchmark'
+          git add -- benchmark-alpha-opaque.md
+          git commit -m 'Record opaque alpha-blend benchmark'
           git push origin HEAD:performance-optimizations
