@@ -1,4 +1,4 @@
-name: Temporary alpha blending benchmark
+name: Temporary alpha blending scale benchmark
 
 on:
   push:
@@ -33,11 +33,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          BASELINE=f0dd1dcd1a1788668b3f12c13e4759d60679eaf4
+          BASELINE=a94cdcfb25019388271151e32fc5065f6d995143
           git fetch origin main
           git worktree add --detach /tmp/webp-main origin/main
           git worktree add --detach /tmp/webp-base "$BASELINE"
-          git worktree add --detach /tmp/webp-inline HEAD
+          git worktree add --detach /tmp/webp-scale HEAD
 
           cat >/tmp/decode_bench.rs <<'RS'
           use image_webp::{DecodingError, WebPDecoder};
@@ -77,20 +77,16 @@ jobs:
               let iterations: usize = args.next().unwrap().parse().unwrap();
               let warmups: usize = args.next().unwrap().parse().unwrap();
               let data = std::fs::read(path).unwrap();
-              for _ in 0..warmups {
-                  black_box(decode_once(&data));
-              }
+              for _ in 0..warmups { black_box(decode_once(&data)); }
               let start = Instant::now();
               let mut sum = 0u64;
-              for _ in 0..iterations {
-                  sum = sum.wrapping_add(decode_once(&data));
-              }
+              for _ in 0..iterations { sum = sum.wrapping_add(decode_once(&data)); }
               black_box(sum);
               println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64);
           }
           RS
 
-          for dir in /tmp/webp-main /tmp/webp-base /tmp/webp-inline; do
+          for dir in /tmp/webp-main /tmp/webp-base /tmp/webp-scale; do
             mkdir -p "$dir/examples"
             cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
             (cd "$dir" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example decode_bench)
@@ -113,34 +109,34 @@ jobs:
           set -euxo pipefail
           MAIN=/tmp/webp-main/target/release/examples/decode_bench
           BASE=/tmp/webp-base/target/release/examples/decode_bench
-          INLINE=/tmp/webp-inline/target/release/examples/decode_bench
+          SCALE=/tmp/webp-scale/target/release/examples/decode_bench
           RANDOM_FILE="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
-          : > /tmp/results-inline.tsv
+          : > /tmp/results-scale.tsv
 
-          for bin in "$MAIN" "$BASE" "$INLINE"; do
+          for bin in "$MAIN" "$BASE" "$SCALE"; do
             taskset -c 0 "$bin" "$RANDOM_FILE" 200 10 >/dev/null
             taskset -c 0 "$bin" "$ISSUE119_FILE" 1 1 >/dev/null
           done
 
           for round in 1 2 3 4 5 6 7; do
             case $((round % 3)) in
-              1) order="main baseline inline" ;;
-              2) order="baseline inline main" ;;
-              0) order="inline main baseline" ;;
+              1) order="main baseline scale" ;;
+              2) order="baseline scale main" ;;
+              0) order="scale main baseline" ;;
             esac
             for variant in $order; do
               case "$variant" in
                 main) bin="$MAIN" ;;
                 baseline) bin="$BASE" ;;
-                inline) bin="$INLINE" ;;
+                scale) bin="$SCALE" ;;
               esac
               value="$(taskset -c 0 "$bin" "$RANDOM_FILE" 1000 0)"
-              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-inline.tsv
+              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-scale.tsv
               value="$(taskset -c 0 "$bin" "$ISSUE119_FILE" 3 0)"
-              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-inline.tsv
+              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-scale.tsv
             done
           done
-          cat /tmp/results-inline.tsv
+          cat /tmp/results-scale.tsv
 
       - name: Persist benchmark
         shell: bash
@@ -148,7 +144,7 @@ jobs:
           set -euxo pipefail
           python3 - <<'PY'
           import csv, statistics, pathlib, subprocess
-          rows = list(csv.reader(open('/tmp/results-inline.tsv'), delimiter='\t'))
+          rows = list(csv.reader(open('/tmp/results-scale.tsv'), delimiter='\t'))
           groups = {}
           for workload, round_no, variant, value in rows:
               groups.setdefault((workload, variant), []).append(float(value))
@@ -156,29 +152,29 @@ jobs:
           shas = {
               'main': subprocess.check_output(['git', '-C', '/tmp/webp-main', 'rev-parse', 'HEAD'], text=True).strip(),
               'baseline': subprocess.check_output(['git', '-C', '/tmp/webp-base', 'rev-parse', 'HEAD'], text=True).strip(),
-              'inline': subprocess.check_output(['git', '-C', '/tmp/webp-inline', 'rev-parse', 'HEAD'], text=True).strip(),
+              'scale': subprocess.check_output(['git', '-C', '/tmp/webp-scale', 'rev-parse', 'HEAD'], text=True).strip(),
           }
           lines = [
-              '# Alpha blending inline benchmark', '',
+              '# Alpha blending scale-table benchmark', '',
               f'- main: `{shas["main"]}`',
-              f'- direct-alpha baseline: `{shas["baseline"]}`',
-              f'- inline candidate: `{shas["inline"]}`',
+              f'- inline baseline: `{shas["baseline"]}`',
+              f'- scale-table candidate: `{shas["scale"]}`',
               '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned to CPU 0',
               '- method: 7 rotating-order rounds; values are microseconds per full decode', '',
-              '| Workload | main median | baseline median | inline median | branch vs main | inline vs baseline |',
+              '| Workload | main median | baseline median | scale median | branch vs main | scale vs baseline |',
               '|---|---:|---:|---:|---:|---:|',
           ]
           for workload in ['random_lossless', 'issue119']:
-              mm, bm, im = med(workload, 'main'), med(workload, 'baseline'), med(workload, 'inline')
-              lines.append(f'| {workload} | {mm:.3f} us | {bm:.3f} us | {im:.3f} us | {mm/im:.3f}x | {bm/im:.3f}x |')
+              mm, bm, sm = med(workload, 'main'), med(workload, 'baseline'), med(workload, 'scale')
+              lines.append(f'| {workload} | {mm:.3f} us | {bm:.3f} us | {sm:.3f} us | {mm/sm:.3f}x | {bm/sm:.3f}x |')
           lines += ['', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode']
           lines += ['\t'.join(row) for row in rows]
           lines += ['```', '']
-          pathlib.Path('benchmark-alpha-inline.md').write_text('\n'.join(lines))
+          pathlib.Path('benchmark-alpha-scale.md').write_text('\n'.join(lines))
           PY
 
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -- benchmark-alpha-inline.md
-          git commit -m 'Record alpha blending inline benchmark'
+          git add -- benchmark-alpha-scale.md
+          git commit -m 'Record alpha blending scale-table benchmark'
           git push origin HEAD:performance-optimizations
