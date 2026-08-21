@@ -1,0 +1,66 @@
+name: Diagnose specialized VP8 DCT candidate
+on:
+  push:
+    branches: [ bench-dct-token-specialized ]
+    paths: [ .github/workflows/diagnose-dct-token-specialized.yml ]
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply candidate and capture verification
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD); echo "BASE=$BASE" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/arithmetic_decoder.rs'); s=p.read_text()
+          marker='''    // This is generic and inlined just to skip the first bounds check.\n    #[inline]\n    pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {\n'''
+          method='''    #[inline(never)]\n    pub(crate) fn read_dct_token(&mut self, tree: &[TreeNode; 11], skip_eob: bool) -> BitResult<i8> {\n        if let Some(v) = self.fast().read_dct_token(tree, skip_eob) {\n            return BitResult::ok(v);\n        }\n        self.cold_read_with_tree(tree, skip_eob as usize)\n    }\n\n'''+marker
+          if marker not in s: raise SystemExit('public marker missing')
+          s=s.replace(marker,method,1)
+          marker='''    fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {\n'''
+          add='''    fn read_dct_token(mut self, tree: &[TreeNode; 11], skip_eob: bool) -> Option<i8> {\n        let value = self.fast_read_dct_token(tree, skip_eob);\n        self.commit_if_valid(value)\n    }\n\n'''+marker
+          if marker not in s: raise SystemExit('wrapper marker missing')
+          s=s.replace(marker,add,1)
+          marker='''    fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {\n'''
+          add='''    fn fast_read_dct_token(&mut self, tree: &[TreeNode; 11], skip_eob: bool) -> i8 {\n        if !skip_eob && !self.fast_read_bit(tree[0].prob) { return TreeNode::value_from_branch(tree[0].left); }\n        if !self.fast_read_bit(tree[1].prob) { return TreeNode::value_from_branch(tree[1].left); }\n        if !self.fast_read_bit(tree[2].prob) { return TreeNode::value_from_branch(tree[2].left); }\n        if !self.fast_read_bit(tree[3].prob) {\n            if !self.fast_read_bit(tree[4].prob) { return TreeNode::value_from_branch(tree[4].left); }\n            let n=tree[5]; return TreeNode::value_from_branch(if self.fast_read_bit(n.prob) {n.right} else {n.left});\n        }\n        if !self.fast_read_bit(tree[6].prob) {\n            let n=tree[7]; return TreeNode::value_from_branch(if self.fast_read_bit(n.prob) {n.right} else {n.left});\n        }\n        if !self.fast_read_bit(tree[8].prob) {\n            let n=tree[9]; return TreeNode::value_from_branch(if self.fast_read_bit(n.prob) {n.right} else {n.left});\n        }\n        let n=tree[10]; TreeNode::value_from_branch(if self.fast_read_bit(n.prob) {n.right} else {n.left})\n    }\n\n'''+marker
+          if marker not in s: raise SystemExit('fast marker missing')
+          p.write_text(s.replace(marker,add,1))
+          p=Path('src/lossy/mod.rs'); s=p.read_text()
+          old='''            let token = decoder\n                .read_with_tree_with_first_node(tree, tree[skip as usize])\n                .or_accumulate(&mut res);\n'''
+          if old not in s: raise SystemExit('call marker missing')
+          p.write_text(s.replace(old,'''            let token = decoder.read_dct_token(tree, skip).or_accumulate(&mut res);\n''',1))
+          PY
+          cargo fmt
+          set +e
+          cargo test -v >/tmp/test.log 2>&1; TEST=$?
+          cargo clippy --all-features -- -D warnings >/tmp/clippy.log 2>&1; CLIPPY=$?
+          rustup toolchain install 1.80.1 --profile minimal >/tmp/msrv-install.log 2>&1
+          cargo +1.80.1 build -v >/tmp/msrv.log 2>&1; MSRV=$?
+          set -e
+          printf 'test=%s\nclippy=%s\nmsrv=%s\n' "$TEST" "$CLIPPY" "$MSRV" >/tmp/status.txt
+          git diff -- src/lossy/arithmetic_decoder.rs src/lossy/mod.rs >/tmp/candidate.diff
+      - name: Persist diagnostic
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git reset --hard "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          def tail(p,n=100):
+              x=Path(p).read_text(errors='replace').splitlines(); return '\n'.join(x[-n:])
+          text='# Specialized VP8 DCT verification diagnostic\n\n```text\n'+Path('/tmp/status.txt').read_text()+'```\n\n## Test tail\n```text\n'+tail('/tmp/test.log')+'\n```\n\n## Clippy tail\n```text\n'+tail('/tmp/clippy.log')+'\n```\n\n## MSRV tail\n```text\n'+tail('/tmp/msrv.log')+'\n```\n\n## Candidate diff\n```diff\n'+Path('/tmp/candidate.diff').read_text()+'\n```\n'
+          Path('diagnostic-dct-token-specialized.md').write_text(text)
+          PY
+          git add diagnostic-dct-token-specialized.md
+          git commit -m 'Record specialized DCT verification diagnostic'
+          git push origin HEAD:bench-dct-token-specialized
