@@ -140,69 +140,6 @@ pub(crate) fn composite_frame(
     }
 }
 
-#[inline]
-pub(crate) fn get_alpha_predictor(
-    x: usize,
-    y: usize,
-    width: usize,
-    filtering_method: FilteringMethod,
-    image_slice: &[u8],
-) -> u8 {
-    match filtering_method {
-        FilteringMethod::None => 0,
-        FilteringMethod::Horizontal => {
-            if x == 0 && y == 0 {
-                0
-            } else if x == 0 {
-                let index = (y - 1) * width + x;
-                image_slice[index * 4 + 3]
-            } else {
-                let index = y * width + x - 1;
-                image_slice[index * 4 + 3]
-            }
-        }
-        FilteringMethod::Vertical => {
-            if x == 0 && y == 0 {
-                0
-            } else if y == 0 {
-                let index = y * width + x - 1;
-                image_slice[index * 4 + 3]
-            } else {
-                let index = (y - 1) * width + x;
-                image_slice[index * 4 + 3]
-            }
-        }
-        FilteringMethod::Gradient => {
-            let (left, top, top_left) = match (x, y) {
-                (0, 0) => (0, 0, 0),
-                (0, y) => {
-                    let above_index = (y - 1) * width + x;
-                    let val = image_slice[above_index * 4 + 3];
-                    (val, val, val)
-                }
-                (x, 0) => {
-                    let before_index = y * width + x - 1;
-                    let val = image_slice[before_index * 4 + 3];
-                    (val, val, val)
-                }
-                (x, y) => {
-                    let left_index = y * width + x - 1;
-                    let left = image_slice[left_index * 4 + 3];
-                    let top_index = (y - 1) * width + x;
-                    let top = image_slice[top_index * 4 + 3];
-                    let top_left_index = (y - 1) * width + x - 1;
-                    let top_left = image_slice[top_left_index * 4 + 3];
-
-                    (left, top, top_left)
-                }
-            };
-
-            let combination = i16::from(left) + i16::from(top) - i16::from(top_left);
-            i16::clamp(combination, 0, 255).try_into().unwrap()
-        }
-    }
-}
-
 fn reconstruct_alpha(data: &mut [u8], width: usize, filtering_method: FilteringMethod) {
     if data.is_empty() || width == 0 {
         return;
@@ -303,7 +240,6 @@ pub(crate) fn read_3_bytes<R: Read>(reader: &mut R) -> Result<u32, DecodingError
 #[derive(Debug)]
 pub(crate) struct AlphaChunk {
     _preprocessing: bool,
-    pub(crate) filtering_method: FilteringMethod,
     pub(crate) data: Vec<u8>,
 }
 
@@ -365,9 +301,6 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
 
     let chunk = AlphaChunk {
         _preprocessing: preprocessing,
-        // The plane has already been reconstructed contiguously above. Keep
-        // the existing decoder loop compatible by making its predictor a no-op.
-        filtering_method: FilteringMethod::None,
         data,
     };
 
