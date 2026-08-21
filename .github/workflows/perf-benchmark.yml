@@ -105,12 +105,12 @@ jobs:
           set -euxo pipefail
           MAIN=/tmp/webp-main/target/release/examples/decode_bench
           OPT=/tmp/webp-opt/target/release/examples/decode_bench
-          RANDOM="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
+          RANDOM_FILE="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
           : > /tmp/results.tsv
 
           # Warm the binaries/filesystem before measured alternating rounds.
-          taskset -c 0 "$MAIN" "$RANDOM" 200 10 >/dev/null
-          taskset -c 0 "$OPT" "$RANDOM" 200 10 >/dev/null
+          taskset -c 0 "$MAIN" "$RANDOM_FILE" 200 10 >/dev/null
+          taskset -c 0 "$OPT" "$RANDOM_FILE" 200 10 >/dev/null
           taskset -c 0 "$MAIN" "$ISSUE119_FILE" 1 1 >/dev/null
           taskset -c 0 "$OPT" "$ISSUE119_FILE" 1 1 >/dev/null
 
@@ -118,7 +118,7 @@ jobs:
             if (( round % 2 )); then order="main opt"; else order="opt main"; fi
             for variant in $order; do
               if [[ "$variant" == main ]]; then bin="$MAIN"; else bin="$OPT"; fi
-              value="$(taskset -c 0 "$bin" "$RANDOM" 1000 0)"
+              value="$(taskset -c 0 "$bin" "$RANDOM_FILE" 1000 0)"
               printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results.tsv
               value="$(taskset -c 0 "$bin" "$ISSUE119_FILE" 3 0)"
               printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results.tsv
