@@ -2,7 +2,7 @@ name: Rust CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, performance-optimizations ]
   pull_request:
     branches: [ main ]
   schedule:
