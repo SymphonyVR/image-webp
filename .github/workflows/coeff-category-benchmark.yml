@@ -1,0 +1,222 @@
+name: Temporary coefficient category benchmark
+
+on:
+  push:
+    branches: [ performance-optimizations ]
+    paths:
+      - .github/workflows/coeff-category-benchmark.yml
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Record baseline and runner CPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASELINE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          lscpu
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')"
+            echo "CPU_ARCH=$(uname -m)"
+            echo "CPU_COUNT=$(nproc)"
+          } >> "$GITHUB_ENV"
+
+      - name: Apply exact category probability slices
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/lossy/mod.rs')
+          text = path.read_text()
+          old = '''                category @ DCT_CAT1..=DCT_CAT6 => {\n                    let probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];\n\n                    let mut extra = 0i16;\n\n                    for t in probs.iter().copied() {\n                        if t == 0 {\n                            break;\n                        }\n                        let b = decoder.read_bool(t).or_accumulate(&mut res);\n                        extra = extra + extra + i16::from(b);\n                    }\n\n                    i16::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]) + extra\n                }\n'''
+          new = '''                category @ DCT_CAT1..=DCT_CAT6 => {\n                    let category_index = (category - DCT_CAT1) as usize;\n                    let bit_count = [1usize, 2, 3, 4, 5, 11][category_index];\n                    let probs = &PROB_DCT_CAT[category_index][..bit_count];\n\n                    let mut extra = 0i16;\n\n                    for &prob in probs {\n                        let b = decoder.read_bool(prob).or_accumulate(&mut res);\n                        extra = extra + extra + i16::from(b);\n                    }\n\n                    i16::from(DCT_CAT_BASE[category_index]) + extra\n                }\n'''
+          if old not in text:
+              raise SystemExit('coefficient category block not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt
+          git diff --check
+          git diff -- src/lossy/mod.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- src/lossy/mod.rs
+          git commit -m 'Use exact VP8 coefficient category probabilities'
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Verify candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+
+      - name: Prepare A/B worktrees
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/webp-base "$BASELINE_SHA"
+          git worktree add --detach /tmp/webp-candidate HEAD
+
+          cat >/tmp/decode_bench.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+
+          fn decode_once(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              let mut checksum = 0u64;
+              if decoder.is_animated() {
+                  loop {
+                      match decoder.read_frame(&mut buf) {
+                          Ok(duration) => {
+                              checksum = checksum.wrapping_add(u64::from(duration));
+                              if let Some(&byte) = buf.get(buf.len() / 2) {
+                                  checksum = checksum.wrapping_add(u64::from(byte));
+                              }
+                          }
+                          Err(DecodingError::NoMoreFrames) => break,
+                          Err(err) => panic!("decode failed: {err:?}"),
+                      }
+                  }
+              } else {
+                  decoder.read_image(&mut buf).unwrap();
+                  if let Some(&byte) = buf.get(buf.len() / 2) {
+                      checksum = checksum.wrapping_add(u64::from(byte));
+                  }
+              }
+              black_box(checksum)
+          }
+
+          fn main() {
+              let mut args = std::env::args().skip(1);
+              let path = args.next().unwrap();
+              let iterations: usize = args.next().unwrap().parse().unwrap();
+              let warmups: usize = args.next().unwrap().parse().unwrap();
+              let data = std::fs::read(path).unwrap();
+              for _ in 0..warmups {
+                  black_box(decode_once(&data));
+              }
+              let start = Instant::now();
+              let mut checksum = 0u64;
+              for _ in 0..iterations {
+                  checksum = checksum.wrapping_add(decode_once(&data));
+              }
+              black_box(checksum);
+              println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64);
+          }
+          RS
+
+          for dir in /tmp/webp-base /tmp/webp-candidate; do
+            mkdir -p "$dir/examples"
+            cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
+            (cd "$dir" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example decode_bench)
+          done
+
+      - name: Fetch issue 119 workload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/issue119
+          curl -L --fail --retry 3 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/sample.zip -d /tmp/issue119
+          ISSUE119_FILE="$(find /tmp/issue119 -type f -iname '*.webp' | head -n 1)"
+          test -n "$ISSUE119_FILE"
+          echo "ISSUE119_FILE=$ISSUE119_FILE" >> "$GITHUB_ENV"
+
+      - name: Run alternating A/B benchmarks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=/tmp/webp-base/target/release/examples/decode_bench
+          CAND=/tmp/webp-candidate/target/release/examples/decode_bench
+          RANDOM_FILE="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
+          : > /tmp/results-category.tsv
+
+          for bin in "$BASE" "$CAND"; do
+            taskset -c 0 "$bin" "$RANDOM_FILE" 300 15 >/dev/null
+            taskset -c 0 "$bin" "$ISSUE119_FILE" 1 1 >/dev/null
+          done
+
+          for round in 1 2 3 4 5 6 7 8 9 10 11; do
+            if (( round % 2 )); then order="baseline candidate"; else order="candidate baseline"; fi
+            for variant in $order; do
+              if [[ "$variant" == baseline ]]; then bin="$BASE"; else bin="$CAND"; fi
+              value="$(taskset -c 0 "$bin" "$RANDOM_FILE" 1500 0)"
+              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-category.tsv
+              value="$(taskset -c 0 "$bin" "$ISSUE119_FILE" 4 0)"
+              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >> /tmp/results-category.tsv
+            done
+          done
+          cat /tmp/results-category.tsv
+
+      - name: Persist benchmark without candidate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv, os, statistics, pathlib
+
+          rows = list(csv.reader(open('/tmp/results-category.tsv'), delimiter='\t'))
+          groups = {}
+          pairs = {}
+          for workload, round_no, variant, value in rows:
+              value = float(value)
+              groups.setdefault((workload, variant), []).append(value)
+              pairs.setdefault((workload, int(round_no)), {})[variant] = value
+
+          def med(workload, variant):
+              return statistics.median(groups[(workload, variant)])
+
+          def paired(workload):
+              ratios = [
+                  values['baseline'] / values['candidate']
+                  for (name, _), values in pairs.items()
+                  if name == workload
+              ]
+              return statistics.median(ratios), min(ratios), max(ratios)
+
+          lines = [
+              '# VP8 coefficient category benchmark', '',
+              f'- branch baseline: `{os.environ["BASELINE_SHA"]}`',
+              f'- ephemeral exact-category candidate: `{os.environ["CANDIDATE_SHA"]}`',
+              f'- CPU: `{os.environ.get("CPU_MODEL", "unknown")}`',
+              f'- architecture / vCPUs: `{os.environ.get("CPU_ARCH", "unknown")}` / `{os.environ.get("CPU_COUNT", "unknown")}`',
+              '- candidate source is intentionally not retained on the branch pending benchmark review',
+              '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned to CPU 0',
+              '- method: 11 alternating A/B rounds; paired speedup is baseline/candidate for the same round', '',
+              '| Workload | baseline median | candidate median | ratio of medians | paired median | paired range |',
+              '|---|---:|---:|---:|---:|---:|',
+          ]
+          for workload in ['random_lossless', 'issue119']:
+              bm = med(workload, 'baseline')
+              cm = med(workload, 'candidate')
+              pm, plo, phi = paired(workload)
+              lines.append(f'| {workload} | {bm:.3f} us | {cm:.3f} us | {bm/cm:.3f}x | {pm:.3f}x | {plo:.3f}–{phi:.3f}x |')
+          lines += ['', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode']
+          lines += ['\t'.join(row) for row in rows]
+          lines += ['```', '']
+          pathlib.Path('/tmp/benchmark-coeff-category.md').write_text('\n'.join(lines))
+          PY
+
+          git reset --hard "$BASELINE_SHA"
+          cp /tmp/benchmark-coeff-category.md benchmark-coeff-category.md
+          git add -- benchmark-coeff-category.md
+          git commit -m 'Record VP8 coefficient category benchmark'
+          git push origin HEAD:performance-optimizations
