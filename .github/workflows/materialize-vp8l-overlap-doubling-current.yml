@@ -1,0 +1,67 @@
+name: Materialize VP8L overlap pattern-copy candidate
+on:
+  push:
+    branches: [ candidate-vp8l-overlap-doubling-current ]
+    paths: [ .github/workflows/materialize-vp8l-overlap-doubling-current.yml ]
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply source candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/mod.rs');s=p.read_text()
+          marker='const ALPHABET_SIZE: [u16; HUFFMAN_CODES_PER_META_CODE] = [256 + 24, 256, 256, 256, 40];\n'
+          helper=r'''
+
+#[inline]
+fn copy_overlapping_backreference(
+    data: &mut [u8],
+    index: usize,
+    distance: usize,
+    length: usize,
+) {
+    debug_assert!(distance > 1);
+    debug_assert!(distance < length);
+
+    let source_start = (index - distance) * 4;
+    let destination_start = index * 4;
+    let byte_len = length * 4;
+    let period_bytes = distance * 4;
+    let (before_destination, destination_tail) = data.split_at_mut(destination_start);
+    let destination = &mut destination_tail[..byte_len];
+
+    destination[..period_bytes]
+        .copy_from_slice(&before_destination[source_start..source_start + period_bytes]);
+
+    let mut copied = period_bytes;
+    while copied < byte_len {
+        let amount = copied.min(byte_len - copied);
+        destination.copy_within(..amount, copied);
+        copied += amount;
+    }
+}
+'''
+          if marker not in s: raise SystemExit('constant marker missing')
+          s=s.replace(marker,marker+helper,1)
+          old='''                } else {\n                    if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n                        data.copy_within(start..start + 16, index * 4);\n\n                        if length > 4 || dist < 4 {\n                            for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {\n                                data.copy_within(start + i..start + i + 16, index * 4 + i);\n                            }\n                        }\n                    } else {\n                        for i in 0..length * 4 {\n                            data[index * 4 + i] = data[index * 4 + i - dist * 4];\n                        }\n                    }\n\n                    if HAS_COLOR_CACHE {\n'''
+          # Current stable is not cache-dispatched yet, so use its original cache block marker below.
+          if old in s:
+              raise SystemExit('unexpected cache-dispatch source')
+          old='''                } else {\n                    if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n                        data.copy_within(start..start + 16, index * 4);\n\n                        if length > 4 || dist < 4 {\n                            for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {\n                                data.copy_within(start + i..start + i + 16, index * 4 + i);\n                            }\n                        }\n                    } else {\n                        for i in 0..length * 4 {\n                            data[index * 4 + i] = data[index * 4 + i - dist * 4];\n                        }\n                    }\n\n                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n'''
+          new='''                } else {\n                    if dist < length {\n                        copy_overlapping_backreference(data, index, dist, length);\n                    } else if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n                        data.copy_within(start..start + 16, index * 4);\n\n                        if length > 4 {\n                            for i in (0..length * 4).step_by(16).skip(1) {\n                                data.copy_within(start + i..start + i + 16, index * 4 + i);\n                            }\n                        }\n                    } else {\n                        for i in 0..length * 4 {\n                            data[index * 4 + i] = data[index * 4 + i - dist * 4];\n                        }\n                    }\n\n                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n'''
+          if old not in s: raise SystemExit('overlap marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/mod.rs
+          git commit -m 'Copy overlapping VP8L backreferences by periods'
+          git push origin HEAD:candidate-vp8l-overlap-doubling-current
