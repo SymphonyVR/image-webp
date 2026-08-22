@@ -1,0 +1,81 @@
+name: Benchmark deduplicated VP8L cache updates
+on:
+  push:
+    branches: [ bench-vp8l-cache-dedup ]
+    paths: [ .github/workflows/bench-vp8l-cache-dedup.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          for v in base tail dedup;do git worktree add --detach "/tmp/$v" "$BASE";done
+          python3 - <<'PY'
+          from pathlib import Path
+          def tail(root):
+            p=Path(root)/'src/lossless/decoder/mod.rs';s=p.read_text();old='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        for pixel in data[index * 4..][..length * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n                    }\n''';new='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        let cache_pixels = length.min(dist);\n                        let cache_start = index + length - cache_pixels;\n                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n                    }\n''';
+            if old not in s:raise SystemExit('tail marker');p.write_text(s.replace(old,new,1))
+          tail('/tmp/tail')
+          p=Path('/tmp/dedup/src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''        let color_cache = color_cache_bits.map(|bits| ColorCache {\n            color_cache_bits: bits,\n            color_cache: vec![[0; 4]; 1 << bits],\n        });\n'''
+          new='''        let color_cache = color_cache_bits.map(|bits| {\n            let len = 1usize << bits;\n            ColorCache {\n                color_cache_bits: bits,\n                color_cache: vec![[0; 4]; len],\n                seen_generation: vec![0; len],\n                generation: 0,\n            }\n        });\n'''
+          if old not in s:raise SystemExit('init marker')
+          s=s.replace(old,new,1)
+          old='''struct ColorCache {\n    color_cache_bits: u8,\n    color_cache: Vec<[u8; 4]>,\n}\n\nimpl ColorCache {\n    #[inline(always)]\n    fn insert(&mut self, color: [u8; 4]) {\n        let [r, g, b, a] = color;\n        let color_u32 =\n            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);\n        let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);\n        self.color_cache[index as usize] = color;\n    }\n'''
+          new='''struct ColorCache {\n    color_cache_bits: u8,\n    color_cache: Vec<[u8; 4]>,\n    seen_generation: Vec<u32>,\n    generation: u32,\n}\n\nimpl ColorCache {\n    #[inline(always)]\n    fn index_for(&self, color: [u8; 4]) -> usize {\n        let [r, g, b, a] = color;\n        let color_u32 =\n            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b) | (u32::from(a) << 24);\n        ((0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits)) as usize\n    }\n\n    #[inline(always)]\n    fn insert(&mut self, color: [u8; 4]) {\n        let index = self.index_for(color);\n        self.color_cache[index] = color;\n    }\n\n    fn insert_backreference_tail(&mut self, pixels: &[u8]) {\n        self.generation = self.generation.wrapping_add(1);\n        if self.generation == 0 {\n            self.seen_generation.fill(0);\n            self.generation = 1;\n        }\n        let generation = self.generation;\n        for pixel in pixels.rchunks_exact(4) {\n            let color: [u8; 4] = pixel.try_into().unwrap();\n            let index = self.index_for(color);\n            if self.seen_generation[index] != generation {\n                self.seen_generation[index] = generation;\n                self.color_cache[index] = color;\n            }\n        }\n    }\n'''
+          if old not in s:raise SystemExit('cache struct marker')
+          s=s.replace(old,new,1)
+          old='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        for pixel in data[index * 4..][..length * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n                    }\n'''
+          new='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        let cache_pixels = length.min(dist);\n                        let cache_start = index + length - cache_pixels;\n                        color_cache.insert_backreference_tail(\n                            &data[cache_start * 4..][..cache_pixels * 4],\n                        );\n                    }\n'''
+          if old not in s:raise SystemExit('dedup loop marker')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/dedup&&cargo fmt&&cargo test -q&&cargo doc -q&&cargo clippy --all-features -- -D warnings&&cargo fmt -- --check&&cargo +1.80.1 build -q)
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[0]as u64^((b[b.len()/2]as u64)<<8))}fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if m=="h"{println!("{:x}",hash(&d));return}let n:usize=a.next().unwrap().parse().unwrap();black_box(dec(&d));let t=Instant::now();for _ in 0..n{black_box(dec(&d));}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for v in base tail dedup;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/cache_dedup.rs";(cd "/tmp/$v"&&cargo build --release --example cache_dedup -q);done
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/x.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());r=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):i=x*3;r[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;r[i+1]=(x*2+y*7+((x*y)>>10))&255;r[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(r)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/x.ppm -o /tmp/x.webp
+          B=/tmp/base/target/release/examples/cache_dedup;H=$($B h /tmp/x.webp);for v in tail dedup;do test "$H" = "$(/tmp/$v/target/release/examples/cache_dedup h /tmp/x.webp)";done
+          mapfile -t F </tmp/files.txt;for f in "${F[@]}";do H=$($B h "$f");for v in tail dedup;do vf=${f/\/tmp\/base/\/tmp\/$v};test "$H" = "$(/tmp/$v/target/release/examples/cache_dedup h "$vf")";done;done
+          : >/tmp/r
+          for r in {1..21};do for v in base tail dedup;do X="/tmp/$v/target/release/examples/cache_dedup";u=$(taskset -c 0 "$X" t /tmp/x.webp 3);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;start=$(date +%s%N);for f in "${F[@]}";do vf=${f/\/tmp\/base/\/tmp\/$v};taskset -c 0 "$X" t "$vf" 3 >/dev/null;done;end=$(date +%s%N);printf 'corpus\t%s\t%s\t%.3f\n' "$r" "$v" "$((end-start))e-3">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in R:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# VP8L cache dedup benchmark','',f'- CPU: `{os.environ["CPU"]}`','- dedup candidate passes full verification; all full decoded hashes match','','| workload | variant | median | vs baseline | vs tail |','|---|---|---:|---:|---:|']
+          for w in ('corpus','large'):
+            for v in ('tail','dedup'):
+              pb=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];pt=[z['tail']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {v} | {statistics.median(g[w,v]):.3f} us | {statistics.median(pb):.4f}x | {statistics.median(pt):.4f}x |')
+          pathlib.Path('benchmark-vp8l-cache-dedup.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-cache-dedup.md;git commit -m 'Record VP8L cache dedup benchmark';git push origin HEAD:bench-vp8l-cache-dedup
