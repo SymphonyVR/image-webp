@@ -1,0 +1,60 @@
+name: Materialize VP8 transform extent candidate
+on:
+  push:
+    branches: [ candidate-libwebp-transform-extent ]
+    paths: [ .github/workflows/materialize-transform-extent.yml ]
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply specialized transforms
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ROOT=$(git rev-parse HEAD^)
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git reset --hard "$ROOT"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/transform.rs');s=p.read_text()
+          marker='// inverse discrete cosine transform, used in decoding\npub(crate) fn idct4x4(block: &mut [i32]) {'
+          helpers='''// inverse discrete cosine transform, used in decoding\npub(crate) fn idct4x4_dc(block: &mut [i32]) {\n    assert!(block.len() >= 16);\n    let dc = ((i64::from(block[0]) + 4) >> 3) as i32;\n    block[..16].fill(dc);\n}\n\npub(crate) fn idct4x4_ac3(block: &mut [i32]) {\n    assert!(block.len() >= 16);\n\n    let dc = i64::from(block[0]);\n    let x1 = i64::from(block[1]);\n    let x4 = i64::from(block[4]);\n    let c4 = (x4 * CONST2) >> 16;\n    let d4 = x4 + ((x4 * CONST1) >> 16);\n    let c1 = (x1 * CONST2) >> 16;\n    let d1 = x1 + ((x1 * CONST1) >> 16);\n    let bases = [dc + d4, dc + c4, dc - c4, dc - d4];\n\n    for (row, base) in bases.into_iter().enumerate() {\n        let offset = row * 4;\n        block[offset] = ((base + d1 + 4) >> 3) as i32;\n        block[offset + 1] = ((base + c1 + 4) >> 3) as i32;\n        block[offset + 2] = ((base - c1 + 4) >> 3) as i32;\n        block[offset + 3] = ((base - d1 + 4) >> 3) as i32;\n    }\n}\n\npub(crate) fn idct4x4(block: &mut [i32]) {'''
+          if marker not in s: raise SystemExit('IDCT marker missing')
+          s=s.replace(marker,helpers,1)
+          test_marker='''    #[test]\n    fn test_dct_inverse() {'''
+          test='''    #[test]\n    fn test_specialized_idct_matches_full() {\n        let mut state = 0x1234_5678_9abc_def0u64;\n        let mut next = || {\n            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);\n            ((state >> 48) as u16 as i16) as i32\n        };\n\n        for _ in 0..10_000 {\n            let mut source = [0i32; 16];\n            source[0] = next();\n            source[1] = next();\n            source[4] = next();\n\n            let mut full = source;\n            let mut ac3 = source;\n            idct4x4(&mut full);\n            idct4x4_ac3(&mut ac3);\n            assert_eq!(full, ac3);\n\n            let mut dc_source = [0i32; 16];\n            dc_source[0] = source[0];\n            let mut full_dc = dc_source;\n            let mut dc = dc_source;\n            idct4x4(&mut full_dc);\n            idct4x4_dc(&mut dc);\n            assert_eq!(full_dc, dc);\n        }\n    }\n\n    #[test]\n    fn test_dct_inverse() {'''
+          if test_marker not in s: raise SystemExit('test marker missing')
+          p.write_text(s.replace(test_marker,test,1))
+
+          p=Path('src/lossy/mod.rs');s=p.read_text()
+          old='''                if block[0] != 0 || n {\n                    mb.non_zero_dct = true;\n                    transform::idct4x4(block);\n                }'''
+          new='''                if block[0] != 0 || n {\n                    mb.non_zero_dct = true;\n                    if nz > 3 {\n                        transform::idct4x4(block);\n                    } else if nz > 1 {\n                        transform::idct4x4_ac3(block);\n                    } else {\n                        transform::idct4x4_dc(block);\n                    }\n                }'''
+          if s.count(old) != 2: raise SystemExit(f'expected 2 transform sites, found {s.count(old)}')
+          p.write_text(s.replace(old,new))
+          PY
+          cargo fmt
+          git diff --check
+          git add src/lossy/mod.rs src/lossy/transform.rs
+          git commit -m 'Specialize VP8 inverse transforms by coefficient extent'
+      - name: Verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Publish source-only candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git push --force-with-lease origin HEAD:candidate-libwebp-transform-extent
