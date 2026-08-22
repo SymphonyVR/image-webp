@@ -188,6 +188,14 @@ impl HuffmanTree {
         matches!(self.0, HuffmanTreeInner::Single(_))
     }
 
+    /// Returns the symbol for a tree that contains exactly one symbol.
+    pub(crate) const fn single_symbol(&self) -> Option<u16> {
+        match self.0 {
+            HuffmanTreeInner::Single(symbol) => Some(symbol),
+            HuffmanTreeInner::Tree { .. } => None,
+        }
+    }
+
     #[inline(never)]
     fn read_symbol_slowpath<R: BufRead>(
         secondary_table: &[u16],

@@ -305,6 +305,7 @@ impl<R: BufRead> LosslessDecoder<R> {
         }
 
         let mut hufftree_groups = Vec::new();
+        let mut trivial_literals = Vec::new();
 
         for _i in 0..num_huff_groups {
             let mut group: HuffmanCodeGroup = Default::default();
@@ -319,6 +320,18 @@ impl<R: BufRead> LosslessDecoder<R> {
                 let tree = self.read_huffman_code(alphabet_size)?;
                 group[j] = tree;
             }
+            let trivial_literal = match (
+                group[RED].single_symbol(),
+                group[BLUE].single_symbol(),
+                group[ALPHA].single_symbol(),
+            ) {
+                (Some(red), Some(blue), Some(alpha)) => {
+                    debug_assert!(red < 256 && blue < 256 && alpha < 256);
+                    Some([red as u8, blue as u8, alpha as u8])
+                }
+                _ => None,
+            };
+            trivial_literals.push(trivial_literal);
             hufftree_groups.push(group);
         }
 
@@ -336,6 +349,7 @@ impl<R: BufRead> LosslessDecoder<R> {
             bits: huffman_bits,
             mask: huffman_mask,
             huffman_code_groups: hufftree_groups,
+            trivial_literals,
         };
 
         Ok(info)
@@ -463,6 +477,7 @@ impl<R: BufRead> LosslessDecoder<R> {
 
         let huff_index = huffman_info.get_huff_index(0, 0);
         let mut tree = &huffman_info.huffman_code_groups[huff_index];
+        let mut trivial_literal = huffman_info.trivial_literals[huff_index];
         let mut index = 0;
 
         let mut next_block_start = 0;
@@ -478,6 +493,7 @@ impl<R: BufRead> LosslessDecoder<R> {
 
                 let huff_index = huffman_info.get_huff_index(x as u16, y as u16);
                 tree = &huffman_info.huffman_code_groups[huff_index];
+                trivial_literal = huffman_info.trivial_literals[huff_index];
 
                 // Fast path: If all the codes each contain only a single
                 // symbol, then the pixel data isn't written to the bitstream
@@ -517,12 +533,17 @@ impl<R: BufRead> LosslessDecoder<R> {
             if code < 256 {
                 //literal, so just use huffman codes and read as argb
                 let green = code as u8;
-                let red = tree[RED].read_symbol(&mut self.bit_reader)? as u8;
-                let blue = tree[BLUE].read_symbol(&mut self.bit_reader)? as u8;
-                if self.bit_reader.nbits < 15 {
-                    self.bit_reader.fill()?;
-                }
-                let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8;
+                let [red, blue, alpha] = if let Some(fixed) = trivial_literal {
+                    fixed
+                } else {
+                    let red = tree[RED].read_symbol(&mut self.bit_reader)? as u8;
+                    let blue = tree[BLUE].read_symbol(&mut self.bit_reader)? as u8;
+                    if self.bit_reader.nbits < 15 {
+                        self.bit_reader.fill()?;
+                    }
+                    let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8;
+                    [red, blue, alpha]
+                };
 
                 data[index * 4] = red;
                 data[index * 4 + 1] = green;
@@ -657,6 +678,7 @@ struct HuffmanInfo {
     bits: u8,
     mask: u16,
     huffman_code_groups: Vec<HuffmanCodeGroup>,
+    trivial_literals: Vec<Option<[u8; 3]>>,
 }
 
 impl HuffmanInfo {
