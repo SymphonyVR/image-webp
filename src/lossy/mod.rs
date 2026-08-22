@@ -619,7 +619,7 @@ impl<R: Read> Vp8Decoder<R> {
                     for x in 0usize..4 {
                         let top = self.top[mbx].bpred[x];
                         let left = self.left.bpred[y];
-                        let intra = self.b.read_with_tree(
+                        let intra = self.b.read_bpred_mode(
                             &KEYFRAME_BPRED_MODE_NODES[top as usize][left as usize],
                         );
                         let intra = intra.or_accumulate(&mut res);

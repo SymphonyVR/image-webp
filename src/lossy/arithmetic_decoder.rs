@@ -1,7 +1,10 @@
 use crate::decoder::DecodingError;
 
 use super::{
-    common::{DCT_CAT_BASE, PROB_DCT_CAT},
+    common::{
+        B_DC_PRED, B_HD_PRED, B_HE_PRED, B_HU_PRED, B_LD_PRED, B_RD_PRED, B_TM_PRED, B_VE_PRED,
+        B_VL_PRED, B_VR_PRED, DCT_CAT_BASE, PROB_DCT_CAT,
+    },
     TreeNode,
 };
 
@@ -206,6 +209,14 @@ impl ArithmeticDecoder {
             return BitResult::ok(value);
         }
         self.cold_read_dct_value(probs, skip_eob)
+    }
+
+    #[inline(never)]
+    pub(crate) fn read_bpred_mode(&mut self, nodes: &[TreeNode; 9]) -> BitResult<i8> {
+        if let Some(value) = self.fast().read_bpred_mode(nodes) {
+            return BitResult::ok(value);
+        }
+        self.read_with_tree(nodes)
     }
 
     // This is generic and inlined just to skip the first bounds check.
@@ -523,6 +534,11 @@ impl FastDecoder<'_> {
         self.commit_if_valid(value)
     }
 
+    fn read_bpred_mode(mut self, nodes: &[TreeNode; 9]) -> Option<i8> {
+        let value = self.fast_read_bpred_mode(nodes);
+        self.commit_if_valid(value)
+    }
+
     fn fast_read_bit(&mut self, probability: u8) -> bool {
         let State {
             mut chunk_index,
@@ -751,6 +767,32 @@ impl FastDecoder<'_> {
             -abs
         } else {
             abs
+        }
+    }
+
+    fn fast_read_bpred_mode(&mut self, nodes: &[TreeNode; 9]) -> i8 {
+        if !self.fast_read_bit(nodes[0].prob) {
+            B_DC_PRED
+        } else if !self.fast_read_bit(nodes[1].prob) {
+            B_TM_PRED
+        } else if !self.fast_read_bit(nodes[2].prob) {
+            B_VE_PRED
+        } else if !self.fast_read_bit(nodes[3].prob) {
+            if !self.fast_read_bit(nodes[4].prob) {
+                B_HE_PRED
+            } else if !self.fast_read_bit(nodes[5].prob) {
+                B_RD_PRED
+            } else {
+                B_VR_PRED
+            }
+        } else if !self.fast_read_bit(nodes[6].prob) {
+            B_LD_PRED
+        } else if !self.fast_read_bit(nodes[7].prob) {
+            B_VL_PRED
+        } else if !self.fast_read_bit(nodes[8].prob) {
+            B_HD_PRED
+        } else {
+            B_HU_PRED
         }
     }
 
