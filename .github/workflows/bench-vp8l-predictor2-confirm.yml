@@ -1,0 +1,53 @@
+name: Confirm VP8L predictor 2 pixel kernel
+on:
+  push:
+    branches: [ bench-vp8l-predictor2-confirm ]
+    paths: [ .github/workflows/bench-vp8l-predictor2-confirm.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TRIGGER=$(git rev-parse HEAD); BASE=$(git rev-parse HEAD^)
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$BASE"
+          git -C /tmp/cand cherry-pick ed5c9031dae06cff8c3bdce6a27290778262d2c3
+          (cd /tmp/cand && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check && cargo +1.80.1 build -q)
+          python3 - <<'PY' >/tmp/vp8l.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();let mut h=1469598103934665603u64;for &z in &b{h^=z as u64;h=h.wrapping_mul(1099511628211)}h}
+          fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if m=="hash"{println!("{:016x}",hash(&d));return}let n:usize=a.next().unwrap().parse().unwrap();black_box(dec(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/bench.rs "$d/examples/p2.rs";(cd "$d"&&cargo build --release --example p2 -q);done
+          B=/tmp/base/target/release/examples/p2;C=/tmp/cand/target/release/examples/p2;mapfile -t F </tmp/vp8l.txt
+          for f in "${F[@]}";do test "$($B hash "$f")" = "$($C hash "$f")";done
+          : >/tmp/r
+          for r in {1..25};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;start=$(date +%s%N);for f in "${F[@]}";do taskset -c 0 "$X" bench "$f" 3 >/dev/null;done;end=$(date +%s%N);printf '%s\t%s\t%.3f\n' "$r" "$v" "$((end-start))e-3">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for r,v,x in R:x=float(x);g.setdefault(v,[]).append(x);rr.setdefault(int(r),{})[v]=x
+          p=[z['base']/z['cand'] for _,z in sorted(rr.items())];L=['# VP8L predictor-2 confirmation','',f'- baseline: `{statistics.median(g["base"]):.3f} us`',f'- candidate: `{statistics.median(g["cand"]):.3f} us`',f'- paired median: `{statistics.median(p):.4f}x`',f'- range: `{min(p):.4f}–{max(p):.4f}x`','- full hashes match; full verification passed',''];pathlib.Path('benchmark-vp8l-predictor2-confirm.md').write_text('\n'.join(L))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-predictor2-confirm.md;git commit -m 'Record VP8L predictor 2 confirmation';git push origin HEAD:bench-vp8l-predictor2-confirm
