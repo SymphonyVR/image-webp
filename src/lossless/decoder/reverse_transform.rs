@@ -82,10 +82,22 @@ pub fn apply_predictor_transform_0(image_data: &mut [u8], range: Range<usize>, _
 }
 pub fn apply_predictor_transform_1(image_data: &mut [u8], range: Range<usize>, _width: usize) {
     assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - 4]);
-        i += 1;
+    if range.start % 4 != 0 || (range.end - range.start) % 4 != 0 {
+        let mut i = range.start;
+        while i < range.end {
+            image_data[i] = image_data[i].wrapping_add(image_data[i - 4]);
+            i += 1;
+        }
+        return;
+    }
+
+    let mut previous: [u8; 4] = image_data[range.start - 4..range.start].try_into().unwrap();
+    for pixel in image_data[range].chunks_exact_mut(4) {
+        pixel[0] = pixel[0].wrapping_add(previous[0]);
+        pixel[1] = pixel[1].wrapping_add(previous[1]);
+        pixel[2] = pixel[2].wrapping_add(previous[2]);
+        pixel[3] = pixel[3].wrapping_add(previous[3]);
+        previous.copy_from_slice(pixel);
     }
 }
 pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {
