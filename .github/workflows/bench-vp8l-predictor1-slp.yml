@@ -1,0 +1,78 @@
+name: Benchmark VP8L predictor-1 four-lane recurrence
+on:
+  push:
+    branches: [ bench-vp8l-predictor1-slp ]
+    paths: [ .github/workflows/bench-vp8l-predictor1-slp.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply and verify candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/reverse_transform.rs');s=p.read_text()
+          old='''pub fn apply_predictor_transform_1(image_data: &mut [u8], range: Range<usize>, _width: usize) {\n    assert!(range.end <= image_data.len());\n    let mut i = range.start;\n    while i < range.end {\n        image_data[i] = image_data[i].wrapping_add(image_data[i - 4]);\n        i += 1;\n    }\n}\n'''
+          new='''pub fn apply_predictor_transform_1(image_data: &mut [u8], range: Range<usize>, _width: usize) {\n    assert!(range.end <= image_data.len());\n    if range.start % 4 != 0 || (range.end - range.start) % 4 != 0 {\n        let mut i = range.start;\n        while i < range.end {\n            image_data[i] = image_data[i].wrapping_add(image_data[i - 4]);\n            i += 1;\n        }\n        return;\n    }\n\n    let mut previous: [u8; 4] = image_data[range.start - 4..range.start].try_into().unwrap();\n    for pixel in image_data[range].chunks_exact_mut(4) {\n        pixel[0] = pixel[0].wrapping_add(previous[0]);\n        pixel[1] = pixel[1].wrapping_add(previous[1]);\n        pixel[2] = pixel[2].wrapping_add(previous[2]);\n        pixel[3] = pixel[3].wrapping_add(previous[3]);\n        previous.copy_from_slice(pixel);\n    }\n}\n'''
+          if old not in s: raise SystemExit('predictor1 marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/reverse_transform.rs;git commit -m 'Process VP8L predictor 1 by pixels'
+          CAND=$(git rev-parse HEAD)
+          echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CAND=$CAND" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Benchmark corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$CAND"
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if mode=="hash"{for d in &ds{println!("{:016x}",hash(d))}return}for d in &ds{black_box(dec(d));}let t=Instant::now();let mut s=0;for _ in 0..n{for d in &ds{s^=dec(d)}}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/bench.rs "$d/examples/p1.rs";(cd "$d"&&cargo build --release --example p1);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done
+          B=/tmp/base/target/release/examples/p1;C=/tmp/cand/target/release/examples/p1
+          diff -u <($B hash 1 "${BF[@]}") <($C hash 1 "${CF[@]}")
+          : >/tmp/r.tsv
+          for r in {1..17};do if ((r%2));then o='base cand';else o='cand base';fi;for v in $o;do if [[ $v == base ]];then x=$B;f=("${BF[@]}");else x=$C;f=("${CF[@]}");fi;u=$(taskset -c 0 "$x" bench 140 "${f[@]}");printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+      - name: Persist result
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv,statistics,os,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for r,v,x in rows:g.setdefault(v,[]).append(float(x));rr.setdefault(int(r),{})[v]=float(x)
+          p=[z['base']/z['cand'] for _,z in sorted(rr.items())];b=statistics.median(g['base']);c=statistics.median(g['cand'])
+          pathlib.Path('benchmark-vp8l-predictor1-slp.md').write_text(f'# VP8L predictor-1 four-lane benchmark\n\n- baseline: `{os.environ["BASE"]}`\n- candidate: `{os.environ["CAND"]}`\n- CPU: `{os.environ["CPU"]}`\n- hashes match; tests/docs/Clippy/fmt/MSRV passed\n\n| baseline | candidate | paired median | range |\n|---:|---:|---:|---:|\n| {b:.3f} us | {c:.3f} us | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |\n')
+          PY
+          git add benchmark-vp8l-predictor1-slp.md;git commit -m 'Record VP8L predictor-1 benchmark';git push origin HEAD:bench-vp8l-predictor1-slp
