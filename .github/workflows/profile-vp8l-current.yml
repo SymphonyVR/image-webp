@@ -1,0 +1,45 @@
+name: Profile current VP8L decoder
+on:
+  push:
+    branches: [ profile-vp8l-current ]
+    paths: [ .github/workflows/profile-vp8l-current.yml ]
+permissions:
+  contents: write
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and profile
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          sudo apt-get update -qq;sudo apt-get install -y valgrind
+          mkdir -p examples
+          cat >examples/profile_vp8l.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor};
+          fn main(){let p=std::env::args().nth(1).unwrap();let d=std::fs::read(p).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[b.len()/2]);}
+          RS
+          RUSTFLAGS='-C debuginfo=1 -C force-frame-pointers=yes' cargo build --release --example profile_vp8l
+          INPUT=tests/images/gallery2/3_webp_ll.webp
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/vp8l.callgrind target/release/examples/profile_vp8l "$INPUT"
+          callgrind_annotate --inclusive=no --threshold=0.05 /tmp/vp8l.callgrind >/tmp/exclusive.txt
+          callgrind_annotate --inclusive=yes --threshold=0.20 /tmp/vp8l.callgrind >/tmp/inclusive.txt
+      - name: Persist profile
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib,os
+          exc=pathlib.Path('/tmp/exclusive.txt').read_text(errors='replace').splitlines();inc=pathlib.Path('/tmp/inclusive.txt').read_text(errors='replace').splitlines()
+          def pick(lines,n=120):
+            out=[]
+            for line in lines:
+              if 'PROGRAM TOTALS' in line or 'image_webp::' in line:
+                out.append(line)
+                if len(out)>=n:break
+            return '\n'.join(out)
+          pathlib.Path('profile-vp8l-current.md').write_text('\n'.join(['# Current VP8L Callgrind profile','',f'- CPU: `{os.environ["CPU"]}`','- fixture: `tests/images/gallery2/3_webp_ll.webp` (800x600)','- one full static decode; normal release; CPU 0','','## Exclusive','','```text',pick(exc),'```','','## Inclusive','','```text',pick(inc),'```','']))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add profile-vp8l-current.md;git commit -m 'Record current VP8L profile';git push origin HEAD:profile-vp8l-current
