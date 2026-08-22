@@ -1,0 +1,37 @@
+name: Materialize sparse VP8 IDCT candidate
+on:
+  push:
+    branches: [ candidate-sparse-idct ]
+    paths: [ .github/workflows/materialize-sparse-idct.yml ]
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply sparse IDCT candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/scripts/apply_sparse_idct.py
+          cargo fmt
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossy/transform.rs src/lossy/mod.rs
+          git commit -m 'Specialize sparse VP8 inverse transforms'
+          git push origin HEAD:candidate-sparse-idct
+      - name: Verify candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
