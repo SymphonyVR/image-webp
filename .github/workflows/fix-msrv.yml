@@ -1,0 +1,19 @@
+name: Fix row-batch MSRV setup
+on:
+  push:
+    branches: [ bench-vp8l-row-batches-current ]
+    paths: [ .github/workflows/fix-msrv.yml ]
+permissions: { contents: write }
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('.github/workflows/bench-vp8l-row-batches-current.yml');s=p.read_text();m='      - name: Rebase candidate and verify\n';r='      - name: Install MSRV\n        run: rustup toolchain install 1.80.1 --profile minimal\n      - name: Rebase candidate and verify\n'
+          if m not in s: raise SystemExit('marker')
+          p.write_text(s.replace(m,r,1))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add .github/workflows/bench-vp8l-row-batches-current.yml;git commit -m 'Install MSRV for row-batch benchmark';git push
