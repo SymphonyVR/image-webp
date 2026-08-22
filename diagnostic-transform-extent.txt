@@ -1,0 +1,12 @@
+exit=1
+trigger=03bdb64e2db21fd5f4ca9caf471bc27448829320
++ set -euxo pipefail
++ git config user.name 'github-actions[bot]'
++ git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
++ git reset --hard 13448c6a17180ee9939154b052dd70b44cd1729c
+HEAD is now at 13448c6 Decode VP8 coefficients with fixed token topology
+/tmp/apply.sh: line 296: warning: here-document at line 5 delimited by end-of-file (wanted `PY')
++ python3 -
+  File "<stdin>", line 1
+    from pathlib import Path
+IndentationError: unexpected indent
