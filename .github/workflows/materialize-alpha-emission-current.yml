@@ -1,0 +1,33 @@
+name: Materialize current alpha-emission candidate
+on:
+  push:
+    branches: [ candidate-alpha-emission-current ]
+    paths: [ .github/workflows/materialize-alpha-emission-current.yml ]
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply verified alpha source onto current baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git checkout 4b9a3669fc536fc97334ef84d152c3255662e0b5 -- src/decoder.rs src/lossy/mod.rs src/lossy/yuv.rs
+          cargo fmt
+          git diff --check
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/decoder.rs src/lossy/mod.rs src/lossy/yuv.rs
+          git commit -m 'Write alpha during lossy RGBA conversion'
+          git push origin HEAD:candidate-alpha-emission-current
