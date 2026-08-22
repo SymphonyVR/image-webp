@@ -1,0 +1,37 @@
+name: Diagnose VP8L row-batch candidate
+on:
+  push:
+    branches: [ candidate-vp8l-row-batches ]
+    paths: [ .github/workflows/diagnose-vp8l-row-batches.yml ]
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Capture generation and verification
+        shell: bash
+        run: |
+          set +e
+          : > row-batch-diagnostic.txt
+          echo '== apply ==' >> row-batch-diagnostic.txt
+          python3 .github/scripts/apply_vp8l_row_batches.py >> row-batch-diagnostic.txt 2>&1
+          echo "exit=$?" >> row-batch-diagnostic.txt
+          echo '== fmt ==' >> row-batch-diagnostic.txt
+          cargo fmt >> row-batch-diagnostic.txt 2>&1
+          echo "exit=$?" >> row-batch-diagnostic.txt
+          echo '== test ==' >> row-batch-diagnostic.txt
+          cargo test -q >> row-batch-diagnostic.txt 2>&1
+          echo "exit=$?" >> row-batch-diagnostic.txt
+          echo '== clippy ==' >> row-batch-diagnostic.txt
+          cargo clippy --all-features -- -D warnings >> row-batch-diagnostic.txt 2>&1
+          echo "exit=$?" >> row-batch-diagnostic.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add row-batch-diagnostic.txt
+          git commit -m 'Record VP8L row-batch diagnostic'
+          git push origin HEAD:candidate-vp8l-row-batches
