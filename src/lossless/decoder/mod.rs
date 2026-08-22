@@ -456,6 +456,20 @@ impl<R: BufRead> LosslessDecoder<R> {
         &mut self,
         width: u16,
         height: u16,
+        huffman_info: HuffmanInfo,
+        data: &mut [u8],
+    ) -> Result<(), DecodingError> {
+        if huffman_info.color_cache.is_some() {
+            self.decode_image_data_inner::<true>(width, height, huffman_info, data)
+        } else {
+            self.decode_image_data_inner::<false>(width, height, huffman_info, data)
+        }
+    }
+
+    fn decode_image_data_inner<const HAS_COLOR_CACHE: bool>(
+        &mut self,
+        width: u16,
+        height: u16,
         mut huffman_info: HuffmanInfo,
         data: &mut [u8],
     ) -> Result<(), DecodingError> {
@@ -501,8 +515,8 @@ impl<R: BufRead> LosslessDecoder<R> {
                             data[index * 4 + i * 4..][..4].copy_from_slice(&value);
                         }
 
-                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                            color_cache.insert(value);
+                        if HAS_COLOR_CACHE {
+                            huffman_info.color_cache.as_mut().unwrap().insert(value);
                         }
 
                         index += n;
@@ -529,8 +543,12 @@ impl<R: BufRead> LosslessDecoder<R> {
                 data[index * 4 + 2] = blue;
                 data[index * 4 + 3] = alpha;
 
-                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                    color_cache.insert([red, green, blue, alpha]);
+                if HAS_COLOR_CACHE {
+                    huffman_info
+                        .color_cache
+                        .as_mut()
+                        .unwrap()
+                        .insert([red, green, blue, alpha]);
                 }
                 index += 1;
             } else if code < 256 + 24 {
@@ -567,12 +585,13 @@ impl<R: BufRead> LosslessDecoder<R> {
                         }
                     }
 
-                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                    if HAS_COLOR_CACHE {
                         // The cache is unobservable while a backreference is copied. For an
                         // overlapping copy, output is periodic with period `dist`, so only the
                         // final occurrence of each phase is needed to reproduce the final cache.
                         let cache_pixels = length.min(dist);
                         let cache_start = index + length - cache_pixels;
+                        let color_cache = huffman_info.color_cache.as_mut().unwrap();
                         for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {
                             color_cache.insert(pixel.try_into().unwrap());
                         }
@@ -581,10 +600,10 @@ impl<R: BufRead> LosslessDecoder<R> {
                 index += length;
             } else {
                 //color cache, so use previously stored pixels to get this pixel
-                let color_cache = huffman_info
-                    .color_cache
-                    .as_mut()
-                    .ok_or(DecodingError::BitStreamError)?;
+                if !HAS_COLOR_CACHE {
+                    return Err(DecodingError::BitStreamError);
+                }
+                let color_cache = huffman_info.color_cache.as_mut().unwrap();
                 let color = color_cache.lookup((code - 280).into());
                 data[index * 4..][..4].copy_from_slice(&color);
                 index += 1;
