@@ -1,0 +1,1 @@
+This temporary branch hosted overlapping benchmark triggers. Results from workflows launched here are screening-only unless reproduced on a dedicated fixed-baseline branch. No source candidate from this branch should be promoted directly.
