@@ -783,30 +783,24 @@ impl<R: Read> Vp8Decoder<R> {
         let mut res = decoder.start_accumulated_result();
         let mut complexity = complexity;
         let mut has_coefficients = false;
-        let mut skip_eob = false;
+        let mut index = first_coeff;
 
-        for i in first_coeff..16usize {
-            let band = COEFF_BANDS[i] as usize;
-            let probs = &probs[band][complexity];
-            let value = decoder
-                .read_dct_value(probs, skip_eob)
+        while index < 16 {
+            let run = decoder
+                .read_dct_run(probs, index, complexity)
                 .or_accumulate(&mut res);
-
-            if value == DCT_VALUE_EOB {
+            has_coefficients |= run.saw_tokens;
+            if run.value == DCT_VALUE_EOB {
                 break;
             }
-            if value == 0 {
-                skip_eob = true;
-                has_coefficients = true;
-                complexity = 0;
-                continue;
-            }
 
-            skip_eob = false;
+            index = usize::from(run.index);
+            let value = run.value;
             complexity = if value.unsigned_abs() == 1 { 1 } else { 2 };
-            let zigzag = ZIGZAG[i] as usize;
+            let zigzag = ZIGZAG[index] as usize;
             block[zigzag] = i32::from(value) * i32::from(if zigzag > 0 { acq } else { dcq });
             has_coefficients = true;
+            index += 1;
         }
 
         decoder.check(res, has_coefficients)

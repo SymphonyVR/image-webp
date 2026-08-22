@@ -1,11 +1,18 @@
 use crate::decoder::DecodingError;
 
 use super::{
-    common::{DCT_CAT_BASE, PROB_DCT_CAT},
+    common::{COEFF_BANDS, DCT_CAT_BASE, PROB_DCT_CAT},
     TreeNode,
 };
 
 pub(crate) const DCT_VALUE_EOB: i16 = i16::MIN;
+
+#[derive(Clone, Copy)]
+pub(crate) struct DctRun {
+    pub(crate) index: u8,
+    pub(crate) value: i16,
+    pub(crate) saw_tokens: bool,
+}
 
 #[must_use]
 #[repr(transparent)]
@@ -201,11 +208,16 @@ impl ArithmeticDecoder {
     }
 
     #[inline(never)]
-    pub(crate) fn read_dct_value(&mut self, probs: &[u8; 11], skip_eob: bool) -> BitResult<i16> {
-        if let Some(value) = self.fast().read_dct_value(probs, skip_eob) {
-            return BitResult::ok(value);
+    pub(crate) fn read_dct_run(
+        &mut self,
+        probs: &[[[u8; 11]; 3]; 8],
+        start: usize,
+        complexity: usize,
+    ) -> BitResult<DctRun> {
+        if let Some(run) = self.fast().read_dct_run(probs, start, complexity) {
+            return BitResult::ok(run);
         }
-        self.cold_read_dct_value(probs, skip_eob)
+        self.cold_read_dct_run(probs, start, complexity)
     }
 
     // This is generic and inlined just to skip the first bounds check.
@@ -450,6 +462,63 @@ impl ArithmeticDecoder {
 
     #[cold]
     #[inline(never)]
+    fn cold_read_dct_run(
+        &mut self,
+        probs: &[[[u8; 11]; 3]; 8],
+        start: usize,
+        complexity: usize,
+    ) -> BitResult<DctRun> {
+        let mut res = self.start_accumulated_result();
+        let mut index = start;
+        let mut complexity = complexity;
+        let mut skip_eob = false;
+        let mut saw_tokens = false;
+
+        loop {
+            let band = COEFF_BANDS[index] as usize;
+            let value = self
+                .cold_read_dct_value(&probs[band][complexity], skip_eob)
+                .or_accumulate(&mut res);
+            if value == DCT_VALUE_EOB {
+                return self.keep_accumulating(
+                    res,
+                    DctRun {
+                        index: index as u8,
+                        value,
+                        saw_tokens,
+                    },
+                );
+            }
+            if value != 0 {
+                return self.keep_accumulating(
+                    res,
+                    DctRun {
+                        index: index as u8,
+                        value,
+                        saw_tokens: true,
+                    },
+                );
+            }
+
+            saw_tokens = true;
+            index += 1;
+            if index == 16 {
+                return self.keep_accumulating(
+                    res,
+                    DctRun {
+                        index: 16,
+                        value: DCT_VALUE_EOB,
+                        saw_tokens,
+                    },
+                );
+            }
+            complexity = 0;
+            skip_eob = true;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
     fn cold_read_with_tree(&mut self, tree: &[TreeNode], start: usize) -> BitResult<i8> {
         let mut index = start;
         let mut res = self.start_accumulated_result();
@@ -513,9 +582,14 @@ impl FastDecoder<'_> {
         self.commit_if_valid(value)
     }
 
-    fn read_dct_value(mut self, probs: &[u8; 11], skip_eob: bool) -> Option<i16> {
-        let value = self.fast_read_dct_value(probs, skip_eob);
-        self.commit_if_valid(value)
+    fn read_dct_run(
+        mut self,
+        probs: &[[[u8; 11]; 3]; 8],
+        start: usize,
+        complexity: usize,
+    ) -> Option<DctRun> {
+        let run = self.fast_read_dct_run(probs, start, complexity);
+        self.commit_if_valid(run)
     }
 
     fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {
@@ -751,6 +825,49 @@ impl FastDecoder<'_> {
             -abs
         } else {
             abs
+        }
+    }
+
+    fn fast_read_dct_run(
+        &mut self,
+        probs: &[[[u8; 11]; 3]; 8],
+        start: usize,
+        complexity: usize,
+    ) -> DctRun {
+        let mut index = start;
+        let mut complexity = complexity;
+        let mut skip_eob = false;
+        let mut saw_tokens = false;
+
+        loop {
+            let band = COEFF_BANDS[index] as usize;
+            let value = self.fast_read_dct_value(&probs[band][complexity], skip_eob);
+            if value == DCT_VALUE_EOB {
+                return DctRun {
+                    index: index as u8,
+                    value,
+                    saw_tokens,
+                };
+            }
+            if value != 0 {
+                return DctRun {
+                    index: index as u8,
+                    value,
+                    saw_tokens: true,
+                };
+            }
+
+            saw_tokens = true;
+            index += 1;
+            if index == 16 {
+                return DctRun {
+                    index: 16,
+                    value: DCT_VALUE_EOB,
+                    saw_tokens,
+                };
+            }
+            complexity = 0;
+            skip_eob = true;
         }
     }
 
