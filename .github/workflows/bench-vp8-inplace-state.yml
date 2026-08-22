@@ -1,0 +1,52 @@
+name: Benchmark in-place VP8 arithmetic state
+on:
+  push:
+    branches: [ bench-vp8-inplace-state ]
+    paths: [ .github/workflows/bench-vp8-inplace-state.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build fixed refs and workload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=41490df368bb675e1f50922329b390968d352f10
+          CAND=7c08b7b5d3ed3f2fa5000ebeac0f6d8d2d8e31ce
+          echo "BASE=$BASE" >> "$GITHUB_ENV"; echo "CAND=$CAND" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"; git worktree add --detach /tmp/cand "$CAND"
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder}; use std::{hint::black_box,io::Cursor,time::Instant};
+          #[inline] fn hb(mut h:u64,b:u8)->u64{h^=b as u64;h.wrapping_mul(1099511628211)}
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut h=1469598103934665603;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{for z in t.to_le_bytes(){h=hb(h,z)}for &z in &b{h=hb(h,z)}},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();for &z in &b{h=hb(h,z)}}h}
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{let m=b.len()/2;s=s.wrapping_add(t as u64)^b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();let m=b.len()/2;s=b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)}black_box(s)}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if mode=="hash"{println!("{:016x}",hash(&d));return}let n:usize=a.next().unwrap().parse().unwrap();black_box(dec(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand; do mkdir -p "$d/examples"; cp /tmp/bench.rs "$d/examples/inplace_state.rs"; (cd "$d" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example inplace_state); done
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 5 -o /tmp/a.zip https://github.com/user-attachments/files/17482915/sample.zip; unzip -q /tmp/a.zip -d /tmp/119
+          curl -L --fail --retry 5 -o /tmp/b.zip https://github.com/user-attachments/files/20597234/honk.webp.zip; unzip -q /tmp/b.zip -d /tmp/136
+          I119=$(find /tmp/119 -iname '*.webp'|head -n1); I136=$(find /tmp/136 -iname '*.webp'|head -n1); B=/tmp/base/target/release/examples/inplace_state; C=/tmp/cand/target/release/examples/inplace_state
+          test "$($B hash "$I119")" = "$($C hash "$I119")"; test "$($B hash "$I136")" = "$($C hash "$I136")"
+          : >/tmp/r.tsv
+          for r in {1..17}; do if ((r%2)); then o='base cand'; else o='cand base'; fi; for v in $o; do [[ $v == base ]]&&x=$B||x=$C; u=$(taskset -c 0 "$x" bench "$I119" 5); printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv; u=$(taskset -c 0 "$x" bench "$I136" 50); printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv; done; done
+      - name: Persist result
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# In-place VP8 arithmetic-state benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`','- full decoded outputs match before timing','- candidate already passed tests, docs, Clippy, formatting, and Rust 1.80.1','','| Workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('issue119','issue136'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |')
+          pathlib.Path('benchmark-vp8-inplace-state.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8-inplace-state.md; git commit -m 'Record in-place VP8 arithmetic-state benchmark'; git push origin HEAD:bench-vp8-inplace-state
