@@ -1,0 +1,74 @@
+name: Benchmark VP8L Huffman root widths
+on:
+  push:
+    branches: [ bench-vp8l-huffman-root-bits ]
+    paths: [ .github/workflows/bench-vp8l-huffman-root-bits.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare 10, 9, and 8-bit variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/b10 "$BASE"
+          cp -a /tmp/b10 /tmp/b9
+          cp -a /tmp/b10 /tmp/b8
+          sed -i 's/const MAX_TABLE_BITS: u8 = 10;/const MAX_TABLE_BITS: u8 = 9;/' /tmp/b9/src/lossless/decoder/huffman.rs
+          sed -i 's/const MAX_TABLE_BITS: u8 = 10;/const MAX_TABLE_BITS: u8 = 8;/' /tmp/b8/src/lossless/decoder/huffman.rs
+          (cd /tmp/b9 && cargo test -q)
+          (cd /tmp/b8 && cargo test -q)
+          python3 - <<'PY' >/tmp/vp8l.txt
+          from pathlib import Path
+          def chunks(d):
+              if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+              o=[];p=12
+              while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+              return o
+          for p in sorted(Path('/tmp/b10/tests/images').rglob('*.webp')):
+              c=chunks(p.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box((b.len()as u64)^b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}
+          fn main(){let mut a=std::env::args().skip(1);let n:usize=a.next().unwrap().parse().unwrap();let paths:Vec<_>=a.collect();let imgs:Vec<Vec<u8>>=paths.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();for d in &imgs{black_box(dec(d));}let t=Instant::now();let mut s=0;for _ in 0..n{for d in &imgs{s^=dec(d)}}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*imgs.len())as f64)}
+          RS
+          for d in /tmp/b10 /tmp/b9 /tmp/b8; do mkdir -p "$d/examples"; cp /tmp/bench.rs "$d/examples/rootbits.rs"; (cd "$d" && cargo build --release --example rootbits); done
+      - name: Run rotating benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t F10 </tmp/vp8l.txt
+          F9=();F8=();for p in "${F10[@]}";do F9+=("${p/\/tmp\/b10/\/tmp\/b9}");F8+=("${p/\/tmp\/b10/\/tmp\/b8}");done
+          B10=/tmp/b10/target/release/examples/rootbits;B9=/tmp/b9/target/release/examples/rootbits;B8=/tmp/b8/target/release/examples/rootbits
+          : >/tmp/r.tsv
+          for r in {1..15};do
+            case $((r%3)) in 0)o='b10 b9 b8';;1)o='b9 b8 b10';;2)o='b8 b10 b9';;esac
+            for v in $o;do
+              case $v in b10)x=$B10;files=("${F10[@]}");;b9)x=$B9;files=("${F9[@]}");;b8)x=$B8;files=("${F8[@]}");;esac
+              u=$(taskset -c 0 "$x" 120 "${files[@]}");printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+            done
+          done
+      - name: Persist result
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={}
+          for r,v,x in rows:g.setdefault(v,[]).append(float(x))
+          med={k:statistics.median(v) for k,v in g.items()}
+          L=['# VP8L Huffman root-width benchmark','',f'- baseline source: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- static VP8L corpus; normal release; CPU 0; rotating 15-round order','','| Root bits | median us/decode | vs 10-bit |','|---:|---:|---:|']
+          for k,label in [('b10','10'),('b9','9'),('b8','8')]:L.append(f'| {label} | {med[k]:.3f} | {med["b10"]/med[k]:.4f}x |')
+          pathlib.Path('benchmark-vp8l-huffman-root-bits.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-huffman-root-bits.md;git commit -m 'Record VP8L Huffman root-width benchmark';git push origin HEAD:bench-vp8l-huffman-root-bits
