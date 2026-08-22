@@ -1,0 +1,71 @@
+name: Benchmark VP8L predictor-2 pixel kernel
+on:
+  push:
+    branches: [ bench-vp8l-predictor2-pixels-v2 ]
+    paths: [ .github/workflows/bench-vp8l-predictor2-pixels.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply candidate and verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/reverse_transform.rs');s=p.read_text()
+          old='''pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {\n    assert!(range.end <= image_data.len());\n    let mut i = range.start;\n    while i < range.end {\n        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4]);\n        i += 1;\n    }\n}\n'''
+          new='''pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {\n    assert!(range.end <= image_data.len());\n    let len = range.end - range.start;\n    let (previous_rows, current) = image_data[..range.end].split_at_mut(range.start);\n    let top = &previous_rows[range.start - width * 4..][..len];\n    for (pixel, top) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)) {\n        pixel[0] = pixel[0].wrapping_add(top[0]);\n        pixel[1] = pixel[1].wrapping_add(top[1]);\n        pixel[2] = pixel[2].wrapping_add(top[2]);\n        pixel[3] = pixel[3].wrapping_add(top[3]);\n    }\n}\n'''
+          if old not in s: raise SystemExit('predictor2 marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/reverse_transform.rs;git commit -m 'Process VP8L predictor 2 by pixels'
+          CAND=$(git rev-parse HEAD);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CAND=$CAND" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          cargo test -v;cargo doc -v;cargo clippy --all-features -- -D warnings;cargo fmt -- --check;rustup toolchain install 1.80.1 --profile minimal;cargo +1.80.1 build -v
+      - name: Benchmark corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$CAND"
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            out=[];i=12
+            while i+8<=len(d):f=d[i:i+4];n=int.from_bytes(d[i+4:i+8],'little');out.append(f);i+=8+n+(n&1)
+            return out
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c: print(p)
+          PY
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if mode=="hash"{for d in &ds{println!("{:016x}",hash(d))}return}for d in &ds{black_box(dec(d));}let t=Instant::now();let mut s=0;for _ in 0..n{for d in &ds{s^=dec(d)}}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/bench.rs "$d/examples/p2.rs";(cd "$d"&&cargo build --release --example p2);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/p2;C=/tmp/cand/target/release/examples/p2
+          diff -u <($B hash 1 "${BF[@]}") <($C hash 1 "${CF[@]}")
+          : >/tmp/r.tsv
+          for r in {1..17};do if ((r%2));then order='base cand';else order='cand base';fi;for v in $order;do if [[ $v == base ]];then x=$B;f=("${BF[@]}");else x=$C;f=("${CF[@]}");fi;u=$(taskset -c 0 "$x" bench 160 "${f[@]}");printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+      - name: Persist result
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv,statistics,os,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for r,v,x in rows:g.setdefault(v,[]).append(float(x));rr.setdefault(int(r),{})[v]=float(x)
+          ratios=[z['base']/z['cand'] for _,z in sorted(rr.items())];b=statistics.median(g['base']);c=statistics.median(g['cand'])
+          pathlib.Path('benchmark-vp8l-predictor2-pixels.md').write_text(f'# VP8L predictor-2 pixel benchmark\n\n- baseline: `{os.environ["BASE"]}`\n- candidate: `{os.environ["CAND"]}`\n- CPU: `{os.environ["CPU"]}`\n- hashes match; full verification passed\n\n| baseline | candidate | paired median | range |\n|---:|---:|---:|---:|\n| {b:.3f} us | {c:.3f} us | {statistics.median(ratios):.4f}x | {min(ratios):.4f}–{max(ratios):.4f}x |\n')
+          PY
+          git add benchmark-vp8l-predictor2-pixels.md;git commit -m 'Record VP8L predictor-2 benchmark';git push origin HEAD:bench-vp8l-predictor2-pixels-v2
