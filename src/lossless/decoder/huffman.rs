@@ -4,7 +4,7 @@ use super::BitReader;
 use crate::decoder::DecodingError;
 
 const MAX_ALLOWED_CODE_LENGTH: usize = 15;
-const MAX_TABLE_BITS: u8 = 10;
+const MAX_TABLE_BITS: u8 = 9;
 
 #[derive(Clone, Debug)]
 enum HuffmanTreeInner {
