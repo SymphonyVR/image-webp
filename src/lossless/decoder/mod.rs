@@ -7,6 +7,7 @@ mod reverse_transform;
 
 use std::io::BufRead;
 use std::mem;
+use std::ops::{Index, IndexMut};
 
 use super::{CODE_LENGTH_CODES, CODE_LENGTH_CODE_ORDER, DISTANCE_MAP};
 use crate::decoder::DecodingError;
@@ -24,7 +25,35 @@ const DIST: usize = 4;
 
 const HUFFMAN_CODES_PER_META_CODE: usize = 5;
 
-type HuffmanCodeGroup = [HuffmanTree; HUFFMAN_CODES_PER_META_CODE];
+const PACKED_LITERAL_BITS: u8 = 6;
+const PACKED_LITERAL_TABLE_SIZE: usize = 1 << PACKED_LITERAL_BITS;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PackedLiteralEntry {
+    bits: u8,
+    green_code: u16,
+    rgba: [u8; 4],
+}
+
+#[derive(Clone, Debug, Default)]
+struct HuffmanCodeGroup {
+    trees: [HuffmanTree; HUFFMAN_CODES_PER_META_CODE],
+    packed_literals: Option<Box<[PackedLiteralEntry; PACKED_LITERAL_TABLE_SIZE]>>,
+}
+
+impl Index<usize> for HuffmanCodeGroup {
+    type Output = HuffmanTree;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.trees[index]
+    }
+}
+
+impl IndexMut<usize> for HuffmanCodeGroup {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.trees[index]
+    }
+}
 
 const ALPHABET_SIZE: [u16; HUFFMAN_CODES_PER_META_CODE] = [256 + 24, 256, 256, 256, 40];
 
@@ -267,6 +296,47 @@ impl<R: BufRead> LosslessDecoder<R> {
         }
     }
 
+    fn build_packed_literal_table(
+        trees: &[HuffmanTree; HUFFMAN_CODES_PER_META_CODE],
+    ) -> Option<Box<[PackedLiteralEntry; PACKED_LITERAL_TABLE_SIZE]>> {
+        let max_literal_bits: u8 = trees[..=ALPHA]
+            .iter()
+            .map(HuffmanTree::max_code_length)
+            .sum();
+        if max_literal_bits >= PACKED_LITERAL_BITS {
+            return None;
+        }
+
+        let mut table = Box::new([PackedLiteralEntry::default(); PACKED_LITERAL_TABLE_SIZE]);
+        for (input_bits, entry) in table.iter_mut().enumerate() {
+            let mut bits = input_bits as u64;
+            let (green_bits, green) = trees[GREEN].peek_symbol_from_bits(bits)?;
+            if green >= 256 {
+                *entry = PackedLiteralEntry {
+                    bits: green_bits,
+                    green_code: green,
+                    rgba: [0; 4],
+                };
+                continue;
+            }
+            bits >>= green_bits;
+
+            let (red_bits, red) = trees[RED].peek_symbol_from_bits(bits)?;
+            bits >>= red_bits;
+            let (blue_bits, blue) = trees[BLUE].peek_symbol_from_bits(bits)?;
+            bits >>= blue_bits;
+            let (alpha_bits, alpha) = trees[ALPHA].peek_symbol_from_bits(bits)?;
+
+            debug_assert!(red < 256 && blue < 256 && alpha < 256);
+            *entry = PackedLiteralEntry {
+                bits: green_bits + red_bits + blue_bits + alpha_bits,
+                green_code: green,
+                rgba: [red as u8, green as u8, blue as u8, alpha as u8],
+            };
+        }
+        Some(table)
+    }
+
     /// Reads huffman codes associated with an image
     #[inline(never)]
     fn read_huffman_codes(
@@ -319,6 +389,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                 let tree = self.read_huffman_code(alphabet_size)?;
                 group[j] = tree;
             }
+            group.packed_literals = Self::build_packed_literal_table(&group.trees);
             hufftree_groups.push(group);
         }
 
@@ -483,7 +554,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                 // symbol, then the pixel data isn't written to the bitstream
                 // and we can just fill the output buffer with the symbol
                 // directly.
-                if tree[..4].iter().all(|t| t.is_single_node()) {
+                if tree.trees[..4].iter().all(|t| t.is_single_node()) {
                     let code = tree[GREEN].read_symbol(&mut self.bit_reader)?;
                     if code < 256 {
                         let n = if huffman_info.bits == 0 {
@@ -511,7 +582,21 @@ impl<R: BufRead> LosslessDecoder<R> {
                 }
             }
 
-            let code = tree[GREEN].read_symbol(&mut self.bit_reader)?;
+            let code = if let Some(packed_literals) = tree.packed_literals.as_ref() {
+                let entry = packed_literals[self.bit_reader.peek(PACKED_LITERAL_BITS) as usize];
+                self.bit_reader.consume(entry.bits)?;
+                if entry.green_code < 256 {
+                    data[index * 4..][..4].copy_from_slice(&entry.rgba);
+                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                        color_cache.insert(entry.rgba);
+                    }
+                    index += 1;
+                    continue;
+                }
+                entry.green_code
+            } else {
+                tree[GREEN].read_symbol(&mut self.bit_reader)?
+            };
 
             //check code
             if code < 256 {

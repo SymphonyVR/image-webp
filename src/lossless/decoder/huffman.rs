@@ -188,6 +188,49 @@ impl HuffmanTree {
         matches!(self.0, HuffmanTreeInner::Single(_))
     }
 
+    /// Returns the longest codeword represented by this tree.
+    ///
+    /// This is used only while constructing optional fast decode tables.
+    pub(crate) fn max_code_length(&self) -> u8 {
+        match &self.0 {
+            HuffmanTreeInner::Single(_) => 0,
+            HuffmanTreeInner::Tree {
+                primary_table,
+                secondary_table,
+                ..
+            } => {
+                let primary = primary_table
+                    .iter()
+                    .map(|entry| (entry >> 12) as u8)
+                    .max()
+                    .unwrap_or(0);
+                let secondary = secondary_table
+                    .iter()
+                    .map(|entry| (entry & 0xf) as u8)
+                    .max()
+                    .unwrap_or(0);
+                primary.max(secondary)
+            }
+        }
+    }
+
+    /// Peeks a symbol from an explicitly supplied bit window when it fits in
+    /// the primary table. The bit reader itself is not modified.
+    pub(crate) fn peek_symbol_from_bits(&self, bits: u64) -> Option<(u8, u16)> {
+        match &self.0 {
+            HuffmanTreeInner::Single(symbol) => Some((0, *symbol)),
+            HuffmanTreeInner::Tree {
+                primary_table,
+                table_mask,
+                ..
+            } => {
+                let entry = primary_table[(bits as u16 & table_mask) as usize];
+                let length = (entry >> 12) as u8;
+                (length <= MAX_TABLE_BITS).then_some((length, entry & 0xfff))
+            }
+        }
+    }
+
     #[inline(never)]
     fn read_symbol_slowpath<R: BufRead>(
         secondary_table: &[u16],
