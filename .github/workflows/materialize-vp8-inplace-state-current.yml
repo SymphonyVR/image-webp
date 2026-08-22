@@ -1,0 +1,39 @@
+name: Materialize in-place VP8 arithmetic state on current tree
+on:
+  push:
+    branches: [ candidate-vp8-inplace-state-current ]
+    paths: [ .github/workflows/materialize-vp8-inplace-state-current.yml ]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply exact tested source diff
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git cherry-pick 7c08b7b5d3ed3f2fa5000ebeac0f6d8d2d8e31ce
+      - name: Verify combined tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Publish source-only candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git rm .github/workflows/materialize-vp8-inplace-state-current.yml
+          git commit -m 'Finalize in-place VP8 arithmetic state optimization'
+          git push origin HEAD:candidate-vp8-inplace-state-current
