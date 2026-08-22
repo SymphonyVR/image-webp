@@ -1,0 +1,54 @@
+name: Current decoder versus main benchmark
+on:
+  push:
+    branches: [ bench-current-vs-main ]
+    paths: [ .github/workflows/bench-current-vs-main.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build fixed refs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/main f4d80bd965df2c81e65b6f43c1f70e0750bd4b0f
+          git worktree add --detach /tmp/current 13448c6a17180ee9939154b052dd70b44cd1729c
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};
+          #[inline]fn hb(mut h:u64,b:u8)->u64{h^=b as u64;h.wrapping_mul(1099511628211)}
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut h=1469598103934665603u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{for z in t.to_le_bytes(){h=hb(h,z)}for &z in &b{h=hb(h,z)}},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();for &z in &b{h=hb(h,z)}}h}
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{let m=b.len()/2;s=s.wrapping_add(t as u64)^b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();let m=b.len()/2;s=b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)}black_box(s)}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if mode=="hash"{println!("{:016x}",hash(&d));return}let n:usize=a.next().unwrap().parse().unwrap();black_box(dec(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/main /tmp/current;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/current_vs_main.rs";(cd "$d"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example current_vs_main);done
+      - name: Validate and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 5 -o /tmp/a.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/a.zip -d /tmp/119
+          curl -L --fail --retry 5 -o /tmp/b.zip https://github.com/user-attachments/files/20597234/honk.webp.zip;unzip -q /tmp/b.zip -d /tmp/136
+          I119=$(find /tmp/119 -iname '*.webp'|head -n1);I136=$(find /tmp/136 -iname '*.webp'|head -n1);M=/tmp/main/target/release/examples/current_vs_main;C=/tmp/current/target/release/examples/current_vs_main
+          H119=$($M hash "$I119");test "$H119" = "$($C hash "$I119")";H136=$($M hash "$I136");test "$H136" = "$($C hash "$I136")";: >/tmp/r.tsv
+          for r in {1..11};do if ((r%2));then o='main current';else o='current main';fi;for v in $o;do [[ $v == main ]]&&x=$M||x=$C;u=$(taskset -c 0 "$x" bench "$I119" 3);printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$x" bench "$I136" 20);printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# Current decoder versus main benchmark','', '- main: `f4d80bd965df2c81e65b6f43c1f70e0750bd4b0f`','- current: `13448c6a17180ee9939154b052dd70b44cd1729c`',f'- CPU: `{os.environ["CPU"]}`','- full-output hashes match outside timed region','','| Workload | main | current | speedup | paired median | range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('issue119','issue136'):
+              a=statistics.median(g[w,'main']);b=statistics.median(g[w,'current']);p=[z['main']/z['current'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {a:.3f} us | {b:.3f} us | {a/b:.3f}x | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+          pathlib.Path('benchmark-current-vs-main.md').write_text('\n'.join(L)+'\n')
+          PY
+          git add benchmark-current-vs-main.md;git commit -m 'Record current decoder benchmark';git push origin HEAD:bench-current-vs-main
