@@ -1,0 +1,58 @@
+name: Profile current lossy decoder
+on:
+  push:
+    branches: [ profile-current-lossy ]
+    paths: [ .github/workflows/profile-current-lossy.yml ]
+permissions:
+  contents: write
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Callgrind and build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y valgrind
+          echo "SHA=$(git rev-parse HEAD^)" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          cat >/tmp/profile.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder}; use std::{hint::black_box,io::Cursor};
+          fn main(){let p=std::env::args().nth(1).unwrap();let d=std::fs::read(p).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{s=s.wrapping_add(t as u64).wrapping_add(b[b.len()/2] as u64)},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();s=b[b.len()/2]as u64}black_box(s)}
+          RS
+          mkdir -p examples; cp /tmp/profile.rs examples/current_profile.rs
+          RUSTFLAGS='-C debuginfo=1 -C force-frame-pointers=yes' cargo build --release --example current_profile
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 5 -o /tmp/a.zip https://github.com/user-attachments/files/17482915/sample.zip; unzip -q /tmp/a.zip -d /tmp/119
+          curl -L --fail --retry 5 -o /tmp/b.zip https://github.com/user-attachments/files/20597234/honk.webp.zip; unzip -q /tmp/b.zip -d /tmp/136
+          echo "I119=$(find /tmp/119 -iname '*.webp'|head -n1)" >> "$GITHUB_ENV"
+          echo "I136=$(find /tmp/136 -iname '*.webp'|head -n1)" >> "$GITHUB_ENV"
+      - name: Run profiles
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN=target/release/examples/current_profile
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/119.cg "$BIN" "$I119"
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/136.cg "$BIN" "$I136"
+          callgrind_annotate --inclusive=yes --threshold=0.05 /tmp/119.cg >/tmp/119.inc
+          callgrind_annotate --inclusive=no --threshold=0.05 /tmp/119.cg >/tmp/119.self
+          callgrind_annotate --inclusive=yes --threshold=0.05 /tmp/136.cg >/tmp/136.inc
+          callgrind_annotate --inclusive=no --threshold=0.05 /tmp/136.cg >/tmp/136.self
+      - name: Persist summary
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,re,pathlib
+          def total(p):
+              t=pathlib.Path(p).read_text(errors='replace');m=re.search(r'^([0-9,]+) \(100\.0%\).*PROGRAM TOTALS',t,re.M);return int(m.group(1).replace(',','')) if m else 0
+          def filt(p):
+              ls=pathlib.Path(p).read_text(errors='replace').splitlines();return '\n'.join([x for x in ls if 'PROGRAM TOTALS' in x or 'image_webp::' in x][:220])
+          L=['# Current lossy Callgrind profile','',f'- source: `{os.environ["SHA"]}`',f'- CPU: `{os.environ["CPU"]}`',f'- issue119 instructions: `{total("/tmp/119.inc"):,}`',f'- issue136 instructions: `{total("/tmp/136.inc"):,}`','', '## Issue 119 inclusive','','```text',filt('/tmp/119.inc'),'```','','## Issue 119 self','','```text',filt('/tmp/119.self'),'```','','## Issue 136 inclusive','','```text',filt('/tmp/136.inc'),'```','','## Issue 136 self','','```text',filt('/tmp/136.self'),'```','']
+          pathlib.Path('profile-current-lossy.md').write_text('\n'.join(L))
+          PY
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add profile-current-lossy.md; git commit -m 'Record current lossy decoder profile'; git push origin HEAD:profile-current-lossy
