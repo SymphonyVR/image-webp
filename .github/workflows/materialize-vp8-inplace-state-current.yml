@@ -13,13 +13,13 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
         with: { components: clippy,rustfmt }
-      - name: Apply exact tested source diff
+      - name: Apply exact tested arithmetic transformation
         shell: bash
         run: |
           set -euxo pipefail
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git cherry-pick 7c08b7b5d3ed3f2fa5000ebeac0f6d8d2d8e31ce
+          python3 .github/scripts/apply_vp8_inplace_state_current.py
+          cargo fmt
+          git diff --check
       - name: Verify combined tree
         shell: bash
         run: |
@@ -34,6 +34,10 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          git rm .github/workflows/materialize-vp8-inplace-state-current.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossy/arithmetic_decoder.rs
+          git commit -m 'Update VP8 arithmetic state in place'
+          git rm .github/workflows/materialize-vp8-inplace-state-current.yml .github/scripts/apply_vp8_inplace_state_current.py
           git commit -m 'Finalize in-place VP8 arithmetic state optimization'
           git push origin HEAD:candidate-vp8-inplace-state-current
