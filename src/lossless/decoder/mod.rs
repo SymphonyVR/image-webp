@@ -568,7 +568,12 @@ impl<R: BufRead> LosslessDecoder<R> {
                     }
 
                     if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                        for pixel in data[index * 4..][..length * 4].chunks_exact(4) {
+                        // The cache is unobservable while a backreference is copied. For an
+                        // overlapping copy, output is periodic with period `dist`, so only the
+                        // final occurrence of each phase is needed to reproduce the final cache.
+                        let cache_pixels = length.min(dist);
+                        let cache_start = index + length - cache_pixels;
+                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {
                             color_cache.insert(pixel.try_into().unwrap());
                         }
                     }
