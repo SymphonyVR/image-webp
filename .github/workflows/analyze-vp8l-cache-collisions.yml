@@ -1,0 +1,59 @@
+name: Analyze VP8L cache-tail collisions
+on:
+  push:
+    branches: [ analyze-vp8l-cache-collisions ]
+    paths: [ .github/workflows/analyze-vp8l-cache-collisions.yml ]
+permissions:
+  contents: write
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Instrument cache-tail redundancy
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        for pixel in data[index * 4..][..length * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n                    }\n'''
+          new='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        let cache_pixels = length.min(dist);\n                        let cache_start = index + length - cache_pixels;\n                        let mut seen = std::collections::HashSet::new();\n                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {\n                            let [r, g, b, a]: [u8; 4] = pixel.try_into().unwrap();\n                            let color_u32 = (u32::from(r) << 16)\n                                | (u32::from(g) << 8)\n                                | u32::from(b)\n                                | (u32::from(a) << 24);\n                            let cache_index = (0x1e35a7bdu32.wrapping_mul(color_u32))\n                                >> (32 - color_cache.color_cache_bits);\n                            seen.insert(cache_index);\n                            color_cache.insert([r, g, b, a]);\n                        }\n                        eprintln!("VP8L_CACHE tail={} unique={}", cache_pixels, seen.len());\n                    }\n'''
+          if old not in s:raise SystemExit('cache marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          mkdir -p examples
+          cat >examples/cache_collisions.rs <<'RS'
+          use image_webp::WebPDecoder;use std::io::Cursor;
+          fn main(){for p in std::env::args().skip(1){eprintln!("FILE {p}");let d=std::fs::read(&p).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();}}
+          RS
+          cargo build --release --example cache_collisions -q
+          sudo apt-get update -qq;sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          target/release/examples/cache_collisions /tmp/large.webp 2>/tmp/log
+      - name: Persist summary
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re,pathlib
+          tail=unique=events=0
+          for line in pathlib.Path('/tmp/log').read_text().splitlines():
+            m=re.search(r'VP8L_CACHE tail=(\d+) unique=(\d+)',line)
+            if m:
+              events+=1;tail+=int(m.group(1));unique+=int(m.group(2))
+          saved=tail-unique
+          pct=100*saved/tail if tail else 0
+          pathlib.Path('analysis-vp8l-cache-collisions.md').write_text(f'# VP8L cache-tail collision analysis\n\n- cache-bearing backrefs: `{events}`\n- tail inserts after periodic trimming: `{tail}`\n- unique cache slots within those tails: `{unique}`\n- potential redundant cache writes: `{saved}` ({pct:.2f}%)\n')
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add analysis-vp8l-cache-collisions.md;git commit -m 'Record VP8L cache collision analysis';git push origin HEAD:analyze-vp8l-cache-collisions
