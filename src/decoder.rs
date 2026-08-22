@@ -11,14 +11,6 @@ use crate::extended::{self, read_alpha_chunk, WebPExtendedInfo};
 use super::lossless::LosslessDecoder;
 use super::lossy::Vp8Decoder;
 
-#[inline]
-fn copy_alpha_plane(rgba: &mut [u8], alpha: &[u8]) {
-    assert_eq!(rgba.len(), alpha.len() * 4);
-    for (pixel, alpha) in rgba.chunks_exact_mut(4).zip(alpha.iter().copied()) {
-        pixel[3] = alpha;
-    }
-}
-
 quick_error! {
     /// Errors that can occur when attempting to decode a WebP image
     #[derive(Debug)]
@@ -710,8 +702,6 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
             }
 
             if self.has_alpha() {
-                frame.fill_rgba(buf, self.webp_decode_options.lossy_upsampling);
-
                 let range = self
                     .chunks
                     .get(&WebPRiffChunk::ALPH)
@@ -723,7 +713,11 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                     self.height as u16,
                 )?;
 
-                copy_alpha_plane(buf, &alpha_chunk.data);
+                frame.fill_rgba(
+                    buf,
+                    &alpha_chunk.data,
+                    self.webp_decode_options.lossy_upsampling,
+                );
             } else {
                 frame.fill_rgb(buf, self.webp_decode_options.lossy_upsampling);
             }
@@ -824,9 +818,11 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 let frame = Vp8Decoder::decode_frame((&mut self.r).take(next_chunk_size))?;
 
                 let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];
-                frame.fill_rgba(&mut rgba_frame, self.webp_decode_options.lossy_upsampling);
-
-                copy_alpha_plane(&mut rgba_frame, &alpha_chunk.data);
+                frame.fill_rgba(
+                    &mut rgba_frame,
+                    &alpha_chunk.data,
+                    self.webp_decode_options.lossy_upsampling,
+                );
 
                 (rgba_frame, true)
             }

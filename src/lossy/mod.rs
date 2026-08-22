@@ -171,6 +171,7 @@ impl Frame {
                     &self.ybuf,
                     &self.ubuf,
                     &self.vbuf,
+                    &[],
                     usize::from(self.width),
                     usize::from(self.height),
                     usize::from(self.buffer_width()),
@@ -182,6 +183,7 @@ impl Frame {
                     &self.ybuf,
                     &self.ubuf,
                     &self.vbuf,
+                    &[],
                     usize::from(self.width),
                     usize::from(self.chroma_width()),
                     usize::from(self.buffer_width()),
@@ -191,7 +193,12 @@ impl Frame {
     }
 
     /// Fills an rgba buffer from the YUV buffers
-    pub(crate) fn fill_rgba(&self, buf: &mut [u8], upsampling_method: UpsamplingMethod) {
+    pub(crate) fn fill_rgba(
+        &self,
+        buf: &mut [u8],
+        alpha: &[u8],
+        upsampling_method: UpsamplingMethod,
+    ) {
         const BPP: usize = 4;
 
         match upsampling_method {
@@ -201,6 +208,7 @@ impl Frame {
                     &self.ybuf,
                     &self.ubuf,
                     &self.vbuf,
+                    alpha,
                     usize::from(self.width),
                     usize::from(self.height),
                     usize::from(self.buffer_width()),
@@ -212,6 +220,7 @@ impl Frame {
                     &self.ybuf,
                     &self.ubuf,
                     &self.vbuf,
+                    alpha,
                     usize::from(self.width),
                     usize::from(self.chroma_width()),
                     usize::from(self.buffer_width()),

@@ -78,10 +78,13 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
     y_buffer: &[u8],
     u_buffer: &[u8],
     v_buffer: &[u8],
+    alpha_buffer: &[u8],
     width: usize,
     height: usize,
     buffer_width: usize,
 ) {
+    debug_assert!(BPP != 4 || alpha_buffer.len() == width * height);
+
     // buffer width is always even so don't need to do div_ceil
     let chroma_buffer_width = buffer_width / 2;
     let chroma_width = width.div_ceil(2);
@@ -91,7 +94,18 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
     let top_row_u = &u_buffer[..chroma_width];
     let top_row_v = &v_buffer[..chroma_width];
     let top_row_buffer = &mut buffer[..width * BPP];
-    fill_row_fancy_with_1_uv_row::<BPP>(top_row_buffer, top_row_y, top_row_u, top_row_v);
+    let top_row_alpha = if BPP == 4 {
+        &alpha_buffer[..width]
+    } else {
+        &[]
+    };
+    fill_row_fancy_with_1_uv_row::<BPP>(
+        top_row_buffer,
+        top_row_y,
+        top_row_u,
+        top_row_v,
+        top_row_alpha,
+    );
 
     let mut main_row_chunks = buffer[width * BPP..].chunks_exact_mut(width * BPP * 2);
     // the y buffer iterator limits the end of the row iterator so we need this end index
@@ -104,6 +118,7 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
         .windows(chroma_buffer_width * 2)
         .step_by(chroma_buffer_width);
 
+    let mut output_row = 1usize;
     for (((row_buffer, y_rows), u_rows), v_rows) in (&mut main_row_chunks)
         .zip(&mut main_y_chunks)
         .zip(&mut main_u_windows)
@@ -113,6 +128,11 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
         let (v_row_1, v_row_2) = v_rows.split_at(chroma_buffer_width);
         let (row_buf_1, row_buf_2) = row_buffer.split_at_mut(width * BPP);
         let (y_row_1, y_row_2) = y_rows.split_at(buffer_width);
+        let (alpha_row_1, alpha_row_2) = if BPP == 4 {
+            alpha_buffer[output_row * width..(output_row + 2) * width].split_at(width)
+        } else {
+            (&[][..], &[][..])
+        };
         fill_row_fancy_with_2_uv_rows::<BPP>(
             row_buf_1,
             &y_row_1[..width],
@@ -120,6 +140,7 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
             &u_row_2[..chroma_width],
             &v_row_1[..chroma_width],
             &v_row_2[..chroma_width],
+            alpha_row_1,
         );
         fill_row_fancy_with_2_uv_rows::<BPP>(
             row_buf_2,
@@ -128,7 +149,9 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
             &u_row_1[..chroma_width],
             &v_row_2[..chroma_width],
             &v_row_1[..chroma_width],
+            alpha_row_2,
         );
+        output_row += 2;
     }
 
     let final_row_buffer = main_row_chunks.into_remainder();
@@ -147,6 +170,11 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
             &final_y_row[..width],
             &final_u_row[..chroma_width],
             &final_v_row[..chroma_width],
+            if BPP == 4 {
+                &alpha_buffer[(height - 1) * width..]
+            } else {
+                &[]
+            },
         );
     }
 }
@@ -159,15 +187,17 @@ fn fill_row_fancy_with_2_uv_rows<const BPP: usize>(
     u_row_2: &[u8],
     v_row_1: &[u8],
     v_row_2: &[u8],
+    alpha_row: &[u8],
 ) {
     // need to do left pixel separately since it will only have one u/v value
     {
-        let rgb1 = &mut row_buffer[0..3];
+        let rgb1 = &mut row_buffer[..BPP];
         let y_value = y_row[0];
         // first pixel uses the first u/v as the main one
         let u_value = get_fancy_chroma_value(u_row_1[0], u_row_1[0], u_row_2[0], u_row_2[0]);
         let v_value = get_fancy_chroma_value(v_row_1[0], v_row_1[0], v_row_2[0], v_row_2[0]);
         set_pixel(rgb1, y_value, u_value, v_value);
+        set_alpha::<BPP>(rgb1, alpha_row, 0);
     }
 
     let rest_row_buffer = &mut row_buffer[BPP..];
@@ -177,27 +207,30 @@ fn fill_row_fancy_with_2_uv_rows<const BPP: usize>(
     let mut main_row_chunks = rest_row_buffer.chunks_exact_mut(BPP * 2);
     let mut main_y_chunks = rest_y_row.chunks_exact(2);
 
-    for (((((rgb, y_val), u_val_1), u_val_2), v_val_1), v_val_2) in (&mut main_row_chunks)
+    for (pair, (((((rgb, y_val), u_val_1), u_val_2), v_val_1), v_val_2)) in (&mut main_row_chunks)
         .zip(&mut main_y_chunks)
         .zip(u_row_1.windows(2))
         .zip(u_row_2.windows(2))
         .zip(v_row_1.windows(2))
         .zip(v_row_2.windows(2))
+        .enumerate()
     {
         {
-            let rgb1 = &mut rgb[0..3];
+            let rgb1 = &mut rgb[..BPP];
             let y_value = y_val[0];
             // first pixel uses the first u/v as the main one
             let u_value = get_fancy_chroma_value(u_val_1[0], u_val_1[1], u_val_2[0], u_val_2[1]);
             let v_value = get_fancy_chroma_value(v_val_1[0], v_val_1[1], v_val_2[0], v_val_2[1]);
             set_pixel(rgb1, y_value, u_value, v_value);
+            set_alpha::<BPP>(rgb1, alpha_row, 1 + pair * 2);
         }
         {
-            let rgb2 = &mut rgb[BPP..];
+            let rgb2 = &mut rgb[BPP..BPP * 2];
             let y_value = y_val[1];
             let u_value = get_fancy_chroma_value(u_val_1[1], u_val_1[0], u_val_2[1], u_val_2[0]);
             let v_value = get_fancy_chroma_value(v_val_1[1], v_val_1[0], v_val_2[1], v_val_2[0]);
             set_pixel(rgb2, y_value, u_value, v_value);
+            set_alpha::<BPP>(rgb2, alpha_row, 2 + pair * 2);
         }
     }
 
@@ -211,11 +244,12 @@ fn fill_row_fancy_with_2_uv_rows<const BPP: usize>(
         let final_v_1 = *v_row_1.last().unwrap();
         let final_v_2 = *v_row_2.last().unwrap();
 
-        let rgb1 = &mut rgb[0..3];
+        let rgb1 = &mut rgb[..BPP];
         // first pixel uses the first u/v as the main one
         let u_value = get_fancy_chroma_value(final_u_1, final_u_1, final_u_2, final_u_2);
         let v_value = get_fancy_chroma_value(final_v_1, final_v_1, final_v_2, final_v_2);
         set_pixel(rgb1, *y_value, u_value, v_value);
+        set_alpha::<BPP>(rgb1, alpha_row, y_row.len() - 1);
     }
 }
 
@@ -224,40 +258,45 @@ fn fill_row_fancy_with_1_uv_row<const BPP: usize>(
     y_row: &[u8],
     u_row: &[u8],
     v_row: &[u8],
+    alpha_row: &[u8],
 ) {
     // doing left pixel first
     {
-        let rgb1 = &mut row_buffer[0..3];
+        let rgb1 = &mut row_buffer[..BPP];
         let y_value = y_row[0];
 
         let u_value = u_row[0];
         let v_value = v_row[0];
         set_pixel(rgb1, y_value, u_value, v_value);
+        set_alpha::<BPP>(rgb1, alpha_row, 0);
     }
 
     // two pixels at a time since they share the same u/v value
     let mut main_row_chunks = row_buffer[BPP..].chunks_exact_mut(BPP * 2);
     let mut main_y_row_chunks = y_row[1..].chunks_exact(2);
 
-    for (((rgb, y_val), u_val), v_val) in (&mut main_row_chunks)
+    for (pair, (((rgb, y_val), u_val), v_val)) in (&mut main_row_chunks)
         .zip(&mut main_y_row_chunks)
         .zip(u_row.windows(2))
         .zip(v_row.windows(2))
+        .enumerate()
     {
         {
-            let rgb1 = &mut rgb[0..3];
+            let rgb1 = &mut rgb[..BPP];
             let y_value = y_val[0];
             // first pixel uses the first u/v as the main one
             let u_value = get_fancy_chroma_value(u_val[0], u_val[1], u_val[0], u_val[1]);
             let v_value = get_fancy_chroma_value(v_val[0], v_val[1], v_val[0], v_val[1]);
             set_pixel(rgb1, y_value, u_value, v_value);
+            set_alpha::<BPP>(rgb1, alpha_row, 1 + pair * 2);
         }
         {
-            let rgb2 = &mut rgb[BPP..];
+            let rgb2 = &mut rgb[BPP..BPP * 2];
             let y_value = y_val[1];
             let u_value = get_fancy_chroma_value(u_val[1], u_val[0], u_val[1], u_val[0]);
             let v_value = get_fancy_chroma_value(v_val[1], v_val[0], v_val[1], v_val[0]);
             set_pixel(rgb2, y_value, u_value, v_value);
+            set_alpha::<BPP>(rgb2, alpha_row, 2 + pair * 2);
         }
     }
 
@@ -269,6 +308,7 @@ fn fill_row_fancy_with_1_uv_row<const BPP: usize>(
         let final_v = *v_row.last().unwrap();
 
         set_pixel(rgb, *final_y, final_u, final_v);
+        set_alpha::<BPP>(rgb, alpha_row, y_row.len() - 1);
     }
 }
 
@@ -288,6 +328,13 @@ fn set_pixel(rgb: &mut [u8], y: u8, u: u8, v: u8) {
     rgb[2] = yuv_to_b(y, u);
 }
 
+#[inline(always)]
+fn set_alpha<const BPP: usize>(pixel: &mut [u8], alpha_row: &[u8], x: usize) {
+    if BPP == 4 {
+        pixel[3] = alpha_row[x];
+    }
+}
+
 /// Simple conversion, not currently used but could add a config to allow for using the simple
 #[allow(unused)]
 pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
@@ -295,6 +342,7 @@ pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
     y_buffer: &[u8],
     u_buffer: &[u8],
     v_buffer: &[u8],
+    alpha_buffer: &[u8],
     width: usize,
     chroma_width: usize,
     buffer_width: usize,
@@ -306,17 +354,23 @@ pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
         .chunks_exact(buffer_width / 2)
         .flat_map(|n| std::iter::repeat(n).take(2));
 
-    for (((row, y_row), u_row), v_row) in buffer
+    for (row_index, (((row, y_row), u_row), v_row)) in buffer
         .chunks_exact_mut(width * BPP)
         .zip(y_buffer.chunks_exact(buffer_width))
         .zip(u_row_twice_iter)
         .zip(v_row_twice_iter)
+        .enumerate()
     {
         fill_rgba_row_simple::<BPP>(
             &y_row[..width],
             &u_row[..chroma_width],
             &v_row[..chroma_width],
             row,
+            if BPP == 4 {
+                &alpha_buffer[row_index * width..][..width]
+            } else {
+                &[]
+            },
         );
     }
 }
@@ -326,6 +380,7 @@ fn fill_rgba_row_simple<const BPP: usize>(
     u_vec: &[u8],
     v_vec: &[u8],
     rgba: &mut [u8],
+    alpha_row: &[u8],
 ) {
     // Fill 2 pixels per iteration: these pixels share `u` and `v` components
     let mut rgb_chunks = rgba.chunks_exact_mut(BPP * 2);
@@ -333,10 +388,11 @@ fn fill_rgba_row_simple<const BPP: usize>(
     let mut u_iter = u_vec.iter();
     let mut v_iter = v_vec.iter();
 
-    for (((rgb, y), &u), &v) in (&mut rgb_chunks)
+    for (pair, (((rgb, y), &u), &v)) in (&mut rgb_chunks)
         .zip(&mut y_chunks)
         .zip(&mut u_iter)
         .zip(&mut v_iter)
+        .enumerate()
     {
         let coeffs = [
             mulhi(v, 26149),
@@ -349,15 +405,17 @@ fn fill_rgba_row_simple<const BPP: usize>(
         let get_g = |y: u8| clip(mulhi(y, 19077) - coeffs[1] - coeffs[2] + 8708);
         let get_b = |y: u8| clip(mulhi(y, 19077) + coeffs[3] - 17685);
 
-        let rgb1 = &mut rgb[0..3];
+        let rgb1 = &mut rgb[..BPP];
         rgb1[0] = get_r(y[0]);
         rgb1[1] = get_g(y[0]);
         rgb1[2] = get_b(y[0]);
+        set_alpha::<BPP>(rgb1, alpha_row, pair * 2);
 
-        let rgb2 = &mut rgb[BPP..];
+        let rgb2 = &mut rgb[BPP..BPP * 2];
         rgb2[0] = get_r(y[1]);
         rgb2[1] = get_g(y[1]);
         rgb2[2] = get_b(y[1]);
+        set_alpha::<BPP>(rgb2, alpha_row, pair * 2 + 1);
     }
 
     let remainder = rgb_chunks.into_remainder();
@@ -377,6 +435,7 @@ fn fill_rgba_row_simple<const BPP: usize>(
             remainder[0] = clip(mulhi(y, 19077) + coeffs[0] - 14234);
             remainder[1] = clip(mulhi(y, 19077) - coeffs[1] - coeffs[2] + 8708);
             remainder[2] = clip(mulhi(y, 19077) + coeffs[3] - 17685);
+            set_alpha::<BPP>(remainder, alpha_row, y_vec.len() - 1);
         }
     }
 }
