@@ -1,0 +1,47 @@
+name: Fix fused alpha-emission verification
+on:
+  push:
+    branches: [ candidate-alpha-emission ]
+    paths: [ .github/workflows/fix-alpha-emission.yml ]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply mechanical verification fixes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/yuv.rs'); s=p.read_text()
+          for sig in [
+              'pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(',
+              'pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(',
+          ]:
+              if '#[allow(clippy::too_many_arguments)]\n'+sig not in s:
+                  if sig not in s: raise SystemExit(f'missing {sig}')
+                  s=s.replace(sig, '#[allow(clippy::too_many_arguments)]\n'+sig, 1)
+          old='fill_rgb_buffer_fancy::<3>(&mut rgb_buffer, &y_buffer, &u_buffer, &v_buffer, 4, 4, 4);'
+          new='fill_rgb_buffer_fancy::<3>(&mut rgb_buffer, &y_buffer, &u_buffer, &v_buffer, &[], 4, 4, 4);'
+          if old in s: s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          cargo fmt
+          git diff --check
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossy/yuv.rs
+          git commit -m 'Verify fused alpha emission'
+          git push origin HEAD:candidate-alpha-emission
