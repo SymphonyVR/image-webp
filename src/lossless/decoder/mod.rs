@@ -12,8 +12,9 @@ use super::{CODE_LENGTH_CODES, CODE_LENGTH_CODE_ORDER, DISTANCE_MAP};
 use crate::decoder::DecodingError;
 use huffman::HuffmanTree;
 use reverse_transform::{
-    apply_color_indexing_transform, apply_color_transform, apply_predictor_transform,
-    apply_subtract_green_transform, TransformType,
+    apply_color_indexing_transform, apply_color_transform, apply_color_transform_rows,
+    apply_predictor_transform, apply_predictor_transform_rows, apply_subtract_green_transform,
+    apply_subtract_green_transform_rows, TransformType,
 };
 
 const GREEN: usize = 0;
@@ -102,48 +103,99 @@ impl<R: BufRead> LosslessDecoder<R> {
             &mut buf[..transformed_size],
         )?;
 
-        let mut image_size = transformed_size;
-        let mut width = transformed_width;
-        for &trans_index in self.transform_order.iter().rev() {
-            let transform = self.transforms[usize::from(trans_index)].as_ref().unwrap();
-            match transform {
-                TransformType::PredictorTransform {
-                    size_bits,
-                    predictor_data,
-                } => apply_predictor_transform(
-                    &mut buf[..image_size],
-                    width,
-                    self.height,
-                    *size_bits,
-                    predictor_data,
-                )?,
-                TransformType::ColorTransform {
-                    size_bits,
-                    transform_data,
-                } => {
-                    apply_color_transform(
+        let has_color_indexing = self.transform_order.iter().any(|&trans_index| {
+            matches!(
+                self.transforms[usize::from(trans_index)].as_ref(),
+                Some(TransformType::ColorIndexingTransform { .. })
+            )
+        });
+
+        if !has_color_indexing {
+            const ROW_BATCH: u16 = 16;
+            let row_pixels = usize::from(transformed_width);
+            let mut start_row = 0u16;
+            while start_row < self.height {
+                let end_row = (start_row + ROW_BATCH).min(self.height);
+                for &trans_index in self.transform_order.iter().rev() {
+                    let transform = self.transforms[usize::from(trans_index)].as_ref().unwrap();
+                    match transform {
+                        TransformType::PredictorTransform {
+                            size_bits,
+                            predictor_data,
+                        } => apply_predictor_transform_rows(
+                            &mut buf[..transformed_size],
+                            transformed_width,
+                            self.height,
+                            *size_bits,
+                            predictor_data,
+                            start_row,
+                            end_row,
+                        )?,
+                        TransformType::ColorTransform {
+                            size_bits,
+                            transform_data,
+                        } => apply_color_transform_rows(
+                            &mut buf[..transformed_size],
+                            transformed_width,
+                            *size_bits,
+                            transform_data,
+                            start_row,
+                            end_row,
+                        ),
+                        TransformType::SubtractGreen => apply_subtract_green_transform_rows(
+                            &mut buf[..transformed_size],
+                            usize::from(start_row) * row_pixels,
+                            usize::from(end_row) * row_pixels,
+                        ),
+                        TransformType::ColorIndexingTransform { .. } => unreachable!(),
+                    }
+                }
+                start_row = end_row;
+            }
+        } else {
+            let mut image_size = transformed_size;
+            let mut width = transformed_width;
+            for &trans_index in self.transform_order.iter().rev() {
+                let transform = self.transforms[usize::from(trans_index)].as_ref().unwrap();
+                match transform {
+                    TransformType::PredictorTransform {
+                        size_bits,
+                        predictor_data,
+                    } => apply_predictor_transform(
                         &mut buf[..image_size],
                         width,
-                        *size_bits,
-                        transform_data,
-                    );
-                }
-                TransformType::SubtractGreen => {
-                    apply_subtract_green_transform(&mut buf[..image_size]);
-                }
-                TransformType::ColorIndexingTransform {
-                    table_size,
-                    table_data,
-                } => {
-                    width = self.width;
-                    image_size = usize::from(width) * usize::from(self.height) * 4;
-                    apply_color_indexing_transform(
-                        buf,
-                        width,
                         self.height,
-                        *table_size,
+                        *size_bits,
+                        predictor_data,
+                    )?,
+                    TransformType::ColorTransform {
+                        size_bits,
+                        transform_data,
+                    } => {
+                        apply_color_transform(
+                            &mut buf[..image_size],
+                            width,
+                            *size_bits,
+                            transform_data,
+                        );
+                    }
+                    TransformType::SubtractGreen => {
+                        apply_subtract_green_transform(&mut buf[..image_size]);
+                    }
+                    TransformType::ColorIndexingTransform {
+                        table_size,
                         table_data,
-                    );
+                    } => {
+                        width = self.width;
+                        image_size = usize::from(width) * usize::from(self.height) * 4;
+                        apply_color_indexing_transform(
+                            buf,
+                            width,
+                            self.height,
+                            *table_size,
+                            table_data,
+                        );
+                    }
                 }
             }
         }

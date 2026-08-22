@@ -28,22 +28,51 @@ pub(crate) fn apply_predictor_transform(
     size_bits: u8,
     predictor_data: &[u8],
 ) -> Result<(), DecodingError> {
+    apply_predictor_transform_rows(
+        image_data,
+        width,
+        height,
+        size_bits,
+        predictor_data,
+        0,
+        height,
+    )
+}
+
+pub(crate) fn apply_predictor_transform_rows(
+    image_data: &mut [u8],
+    width: u16,
+    height: u16,
+    size_bits: u8,
+    predictor_data: &[u8],
+    start_row: u16,
+    end_row: u16,
+) -> Result<(), DecodingError> {
     let block_xsize = usize::from(subsample_size(width, size_bits));
     let width = usize::from(width);
     let height = usize::from(height);
+    let start_row = usize::from(start_row);
+    let end_row = usize::from(end_row);
 
-    // Handle top and left borders specially. This involves ignoring mode and using specific
-    // predictors for each.
-    image_data[3] = image_data[3].wrapping_add(255);
-    apply_predictor_transform_1(image_data, 4..width * 4, width);
-    for y in 1..height {
+    assert!(start_row <= end_row && end_row <= height);
+    if start_row == end_row {
+        return Ok(());
+    }
+
+    if start_row == 0 {
+        image_data[3] = image_data[3].wrapping_add(255);
+        apply_predictor_transform_1(image_data, 4..width * 4, width);
+    }
+
+    let first_predicted_row = start_row.max(1);
+    for y in first_predicted_row..end_row {
         for i in 0..4 {
             image_data[y * width * 4 + i] =
                 image_data[y * width * 4 + i].wrapping_add(image_data[(y - 1) * width * 4 + i]);
         }
     }
 
-    for y in 1..height {
+    for y in first_predicted_row..end_row {
         for block_x in 0..block_xsize {
             let block_index = (y >> size_bits) * block_xsize + block_x;
             let predictor = predictor_data[block_index * 4 + 1];
@@ -356,14 +385,38 @@ pub(crate) fn apply_color_transform(
     size_bits: u8,
     transform_data: &[u8],
 ) {
+    let row_bytes = usize::from(width) * 4;
+    let height = image_data.len() / row_bytes;
+    apply_color_transform_rows(
+        image_data,
+        width,
+        size_bits,
+        transform_data,
+        0,
+        height as u16,
+    );
+}
+
+pub(crate) fn apply_color_transform_rows(
+    image_data: &mut [u8],
+    width: u16,
+    size_bits: u8,
+    transform_data: &[u8],
+    start_row: u16,
+    end_row: u16,
+) {
     let block_xsize = usize::from(subsample_size(width, size_bits));
     let width = usize::from(width);
+    let start_row = usize::from(start_row);
+    let end_row = usize::from(end_row);
+    let row_bytes = width * 4;
 
-    for (y, row) in image_data.chunks_exact_mut(width * 4).enumerate() {
+    assert!(start_row <= end_row && end_row * row_bytes <= image_data.len());
+    let rows = &mut image_data[start_row * row_bytes..end_row * row_bytes];
+
+    for (row_offset, row) in rows.chunks_exact_mut(row_bytes).enumerate() {
+        let y = start_row + row_offset;
         let row_transform_data_start = (y >> size_bits) * block_xsize * 4;
-        // the length of block_tf_data should be `block_xsize * 4`, so we could slice it with [..block_xsize * 4]
-        // but there is no point - `.zip()` runs until either of the iterators is consumed,
-        // so the extra slicing operation would be doing more work for no reason
         let row_tf_data = &transform_data[row_transform_data_start..];
 
         for (block, transform) in row
@@ -391,7 +444,17 @@ pub(crate) fn apply_color_transform(
 }
 
 pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
-    for pixel in image_data.chunks_exact_mut(4) {
+    let end_pixel = image_data.len() / 4;
+    apply_subtract_green_transform_rows(image_data, 0, end_pixel);
+}
+
+pub(crate) fn apply_subtract_green_transform_rows(
+    image_data: &mut [u8],
+    start_pixel: usize,
+    end_pixel: usize,
+) {
+    assert!(start_pixel <= end_pixel && end_pixel * 4 <= image_data.len());
+    for pixel in image_data[start_pixel * 4..end_pixel * 4].chunks_exact_mut(4) {
         pixel[0] = pixel[0].wrapping_add(pixel[1]);
         pixel[2] = pixel[2].wrapping_add(pixel[1]);
     }
@@ -606,6 +669,69 @@ fn clamp_add_subtract_half(a: i16, b: i16) -> u8 {
 /// Does color transform on 2 numbers
 fn color_transform_delta(t: i8, c: i8) -> u32 {
     (i32::from(t) * i32::from(c)) as u32 >> 5
+}
+
+#[cfg(test)]
+mod row_batch_tests {
+    use super::*;
+
+    fn bytes(len: usize, seed: &mut u32) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (*seed >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row_batched_transforms_match_whole_image_transforms() {
+        let width = 67u16;
+        let height = 35u16;
+        let size_bits = 3u8;
+        let mut seed = 0x9284_17c3;
+
+        let source = bytes(usize::from(width) * usize::from(height) * 4, &mut seed);
+        let block_xsize = usize::from(subsample_size(width, size_bits));
+        let block_ysize = usize::from(subsample_size(height, size_bits));
+        let mut predictor_data = bytes(block_xsize * block_ysize * 4, &mut seed);
+        for predictor in predictor_data.chunks_exact_mut(4) {
+            predictor[1] %= 14;
+        }
+        let color_data = bytes(block_xsize * block_ysize * 4, &mut seed);
+
+        let mut expected = source.clone();
+        apply_predictor_transform(&mut expected, width, height, size_bits, &predictor_data)
+            .unwrap();
+        apply_color_transform(&mut expected, width, size_bits, &color_data);
+        apply_subtract_green_transform(&mut expected);
+
+        let mut batched = source;
+        let row_pixels = usize::from(width);
+        let mut start = 0u16;
+        while start < height {
+            let end = (start + 16).min(height);
+            apply_predictor_transform_rows(
+                &mut batched,
+                width,
+                height,
+                size_bits,
+                &predictor_data,
+                start,
+                end,
+            )
+            .unwrap();
+            apply_color_transform_rows(&mut batched, width, size_bits, &color_data, start, end);
+            apply_subtract_green_transform_rows(
+                &mut batched,
+                usize::from(start) * row_pixels,
+                usize::from(end) * row_pixels,
+            );
+            start = end;
+        }
+
+        assert_eq!(expected, batched);
+    }
 }
 
 #[cfg(all(test, feature = "_benchmarks"))]
