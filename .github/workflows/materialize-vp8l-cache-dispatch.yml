@@ -1,0 +1,47 @@
+name: Materialize VP8L cache-presence dispatch candidate
+on:
+  push:
+    branches: [ candidate-vp8l-cache-dispatch ]
+    paths: [ .github/workflows/materialize-vp8l-cache-dispatch.yml ]
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/mod.rs');s=p.read_text()
+          sig='''    /// Decodes the image data using the huffman trees and either of the 3 methods of decoding\n    fn decode_image_data(\n        &mut self,\n        width: u16,\n        height: u16,\n        mut huffman_info: HuffmanInfo,\n        data: &mut [u8],\n    ) -> Result<(), DecodingError> {\n'''
+          repl='''    /// Decodes the image data using the huffman trees and either of the 3 methods of decoding\n    fn decode_image_data(\n        &mut self,\n        width: u16,\n        height: u16,\n        huffman_info: HuffmanInfo,\n        data: &mut [u8],\n    ) -> Result<(), DecodingError> {\n        if huffman_info.color_cache.is_some() {\n            self.decode_image_data_inner::<true>(width, height, huffman_info, data)\n        } else {\n            self.decode_image_data_inner::<false>(width, height, huffman_info, data)\n        }\n    }\n\n    fn decode_image_data_inner<const HAS_COLOR_CACHE: bool>(\n        &mut self,\n        width: u16,\n        height: u16,\n        mut huffman_info: HuffmanInfo,\n        data: &mut [u8],\n    ) -> Result<(), DecodingError> {\n'''
+          if sig not in s: raise SystemExit('signature marker missing')
+          s=s.replace(sig,repl,1)
+          old='''                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                            color_cache.insert(value);\n                        }\n'''
+          new='''                        if HAS_COLOR_CACHE {\n                            huffman_info.color_cache.as_mut().unwrap().insert(value);\n                        }\n'''
+          if old not in s: raise SystemExit('single-node cache marker missing')
+          s=s.replace(old,new,1)
+          old='''                if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                    color_cache.insert([red, green, blue, alpha]);\n                }\n'''
+          new='''                if HAS_COLOR_CACHE {\n                    huffman_info\n                        .color_cache\n                        .as_mut()\n                        .unwrap()\n                        .insert([red, green, blue, alpha]);\n                }\n'''
+          if old not in s: raise SystemExit('literal cache marker missing')
+          s=s.replace(old,new,1)
+          old='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        // The cache is unobservable while a backreference is copied. For an\n                        // overlapping copy, output is periodic with period `dist`, so only the\n                        // final occurrence of each phase is needed to reproduce the final cache.\n                        let cache_pixels = length.min(dist);\n                        let cache_start = index + length - cache_pixels;\n                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n                    }\n'''
+          new='''                    if HAS_COLOR_CACHE {\n                        // The cache is unobservable while a backreference is copied. For an\n                        // overlapping copy, output is periodic with period `dist`, so only the\n                        // final occurrence of each phase is needed to reproduce the final cache.\n                        let cache_pixels = length.min(dist);\n                        let cache_start = index + length - cache_pixels;\n                        let color_cache = huffman_info.color_cache.as_mut().unwrap();\n                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n                    }\n'''
+          if old not in s: raise SystemExit('backref cache marker missing')
+          s=s.replace(old,new,1)
+          old='''                let color_cache = huffman_info\n                    .color_cache\n                    .as_mut()\n                    .ok_or(DecodingError::BitStreamError)?;\n'''
+          new='''                if !HAS_COLOR_CACHE {\n                    return Err(DecodingError::BitStreamError);\n                }\n                let color_cache = huffman_info.color_cache.as_mut().unwrap();\n'''
+          if old not in s: raise SystemExit('cache code marker missing')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          cargo fmt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/mod.rs
+          git commit -m 'Specialize VP8L image decoding by color-cache presence'
+          git push origin HEAD:candidate-vp8l-cache-dispatch
