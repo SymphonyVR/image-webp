@@ -1,0 +1,67 @@
+name: Benchmark VP8 read_coefficients noinline
+on:
+  push:
+    branches: [ bench-vp8l-single-group ]
+    paths: [ .github/workflows/bench-vp8-read-coeff-noinline.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Build and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=00c9bf309f8286509832948a67d4fbcdb2933adc
+          git worktree add --detach /tmp/base "$BASE";cp -a /tmp/base /tmp/cand
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossy/mod.rs');s=p.read_text()
+          old='''    fn read_coefficients(\n        &mut self,\n'''
+          new='''    #[inline(never)]\n    fn read_coefficients(\n        &mut self,\n'''
+          if old not in s: raise SystemExit('marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo doc -q&&cargo clippy --all-features -- -D warnings&&cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand&&cargo +1.80.1 build -q)
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];if x.is_animated(){while x.read_frame(&mut b).is_ok(){black_box(&b);}}else{x.read_image(&mut b).unwrap();}black_box(b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if mode=="hash"{println!("{:016x}",hash(&d));return}for _ in 0..2{black_box(dec(&d));}let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/bench.rs "$d/examples/nrc.rs";(cd "$d"&&cargo build --release --example nrc -q);done
+          B=/tmp/base/target/release/examples/nrc;C=/tmp/cand/target/release/examples/nrc
+          for f in /tmp/base/tests/images/issue119.webp /tmp/base/tests/images/gallery2/3_webp_ll.webp;do test -f "$f"||true;done
+          ISSUE=$(find /tmp/base/tests/images -type f -iname '*119*' -o -iname '*honk*.webp' | head -1 || true)
+          # Use repository benchmark fixtures if available; otherwise download public issue fixtures from their established URLs in earlier workflows is intentionally avoided here.
+          python3 - <<'PY' >/tmp/cases.txt
+          from pathlib import Path
+          ps=list(Path('/tmp/base/tests/images').rglob('*.webp'))
+          # Pick largest lossy and a representative second lossy file when issue-specific fixtures aren't checked in.
+          def vp8(p):
+            d=p.read_bytes();return b'VP8 ' in d and b'VP8L' not in d
+          q=sorted([p for p in ps if vp8(p)],key=lambda p:p.stat().st_size,reverse=True)
+          for p in q[:2]:print(p)
+          PY
+          mapfile -t F </tmp/cases.txt;test ${#F[@]} -ge 1
+          : >/tmp/r.tsv
+          for f in "${F[@]}";do cf=${f/\/tmp\/base/\/tmp\/cand};test "$($B hash 1 "$f")" = "$($C hash 1 "$cf")";done
+          for r in {1..21};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;for k in "${!F[@]}";do f=${F[$k]};[[ $v == cand ]]&&f=${f/\/tmp\/base/\/tmp\/cand};u=$(taskset -c 0 "$X" bench 6 "$f");printf '%s\t%s\t%s\t%s\n' "$k" "$r" "$v" "$u">>/tmp/r.tsv;done;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,subprocess
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={};g={}
+          for k,r,v,x in rows:k=int(k);r=int(r);x=float(x);g.setdefault((k,v),[]).append(x);rr.setdefault((k,r),{})[v]=x
+          L=['# VP8 read_coefficients noinline benchmark','', '- full verification and output hashes passed','','| case | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for k in sorted({int(x[0]) for x in rows}):
+            p=[z['base']/z['cand'] for (kk,_),z in sorted(rr.items()) if kk==k];b=statistics.median(g[k,'base']);c=statistics.median(g[k,'cand']);L.append(f'| {k} | {b:.3f} us | {c:.3f} us | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |')
+          pathlib.Path('benchmark-vp8-read-coeff-noinline.md').write_text('\n'.join(L+['']))
+          PY
+          cp benchmark-vp8-read-coeff-noinline.md "$GITHUB_WORKSPACE/"
+          cd "$GITHUB_WORKSPACE";git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8-read-coeff-noinline.md;git commit -m 'Record VP8 coefficient noinline benchmark';git push origin HEAD:bench-vp8l-single-group
