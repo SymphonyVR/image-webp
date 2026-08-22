@@ -1,0 +1,35 @@
+name: Promote confirmed VP8L predictor-1 optimization
+on:
+  push:
+    branches: [ promote-vp8l-predictor1 ]
+    paths: [ .github/workflows/promote-vp8l-predictor1.yml ]
+permissions:
+  contents: write
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply confirmed source and verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git cherry-pick 9506cad4ca7ff0f1f9280a3e473832b34ac9e30e
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Remove promotion workflow
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git rm .github/workflows/promote-vp8l-predictor1.yml
+          git commit -m 'Finalize VP8L predictor-1 optimization'
+          git push origin HEAD:promote-vp8l-predictor1
