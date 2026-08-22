@@ -770,7 +770,7 @@ impl<R: Read> Vp8Decoder<R> {
         complexity: usize,
         dcq: i16,
         acq: i16,
-    ) -> Result<bool, DecodingError> {
+    ) -> Result<u8, DecodingError> {
         assert!(complexity <= 2);
 
         let first_coeff = if plane == Plane::YCoeff1 {
@@ -782,8 +782,8 @@ impl<R: Read> Vp8Decoder<R> {
         let decoder = &mut self.partitions[p];
         let mut res = decoder.start_accumulated_result();
         let mut complexity = complexity;
-        let mut has_coefficients = false;
         let mut skip_eob = false;
+        let mut end = 16u8;
 
         for i in first_coeff..16usize {
             let band = COEFF_BANDS[i] as usize;
@@ -791,25 +791,21 @@ impl<R: Read> Vp8Decoder<R> {
             let value = decoder
                 .read_dct_value(probs, skip_eob)
                 .or_accumulate(&mut res);
-
             if value == DCT_VALUE_EOB {
+                end = i as u8;
                 break;
             }
             if value == 0 {
                 skip_eob = true;
-                has_coefficients = true;
                 complexity = 0;
                 continue;
             }
-
             skip_eob = false;
             complexity = if value.unsigned_abs() == 1 { 1 } else { 2 };
             let zigzag = ZIGZAG[i] as usize;
             block[zigzag] = i32::from(value) * i32::from(if zigzag > 0 { acq } else { dcq });
-            has_coefficients = true;
         }
-
-        decoder.check(res, has_coefficients)
+        decoder.check(res, end)
     }
 
     fn read_residual_data(
@@ -831,15 +827,22 @@ impl<R: Read> Vp8Decoder<R> {
             let mut block = [0i32; 16];
             let dcq = self.segment[sindex].y2dc;
             let acq = self.segment[sindex].y2ac;
-            let n = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
+            let nz = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
+            let n = nz > 0;
 
             self.left.complexity[0] = if n { 1 } else { 0 };
             self.top[mbx].complexity[0] = if n { 1 } else { 0 };
 
-            transform::iwht4x4(&mut block);
-
-            for k in 0usize..16 {
-                blocks[16 * k] = block[k];
+            if nz > 1 {
+                transform::iwht4x4(&mut block);
+                for k in 0usize..16 {
+                    blocks[16 * k] = block[k];
+                }
+            } else {
+                let dc0 = (block[0] + 3) >> 3;
+                for k in 0usize..16 {
+                    blocks[16 * k] = dc0;
+                }
             }
 
             plane = Plane::YCoeff1;
@@ -856,7 +859,8 @@ impl<R: Read> Vp8Decoder<R> {
                 let dcq = self.segment[sindex].ydc;
                 let acq = self.segment[sindex].yac;
 
-                let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                let nz = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                let n = nz > if plane == Plane::YCoeff1 { 1 } else { 0 };
 
                 if block[0] != 0 || n {
                     mb.non_zero_dct = true;
@@ -885,8 +889,9 @@ impl<R: Read> Vp8Decoder<R> {
                     let dcq = self.segment[sindex].uvdc;
                     let acq = self.segment[sindex].uvac;
 
-                    let n =
+                    let nz =
                         self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                    let n = nz > 0;
                     if block[0] != 0 || n {
                         mb.non_zero_dct = true;
                         transform::idct4x4(block);
