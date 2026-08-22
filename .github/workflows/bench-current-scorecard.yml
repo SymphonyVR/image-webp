@@ -1,0 +1,76 @@
+name: Measure current optimization scorecard
+on:
+  push:
+    branches: [ bench-current-scorecard ]
+    paths: [ .github/workflows/bench-current-scorecard.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build original and current refs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=f4d80bd965df2c81e65b6f43c1f70e0750bd4b0f
+          CAND=0fdcb2f57d1d7dd272ee45d08e26fc80cb3f2aa8
+          echo "BASE=$BASE" >> "$GITHUB_ENV"; echo "CAND=$CAND" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"; git worktree add --detach /tmp/cand "$CAND"
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder}; use std::{hint::black_box,io::Cursor,time::Instant};
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{let m=b.len()/2;s=s.wrapping_add(t as u64)^b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();let m=b.len()/2;s=b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)}black_box(s)}
+          fn main(){let mut a=std::env::args().skip(1);let n:usize=a.next().unwrap().parse().unwrap();let paths:Vec<_>=a.collect();let imgs:Vec<Vec<u8>>=paths.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();for d in &imgs{black_box(dec(d));}let t=Instant::now();let mut s=0;for _ in 0..n{for d in &imgs{s^=dec(d)}}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*imgs.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand; do mkdir -p "$d/examples"; cp /tmp/bench.rs "$d/examples/score.rs"; (cd "$d" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example score); done
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 5 -o /tmp/a.zip https://github.com/user-attachments/files/17482915/sample.zip; unzip -q /tmp/a.zip -d /tmp/119
+          curl -L --fail --retry 5 -o /tmp/b.zip https://github.com/user-attachments/files/20597234/honk.webp.zip; unzip -q /tmp/b.zip -d /tmp/136
+          echo "I119=$(find /tmp/119 -iname '*.webp'|head -n1)" >> "$GITHUB_ENV"
+          echo "I136=$(find /tmp/136 -iname '*.webp'|head -n1)" >> "$GITHUB_ENV"
+          python3 - <<'PY' >/tmp/base-vp8l.txt
+          from pathlib import Path
+          def chunks(d):
+              if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+              o=[];p=12
+              while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+              return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+              c=chunks(p.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: print(p)
+          PY
+      - name: Run paired scorecard
+        shell: bash
+        run: |
+          set -euxo pipefail
+          B=/tmp/base/target/release/examples/score; C=/tmp/cand/target/release/examples/score
+          mapfile -t BF </tmp/base-vp8l.txt
+          CF=(); for p in "${BF[@]}"; do CF+=("${p/\/tmp\/base/\/tmp\/cand}"); done
+          : >/tmp/r.tsv
+          for r in {1..13}; do
+            if ((r%2)); then o='base cand'; else o='cand base'; fi
+            for v in $o; do
+              if [[ $v == base ]]; then x=$B; files=("${BF[@]}"); else x=$C; files=("${CF[@]}"); fi
+              u=$(taskset -c 0 "$x" 4 "$I119"); printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+              u=$(taskset -c 0 "$x" 40 "$I136"); printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+              u=$(taskset -c 0 "$x" 100 "${files[@]}"); printf 'vp8l\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+            done
+          done
+      - name: Persist scorecard
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# Current optimization scorecard','',f'- original: `{os.environ["BASE"]}`',f'- current: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`','- same-run native release, CPU 0, paired medians','','| Workload | original | current | paired speedup |','|---|---:|---:|---:|']
+          for w in ('issue119','issue136','vp8l'):
+              b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {statistics.median(p):.3f}x |')
+          pathlib.Path('benchmark-current-scorecard.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-current-scorecard.md; git commit -m 'Record current optimization scorecard'; git push origin HEAD:bench-current-scorecard
