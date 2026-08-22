@@ -551,6 +551,14 @@ impl<R: BufRead> LosslessDecoder<R> {
                     for i in 0..length {
                         data[index * 4 + i * 4..][..4].copy_from_slice(&value);
                     }
+                } else if dist >= length {
+                    let source_start = (index - dist) * 4;
+                    let destination_start = index * 4;
+                    let byte_len = length * 4;
+                    let (before_destination, destination) = data.split_at_mut(destination_start);
+                    destination[..byte_len].copy_from_slice(
+                        &before_destination[source_start..source_start + byte_len],
+                    );
                 } else {
                     if index + length + 3 <= num_values {
                         let start = (index - dist) * 4;
