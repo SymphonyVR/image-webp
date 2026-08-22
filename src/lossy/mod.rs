@@ -706,7 +706,7 @@ impl<R: Read> Vp8Decoder<R> {
                     let y0 = 1 + y * 4;
                     let x0 = 1 + x * 4;
 
-                    add_residue(&mut ws, rb, y0, x0, stride);
+                    transform::idct4x4_add(rb, &mut ws, y0, x0, stride);
                 }
             }
         }
@@ -777,13 +777,13 @@ impl<R: Read> Vp8Decoder<R> {
                 let u_index = 16 + i;
                 if resdata.has_block(u_index) {
                     let urb: &[i32; 16] = resdata.blocks[u_index * 16..][..16].try_into().unwrap();
-                    add_residue(&mut uws, urb, y0, x0, stride);
+                    transform::idct4x4_add(urb, &mut uws, y0, x0, stride);
                 }
 
                 let v_index = 20 + i;
                 if resdata.has_block(v_index) {
                     let vrb: &[i32; 16] = resdata.blocks[v_index * 16..][..16].try_into().unwrap();
-                    add_residue(&mut vws, vrb, y0, x0, stride);
+                    transform::idct4x4_add(vrb, &mut vws, y0, x0, stride);
                 }
             }
         }
@@ -907,7 +907,6 @@ impl<R: Read> Vp8Decoder<R> {
                 let has_residual = block[0] != 0 || block[1..].iter().any(|&c| c != 0);
                 if block[0] != 0 || n {
                     mb.non_zero_dct = true;
-                    transform::idct4x4(block);
                 }
                 if has_residual {
                     non_zero_blocks |= 1u32 << i;
@@ -940,7 +939,6 @@ impl<R: Read> Vp8Decoder<R> {
                     let has_residual = block[0] != 0 || block[1..].iter().any(|&c| c != 0);
                     if block[0] != 0 || n {
                         mb.non_zero_dct = true;
-                        transform::idct4x4(block);
                     }
                     if has_residual {
                         non_zero_blocks |= 1u32 << i;

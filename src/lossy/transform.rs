@@ -50,6 +50,70 @@ pub(crate) fn idct4x4(block: &mut [i32]) {
     }
 }
 
+/// Inverse DCT and add the resulting residuals directly to a predicted 4x4 block.
+///
+/// This is the same transform as [`idct4x4`], but avoids materializing the final
+/// 16 transformed residuals when decoding. The first pass stays local and the
+/// second pass writes/clamps directly into the prediction buffer.
+pub(crate) fn idct4x4_add(block: &[i32; 16], dst: &mut [u8], y0: usize, x0: usize, stride: usize) {
+    #[inline(always)]
+    fn fetch(block: &[i32; 16], idx: usize) -> i64 {
+        i64::from(block[idx])
+    }
+
+    #[allow(clippy::manual_clamp)]
+    #[inline(always)]
+    fn add_clamped(pixel: &mut u8, residual: i32) {
+        let value = i32::from(*pixel) + residual;
+        *pixel = value.max(0).min(255) as u8;
+    }
+
+    let mut tmp = [0i32; 16];
+
+    for i in 0usize..4 {
+        let a1 = fetch(block, i) + fetch(block, 8 + i);
+        let b1 = fetch(block, i) - fetch(block, 8 + i);
+
+        let t1 = (fetch(block, 4 + i) * CONST2) >> 16;
+        let t2 = fetch(block, 12 + i) + ((fetch(block, 12 + i) * CONST1) >> 16);
+        let c1 = t1 - t2;
+
+        let t1 = fetch(block, 4 + i) + ((fetch(block, 4 + i) * CONST1) >> 16);
+        let t2 = (fetch(block, 12 + i) * CONST2) >> 16;
+        let d1 = t1 + t2;
+
+        tmp[i] = (a1 + d1) as i32;
+        tmp[4 + i] = (b1 + c1) as i32;
+        tmp[12 + i] = (a1 - d1) as i32;
+        tmp[8 + i] = (b1 - c1) as i32;
+    }
+
+    for row in 0usize..4 {
+        let base = 4 * row;
+        let a1 = fetch(&tmp, base) + fetch(&tmp, base + 2);
+        let b1 = fetch(&tmp, base) - fetch(&tmp, base + 2);
+
+        let t1 = (fetch(&tmp, base + 1) * CONST2) >> 16;
+        let t2 = fetch(&tmp, base + 3) + ((fetch(&tmp, base + 3) * CONST1) >> 16);
+        let c1 = t1 - t2;
+
+        let t1 = fetch(&tmp, base + 1) + ((fetch(&tmp, base + 1) * CONST1) >> 16);
+        let t2 = (fetch(&tmp, base + 3) * CONST2) >> 16;
+        let d1 = t1 + t2;
+
+        let residuals = [
+            ((a1 + d1 + 4) >> 3) as i32,
+            ((b1 + c1 + 4) >> 3) as i32,
+            ((b1 - c1 + 4) >> 3) as i32,
+            ((a1 - d1 + 4) >> 3) as i32,
+        ];
+        let pos = (y0 + row) * stride + x0;
+        for (pixel, residual) in dst[pos..pos + 4].iter_mut().zip(residuals) {
+            add_clamped(pixel, residual);
+        }
+    }
+}
+
 // 14.3 inverse walsh-hadamard transform, used in decoding
 pub(crate) fn iwht4x4(block: &mut [i32]) {
     // Perform one length check up front to avoid subsequent bounds checks in this function
@@ -164,6 +228,34 @@ pub(crate) fn dct4x4(block: &mut [i32; 16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_idct4x4_add_matches_staged_transform() {
+        let mut seed = 0x1234_5678u32;
+        for _ in 0..1000 {
+            let mut block = [0i32; 16];
+            for coeff in &mut block {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *coeff = ((seed >> 16) as i16 as i32) / 8;
+            }
+
+            let mut expected = [127u8; 8 * 8];
+            let mut transformed = block;
+            idct4x4(&mut transformed);
+            for row in 0..4 {
+                for col in 0..4 {
+                    let pos = (2 + row) * 8 + 2 + col;
+                    expected[pos] = (i32::from(expected[pos]) + transformed[row * 4 + col])
+                        .max(0)
+                        .min(255) as u8;
+                }
+            }
+
+            let mut actual = [127u8; 8 * 8];
+            idct4x4_add(&block, &mut actual, 2, 2, 8);
+            assert_eq!(expected, actual);
+        }
+    }
 
     #[test]
     fn test_dct_inverse() {

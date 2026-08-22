@@ -3,6 +3,7 @@
 //! Functions for doing prediction and for setting up buffers for prediction
 
 use super::common::IntraMode;
+use super::transform;
 
 /// Luma prediction block includes the 1 pixel border to the left and on top
 /// as well as 4 pixels to the top right of the block
@@ -184,7 +185,7 @@ pub(crate) fn predict_4x4(
 
             if non_zero_blocks & (1u32 << i) != 0 {
                 let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
-                add_residue(ws, rb, y0, x0, stride);
+                transform::idct4x4_add(rb, ws, y0, x0, stride);
             }
         }
     }
