@@ -1,0 +1,68 @@
+name: Benchmark VP8 row-local loop filtering
+on:
+  push:
+    branches: [ bench-vp8-row-filter-stream ]
+    paths: [ .github/workflows/bench-vp8-row-filter-stream.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply candidate and verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/mod.rs');s=p.read_text()
+          s=s.replace('''    macroblocks: Vec<MacroBlock>,\n\n    frame: Frame,\n''','''    frame: Frame,\n''',1)
+          s=s.replace('''            macroblocks: Vec::new(),\n\n            frame: f,\n''','''            frame: f,\n''',1)
+          old='''        for mby in 0..self.mbheight as usize {\n            let p = mby % self.num_partitions as usize;\n            self.left = PreviousMacroBlock::default();\n\n            for mbx in 0..self.mbwidth as usize {\n'''
+          new='''        let mut row_macroblocks = vec![MacroBlock::default(); self.mbwidth as usize];\n        for mby in 0..self.mbheight as usize {\n            let p = mby % self.num_partitions as usize;\n            self.left = PreviousMacroBlock::default();\n\n            for mbx in 0..self.mbwidth as usize {\n'''
+          if old not in s: raise SystemExit('row start marker missing')
+          s=s.replace(old,new,1)
+          old='''                self.intra_predict_luma(mbx, mby, &mb, &blocks);\n                self.intra_predict_chroma(mbx, mby, &mb, &blocks);\n\n                self.macroblocks.push(mb);\n            }\n\n            self.left_border_y = vec![129u8; 1 + 16];\n            self.left_border_u = vec![129u8; 1 + 8];\n            self.left_border_v = vec![129u8; 1 + 8];\n        }\n\n        //do loop filtering\n        for mby in 0..self.mbheight as usize {\n            for mbx in 0..self.mbwidth as usize {\n                let mb = self.macroblocks[mby * self.mbwidth as usize + mbx];\n                self.loop_filter(mbx, mby, &mb);\n            }\n        }\n'''
+          new='''                self.intra_predict_luma(mbx, mby, &mb, &blocks);\n                self.intra_predict_chroma(mbx, mby, &mb, &blocks);\n                row_macroblocks[mbx] = mb;\n            }\n\n            // Prediction has already copied the unfiltered right/bottom borders\n            // into dedicated state. Filter the completed row while its pixels\n            // are still hot, preserving the original raster filter order.\n            for (mbx, mb) in row_macroblocks.iter().enumerate() {\n                self.loop_filter(mbx, mby, mb);\n            }\n\n            self.left_border_y.fill(129);\n            self.left_border_u.fill(129);\n            self.left_border_v.fill(129);\n        }\n'''
+          if old not in s: raise SystemExit('row finish marker missing')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          cargo fmt
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossy/mod.rs;git commit -m 'Filter VP8 macroblocks by reconstructed row'
+          CAND=$(git rev-parse HEAD);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CAND=$CAND" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          cargo test -q;cargo doc -q;cargo clippy --all-features -- -D warnings;cargo fmt -- --check;rustup toolchain install 1.80.1 --profile minimal;cargo +1.80.1 build -q
+      - name: Benchmark issue workloads
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$CAND"
+          mkdir -p /tmp/i119 /tmp/i136
+          curl -L --fail --retry 3 -o /tmp/i119.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/i119.zip -d /tmp/i119
+          curl -L --fail --retry 3 -o /tmp/i136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip;unzip -q /tmp/i136.zip -d /tmp/i136
+          I119=$(find /tmp/i119 -type f -iname '*.webp'|head -1);I136=$(find /tmp/i136 -type f -iname '*.webp'|head -1)
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>s^=t as u64^b[b.len()/2]as u64,Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();s=b[b.len()/2]as u64}black_box(s)}
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];if x.is_animated(){while x.read_frame(&mut b).is_ok(){}}else{x.read_image(&mut b).unwrap();}b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}
+          fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let p=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let d=std::fs::read(p).unwrap();if m=="hash"{println!("{:016x}",hash(&d));return}black_box(dec(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/bench.rs "$d/examples/rf.rs";(cd "$d"&&cargo build --release --example rf -q);done
+          B=/tmp/base/target/release/examples/rf;C=/tmp/cand/target/release/examples/rf;test "$($B hash "$I119" 1)" = "$($C hash "$I119" 1)";test "$($B hash "$I136" 1)" = "$($C hash "$I136" 1)";: >/tmp/r.tsv
+          for r in {1..21};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;u=$(taskset -c 0 "$X" bench "$I119" 3);printf '119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench "$I136" 20);printf '136\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# VP8 row-local loop-filter benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`','- full verification and output hashes passed','','| workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('119','136'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| issue {w} | {b:.3f} us | {c:.3f} us | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          pathlib.Path('benchmark-vp8-row-filter-stream.md').write_text('\n'.join(L+['']))
+          PY
+          cp benchmark-vp8-row-filter-stream.md "$GITHUB_WORKSPACE/";cd "$GITHUB_WORKSPACE";git reset --hard "$BASE";cp /tmp/cand/src/lossy/mod.rs src/lossy/mod.rs;git add src/lossy/mod.rs benchmark-vp8-row-filter-stream.md;git commit -m 'Record VP8 row-filter benchmark';git push origin HEAD:bench-vp8-row-filter-stream
