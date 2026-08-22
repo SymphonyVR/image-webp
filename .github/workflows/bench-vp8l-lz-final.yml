@@ -1,0 +1,153 @@
+name: Benchmark final-tree VP8L LZ candidates
+on:
+  push:
+    branches: [ bench-vp8l-lz-final ]
+    paths: [ .github/workflows/bench-vp8l-lz-final.yml ]
+permissions:
+  contents: write
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Prepare variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          for v in bulk pattern deferred bulk_deferred pattern_deferred;do cp -a /tmp/base "/tmp/$v";done
+          cat >/tmp/patch.py <<'PY'
+          from pathlib import Path
+          def bulk(root):
+            p=Path(root)/'src/lossless/decoder/mod.rs';s=p.read_text()
+            old='''                } else {\n                    if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n'''
+            new='''                } else {\n                    if dist >= length {\n                        let source_start = (index - dist) * 4;\n                        let destination_start = index * 4;\n                        let byte_len = length * 4;\n                        let (before_destination, destination) = data.split_at_mut(destination_start);\n                        destination[..byte_len].copy_from_slice(\n                            &before_destination[source_start..source_start + byte_len],\n                        );\n                    } else if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n'''
+            if old not in s: raise SystemExit(f'bulk marker missing {root}')
+            p.write_text(s.replace(old,new,1))
+          def pattern(root):
+            p=Path(root)/'src/lossless/decoder/mod.rs';s=p.read_text()
+            marker='''const ALPHABET_SIZE: [u16; HUFFMAN_CODES_PER_META_CODE] = [256 + 24, 256, 256, 256, 40];\n'''
+            helper=r'''
+
+#[inline]
+fn copy_backreference(data: &mut [u8], index: usize, distance: usize, length: usize) {
+    let destination_start = index * 4;
+    let byte_len = length * 4;
+    let source_start = (index - distance) * 4;
+
+    if distance >= length {
+        let (before_destination, destination) = data.split_at_mut(destination_start);
+        destination[..byte_len]
+            .copy_from_slice(&before_destination[source_start..source_start + byte_len]);
+        return;
+    }
+
+    let period_bytes = distance * 4;
+    let (before_destination, destination_tail) = data.split_at_mut(destination_start);
+    let destination = &mut destination_tail[..byte_len];
+    destination[..period_bytes]
+        .copy_from_slice(&before_destination[source_start..source_start + period_bytes]);
+    let mut copied = period_bytes;
+    while copied < byte_len {
+        let amount = copied.min(byte_len - copied);
+        destination.copy_within(..amount, copied);
+        copied += amount;
+    }
+}
+'''
+            if marker not in s: raise SystemExit('const marker missing')
+            s=s.replace(marker,marker+helper,1)
+            start=s.index('''                if dist == 1 {\n                    let value: [u8; 4]''')
+            cache=s.index('''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {''',start)
+            # Keep current cache-tail block and its enclosing `else` semantics; replace only copy code before cache update.
+            prefix='''                copy_backreference(data, index, dist, length);\n\n                if dist != 1 {\n'''
+            s=s[:start]+prefix+s[cache:]
+            # Existing source already has the closing brace for old else after cache block; it now closes `if dist != 1`.
+            p.write_text(s)
+          def deferred(root):
+            p=Path(root)/'src/lossless/decoder/mod.rs';s=p.read_text()
+            marker='''        let mut tree = &huffman_info.huffman_code_groups[huff_index];\n        let mut index = 0;\n''';rep='''        let mut tree = &huffman_info.huffman_code_groups[huff_index];\n        let mut index = 0;\n        let mut last_cached = 0usize;\n''';
+            if marker not in s: raise SystemExit('deferred index marker missing')
+            s=s.replace(marker,rep,1)
+            old='''                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                            color_cache.insert(value);\n                        }\n\n                        index += n;\n''';new='''                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                            for pixel in data[last_cached * 4..index * 4].chunks_exact(4) {\n                                color_cache.insert(pixel.try_into().unwrap());\n                            }\n                            color_cache.insert(value);\n                            last_cached = index + n;\n                        }\n\n                        index += n;\n''';
+            if old not in s: raise SystemExit('single marker missing')
+            s=s.replace(old,new,1)
+            old='''                if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                    color_cache.insert([red, green, blue, alpha]);\n                }\n                index += 1;\n''';
+            if old not in s: raise SystemExit('literal cache marker missing')
+            s=s.replace(old,'                index += 1;\n',1)
+            # Remove whichever immediate backref cache-tail block remains.
+            key='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        // The cache is unobservable while a backreference is copied.'''
+            if key in s:
+              a=s.index(key);b=s.index('''                    }\n                }\n                index += length;''',a)
+              s=s[:a]+s[b+len('                    }\n'):]
+            old='''                let color_cache = huffman_info\n                    .color_cache\n                    .as_mut()\n                    .ok_or(DecodingError::BitStreamError)?;\n                let color = color_cache.lookup((code - 280).into());\n''';new='''                let color_cache = huffman_info\n                    .color_cache\n                    .as_mut()\n                    .ok_or(DecodingError::BitStreamError)?;\n                for pixel in data[last_cached * 4..index * 4].chunks_exact(4) {\n                    color_cache.insert(pixel.try_into().unwrap());\n                }\n                last_cached = index;\n                let color = color_cache.lookup((code - 280).into());\n''';
+            if old not in s: raise SystemExit('lookup marker missing')
+            s=s.replace(old,new,1)
+            old='''                data[index * 4..][..4].copy_from_slice(&color);\n                index += 1;\n\n                if index < next_block_start {\n''';new='''                data[index * 4..][..4].copy_from_slice(&color);\n                index += 1;\n                last_cached = index;\n\n                if index < next_block_start {\n''';
+            if old not in s: raise SystemExit('cache advance missing')
+            s=s.replace(old,new,1)
+            old='''                            data[index * 4..][..4]\n                                .copy_from_slice(&color_cache.lookup((code - 280).into()));\n                            index += 1;\n''';new='''                            data[index * 4..][..4]\n                                .copy_from_slice(&color_cache.lookup((code - 280).into()));\n                            index += 1;\n                            last_cached = index;\n''';
+            if old not in s: raise SystemExit('second lookup missing')
+            s=s.replace(old,new,1);p.write_text(s)
+          bulk('/tmp/bulk');pattern('/tmp/pattern');deferred('/tmp/deferred');bulk('/tmp/bulk_deferred');deferred('/tmp/bulk_deferred');pattern('/tmp/pattern_deferred');deferred('/tmp/pattern_deferred')
+          PY
+          python3 /tmp/patch.py
+          rustup toolchain install 1.80.1 --profile minimal
+          for d in /tmp/bulk /tmp/pattern /tmp/deferred /tmp/bulk_deferred /tmp/pattern_deferred;do (cd "$d"&&cargo fmt&&cargo test -q&&cargo doc -q&&cargo clippy --all-features -- -D warnings&&cargo fmt -- --check&&cargo +1.80.1 build -q);done
+      - name: Prepare corpus and large image
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="hash"{for d in &ds{println!("{:016x}",hash(d))}return}for d in &ds{black_box(dec(d));}let t=Instant::now();let mut s=0;for _ in 0..n{for d in &ds{s^=dec(d)}}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+RS
+          for d in base bulk pattern deferred bulk_deferred pattern_deferred;do mkdir -p "/tmp/$d/examples";cp /tmp/b.rs "/tmp/$d/examples/lz.rs";(cd "/tmp/$d"&&cargo build --release --example lz -q);done
+      - name: Hash and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt;B=/tmp/base/target/release/examples/lz
+          BH=$($B hash 1 "${BF[@]}" /tmp/large.webp)
+          for v in bulk pattern deferred bulk_deferred pattern_deferred;do CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done;test "$BH" = "$(/tmp/$v/target/release/examples/lz hash 1 "${CF[@]}" /tmp/large.webp)";done
+          : >/tmp/r.tsv
+          for r in {1..11};do V=(base bulk pattern deferred bulk_deferred pattern_deferred);if ((r%2==0));then V=(pattern_deferred bulk_deferred deferred pattern bulk base);fi;for v in "${V[@]}";do X=/tmp/$v/target/release/examples/lz;F=();for p in "${BF[@]}";do [[ $v == base ]]&&F+=("$p")||F+=("${p/\/tmp\/base/\/tmp\/$v}");done;u=$(taskset -c 0 "$X" bench 100 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench 2 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+      - name: Persist
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# Final-tree VP8L LZ/cache matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- all variants pass tests/docs/Clippy/fmt/MSRV and full-output hashes','','| workload | variant | paired speedup vs base | range |','|---|---|---:|---:|']
+          for w in ('corpus','large'):
+            for v in ('bulk','pattern','deferred','bulk_deferred','pattern_deferred'):
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {v} | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          pathlib.Path('benchmark-vp8l-lz-final.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-lz-final.md;git commit -m 'Record final-tree VP8L LZ matrix';git push origin HEAD:bench-vp8l-lz-final
