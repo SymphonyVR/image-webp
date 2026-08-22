@@ -1,0 +1,59 @@
+name: Benchmark VP8 left-border reuse
+on:
+  push:
+    branches: [ bench-vp8l-single-group ]
+    paths: [ .github/workflows/bench-vp8-border-reuse.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Prepare A/B
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=00c9bf309f8286509832948a67d4fbcdb2933adc
+          git worktree add --detach /tmp/base "$BASE";cp -a /tmp/base /tmp/cand
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossy/mod.rs');s=p.read_text()
+          old='''            self.left_border_y = vec![129u8; 1 + 16];\n            self.left_border_u = vec![129u8; 1 + 8];\n            self.left_border_v = vec![129u8; 1 + 8];\n'''
+          new='''            self.left_border_y.fill(129);\n            self.left_border_u.fill(129);\n            self.left_border_v.fill(129);\n'''
+          if old not in s: raise SystemExit('border reset marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo doc -q&&cargo clippy --all-features -- -D warnings&&cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand&&cargo +1.80.1 build -q)
+          mkdir -p /tmp/i119 /tmp/i136
+          curl -L --fail --retry 3 -o /tmp/i119.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/i119.zip -d /tmp/i119
+          curl -L --fail --retry 3 -o /tmp/i136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip;unzip -q /tmp/i136.zip -d /tmp/i136
+          echo "I119=$(find /tmp/i119 -type f -iname '*.webp'|head -1)" >> "$GITHUB_ENV";echo "I136=$(find /tmp/i136 -type f -iname '*.webp'|head -1)" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>s=s.wrapping_add(t as u64).wrapping_add(b[b.len()/2]as u64),Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();s=b[b.len()/2]as u64}black_box(s)}
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];if x.is_animated(){while x.read_frame(&mut b).is_ok(){}}else{x.read_image(&mut b).unwrap();}b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}
+          fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let p=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let d=std::fs::read(p).unwrap();if m=="hash"{println!("{:016x}",hash(&d));return}black_box(dec(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/bench.rs "$d/examples/br.rs";(cd "$d"&&cargo build --release --example br -q);done
+      - name: Measure and persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          B=/tmp/base/target/release/examples/br;C=/tmp/cand/target/release/examples/br;test "$($B hash "$I119" 1)" = "$($C hash "$I119" 1)";test "$($B hash "$I136" 1)" = "$($C hash "$I136" 1)";: >/tmp/r.tsv
+          for r in {1..21};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;u=$(taskset -c 0 "$X" bench "$I119" 3);printf '119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench "$I136" 20);printf '136\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# VP8 left-border reuse benchmark','',f'- CPU: `{os.environ["CPU"]}`','- full verification + hashes passed','','| workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('119','136'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| issue {w} | {b:.3f} us | {c:.3f} us | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          pathlib.Path('benchmark-vp8-border-reuse.md').write_text('\n'.join(L+['']))
+          PY
+          cp benchmark-vp8-border-reuse.md "$GITHUB_WORKSPACE/";cd "$GITHUB_WORKSPACE";git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8-border-reuse.md;git commit -m 'Record VP8 border reuse benchmark';git push origin HEAD:bench-vp8l-single-group
