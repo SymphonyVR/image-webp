@@ -1,0 +1,35 @@
+name: Verify fused alpha emission
+on:
+  push:
+    branches: [ candidate-alpha-emission ]
+    paths: [ .github/workflows/verify-alpha-emission.yml ]
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Run verification and record status
+        shell: bash
+        run: |
+          set +e
+          : > /tmp/verify.txt
+          for cmd in "cargo test -v" "cargo doc -v" "cargo clippy --all-features -- -D warnings" "cargo fmt -- --check"; do
+            echo "== $cmd ==" >> /tmp/verify.txt
+            bash -lc "$cmd" >> /tmp/verify.txt 2>&1
+            echo "exit=$?" >> /tmp/verify.txt
+          done
+          rustup toolchain install 1.80.1 --profile minimal >> /tmp/verify.txt 2>&1
+          echo "== cargo +1.80.1 build -v ==" >> /tmp/verify.txt
+          cargo +1.80.1 build -v >> /tmp/verify.txt 2>&1
+          echo "exit=$?" >> /tmp/verify.txt
+          cp /tmp/verify.txt verify-alpha-emission.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add verify-alpha-emission.txt
+          git commit -m 'Record fused alpha-emission verification'
+          git push origin HEAD:candidate-alpha-emission
