@@ -12,7 +12,8 @@ use super::{CODE_LENGTH_CODES, CODE_LENGTH_CODE_ORDER, DISTANCE_MAP};
 use crate::decoder::DecodingError;
 use huffman::HuffmanTree;
 use reverse_transform::{
-    apply_color_indexing_transform, apply_color_transform, apply_predictor_transform,
+    apply_color_indexing_transform, apply_color_transform,
+    apply_color_transform_and_subtract_green, apply_predictor_transform,
     apply_subtract_green_transform, TransformType,
 };
 
@@ -104,7 +105,8 @@ impl<R: BufRead> LosslessDecoder<R> {
 
         let mut image_size = transformed_size;
         let mut width = transformed_width;
-        for &trans_index in self.transform_order.iter().rev() {
+        let mut transforms = self.transform_order.iter().rev().copied().peekable();
+        while let Some(trans_index) = transforms.next() {
             let transform = self.transforms[usize::from(trans_index)].as_ref().unwrap();
             match transform {
                 TransformType::PredictorTransform {
@@ -121,15 +123,50 @@ impl<R: BufRead> LosslessDecoder<R> {
                     size_bits,
                     transform_data,
                 } => {
-                    apply_color_transform(
-                        &mut buf[..image_size],
-                        width,
-                        *size_bits,
-                        transform_data,
-                    );
+                    let subtract_after = transforms.peek().is_some_and(|&next_index| {
+                        matches!(
+                            self.transforms[usize::from(next_index)].as_ref(),
+                            Some(TransformType::SubtractGreen)
+                        )
+                    });
+                    if subtract_after {
+                        apply_color_transform_and_subtract_green::<false>(
+                            &mut buf[..image_size],
+                            width,
+                            *size_bits,
+                            transform_data,
+                        );
+                        transforms.next();
+                    } else {
+                        apply_color_transform(
+                            &mut buf[..image_size],
+                            width,
+                            *size_bits,
+                            transform_data,
+                        );
+                    }
                 }
                 TransformType::SubtractGreen => {
-                    apply_subtract_green_transform(&mut buf[..image_size]);
+                    let next_color = transforms.peek().and_then(|&next_index| {
+                        match self.transforms[usize::from(next_index)].as_ref() {
+                            Some(TransformType::ColorTransform {
+                                size_bits,
+                                transform_data,
+                            }) => Some((*size_bits, transform_data.as_slice())),
+                            _ => None,
+                        }
+                    });
+                    if let Some((size_bits, transform_data)) = next_color {
+                        apply_color_transform_and_subtract_green::<true>(
+                            &mut buf[..image_size],
+                            width,
+                            size_bits,
+                            transform_data,
+                        );
+                        transforms.next();
+                    } else {
+                        apply_subtract_green_transform(&mut buf[..image_size]);
+                    }
                 }
                 TransformType::ColorIndexingTransform {
                     table_size,
