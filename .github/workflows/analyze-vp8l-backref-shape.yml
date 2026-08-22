@@ -1,0 +1,76 @@
+name: Analyze VP8L backward-reference shape
+on:
+  push:
+    branches: [ analyze-vp8l-backref-shape ]
+    paths: [ .github/workflows/analyze-vp8l-backref-shape.yml ]
+permissions:
+  contents: write
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Instrument LZ copy shape
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''        let mut next_block_start = 0;\n        while index < num_values {\n'''
+          new='''        let mut next_block_start = 0;\n        let mut shape_nonoverlap_refs = 0usize;\n        let mut shape_nonoverlap_pixels = 0usize;\n        let mut shape_overlap_refs = 0usize;\n        let mut shape_overlap_pixels = 0usize;\n        let mut shape_dist1_refs = 0usize;\n        let mut shape_dist1_pixels = 0usize;\n        let mut shape_cache_old_inserts = 0usize;\n        let mut shape_cache_tail_inserts = 0usize;\n        let mut shape_current_copy_chunks = 0usize;\n        while index < num_values {\n'''
+          if old not in s: raise SystemExit('loop marker missing')
+          s=s.replace(old,new,1)
+          old='''                if index < dist || num_values - index < length {\n                    return Err(DecodingError::BitStreamError);\n                }\n\n                if dist == 1 {\n'''
+          new='''                if index < dist || num_values - index < length {\n                    return Err(DecodingError::BitStreamError);\n                }\n\n                if dist == 1 {\n                    shape_dist1_refs += 1;\n                    shape_dist1_pixels += length;\n                } else if dist >= length {\n                    shape_nonoverlap_refs += 1;\n                    shape_nonoverlap_pixels += length;\n                } else {\n                    shape_overlap_refs += 1;\n                    shape_overlap_pixels += length;\n                }\n                if dist != 1 && huffman_info.color_cache.is_some() {\n                    shape_cache_old_inserts += length;\n                    shape_cache_tail_inserts += length.min(dist);\n                }\n                if dist != 1 {\n                    if index + length + 3 <= num_values {\n                        shape_current_copy_chunks += 1;\n                        if length > 4 || dist < 4 {\n                            shape_current_copy_chunks += (length * 4 - 1) / ((dist * 4).min(16));\n                        }\n                    } else {\n                        shape_current_copy_chunks += length * 4;\n                    }\n                }\n\n                if dist == 1 {\n'''
+          if old not in s: raise SystemExit('backref marker missing')
+          s=s.replace(old,new,1)
+          old='''        Ok(())\n    }\n\n    /// Reads color cache data from the bitstream\n'''
+          new='''        eprintln!(\n            "VP8L_LZ width={} height={} nonoverlap_refs={} nonoverlap_pixels={} overlap_refs={} overlap_pixels={} dist1_refs={} dist1_pixels={} cache_old_inserts={} cache_tail_inserts={} current_copy_chunks={}",\n            width, height, shape_nonoverlap_refs, shape_nonoverlap_pixels, shape_overlap_refs,\n            shape_overlap_pixels, shape_dist1_refs, shape_dist1_pixels, shape_cache_old_inserts,\n            shape_cache_tail_inserts, shape_current_copy_chunks\n        );\n        Ok(())\n    }\n\n    /// Reads color cache data from the bitstream\n'''
+          if old not in s: raise SystemExit('end marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          mkdir -p examples
+          cat >examples/analyze_lz.rs <<'RS'
+          use image_webp::WebPDecoder;use std::io::Cursor;
+          fn main(){for p in std::env::args().skip(1){eprintln!("FILE {p}");let d=std::fs::read(&p).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();}}
+          RS
+          cargo build --release --example analyze_lz
+      - name: Collect shapes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p.resolve())
+          PY
+          mapfile -t FILES </tmp/files.txt;target/release/examples/analyze_lz "${FILES[@]}" 2>/tmp/fixtures.log
+          sudo apt-get update -qq;sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          target/release/examples/analyze_lz /tmp/large.webp 2>/tmp/large.log
+      - name: Persist
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('analysis-vp8l-backref-shape.md').write_text('# VP8L backward-reference shape\n\n## Fixtures\n\n```text\n'+Path('/tmp/fixtures.log').read_text().strip()+'\n```\n\n## Generated 2048x2048\n\n```text\n'+Path('/tmp/large.log').read_text().strip()+'\n```\n')
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add analysis-vp8l-backref-shape.md;git commit -m 'Record VP8L backward-reference shape';git push origin HEAD:analyze-vp8l-backref-shape
