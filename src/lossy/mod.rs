@@ -89,6 +89,12 @@ const KEYFRAME_BPRED_MODE_NODES: [[[TreeNode; 9]; 10]; 10] = {
 const KEYFRAME_UV_MODE_NODES: [TreeNode; 3] =
     tree_nodes_from(KEYFRAME_UV_MODE_TREE, KEYFRAME_UV_MODE_PROBS);
 
+#[derive(Clone, Copy)]
+struct CoeffInfo {
+    coded: bool,
+    extent: u8,
+}
+
 #[derive(Default, Clone, Copy)]
 struct MacroBlock {
     bpred: [IntraMode; 16],
@@ -770,7 +776,7 @@ impl<R: Read> Vp8Decoder<R> {
         complexity: usize,
         dcq: i16,
         acq: i16,
-    ) -> Result<bool, DecodingError> {
+    ) -> Result<CoeffInfo, DecodingError> {
         assert!(complexity <= 2);
 
         let first_coeff = if plane == Plane::YCoeff1 {
@@ -783,6 +789,7 @@ impl<R: Read> Vp8Decoder<R> {
         let mut res = decoder.start_accumulated_result();
         let mut complexity = complexity;
         let mut has_coefficients = false;
+        let mut extent = 0u8;
         let mut skip_eob = false;
 
         for i in first_coeff..16usize {
@@ -807,9 +814,16 @@ impl<R: Read> Vp8Decoder<R> {
             let zigzag = ZIGZAG[i] as usize;
             block[zigzag] = i32::from(value) * i32::from(if zigzag > 0 { acq } else { dcq });
             has_coefficients = true;
+            extent = (i + 1) as u8;
         }
 
-        decoder.check(res, has_coefficients)
+        decoder.check(
+            res,
+            CoeffInfo {
+                coded: has_coefficients,
+                extent,
+            },
+        )
     }
 
     fn read_residual_data(
@@ -831,10 +845,11 @@ impl<R: Read> Vp8Decoder<R> {
             let mut block = [0i32; 16];
             let dcq = self.segment[sindex].y2dc;
             let acq = self.segment[sindex].y2ac;
-            let n = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
+            let info =
+                self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
 
-            self.left.complexity[0] = if n { 1 } else { 0 };
-            self.top[mbx].complexity[0] = if n { 1 } else { 0 };
+            self.left.complexity[0] = if info.coded { 1 } else { 0 };
+            self.top[mbx].complexity[0] = if info.coded { 1 } else { 0 };
 
             transform::iwht4x4(&mut block);
 
@@ -856,15 +871,17 @@ impl<R: Read> Vp8Decoder<R> {
                 let dcq = self.segment[sindex].ydc;
                 let acq = self.segment[sindex].yac;
 
-                let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                let info =
+                    self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
 
-                if block[0] != 0 || n {
+                if block[0] != 0 || info.coded {
                     mb.non_zero_dct = true;
-                    transform::idct4x4(block);
+                    let extent = info.extent.max(u8::from(block[0] != 0));
+                    transform::idct4x4_sparse(block, extent);
                 }
 
-                left = if n { 1 } else { 0 };
-                self.top[mbx].complexity[x + 1] = if n { 1 } else { 0 };
+                left = if info.coded { 1 } else { 0 };
+                self.top[mbx].complexity[x + 1] = if info.coded { 1 } else { 0 };
             }
 
             self.left.complexity[y + 1] = left;
@@ -885,15 +902,15 @@ impl<R: Read> Vp8Decoder<R> {
                     let dcq = self.segment[sindex].uvdc;
                     let acq = self.segment[sindex].uvac;
 
-                    let n =
+                    let info =
                         self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
-                    if block[0] != 0 || n {
+                    if block[0] != 0 || info.coded {
                         mb.non_zero_dct = true;
-                        transform::idct4x4(block);
+                        transform::idct4x4_sparse(block, info.extent);
                     }
 
-                    left = if n { 1 } else { 0 };
-                    self.top[mbx].complexity[x + j] = if n { 1 } else { 0 };
+                    left = if info.coded { 1 } else { 0 };
+                    self.top[mbx].complexity[x + j] = if info.coded { 1 } else { 0 };
                 }
 
                 self.left.complexity[y + j] = left;
