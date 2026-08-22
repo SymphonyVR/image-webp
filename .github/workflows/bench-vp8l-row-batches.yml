@@ -1,0 +1,114 @@
+name: Benchmark row-batched VP8L inverse transforms
+on:
+  push:
+    branches: [ bench-vp8l-row-batches ]
+    paths: [ .github/workflows/bench-vp8l-row-batches.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Verify candidate and prepare corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=0fdcb2f57d1d7dd272ee45d08e26fc80cb3f2aa8
+          CAND=ccf0bc41c2c03e3adfc6dd071cec97eec6062358
+          echo "BASE=$BASE" >> "$GITHUB_ENV"; echo "CAND=$CAND" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"; git worktree add --detach /tmp/cand "$CAND"
+          (cd /tmp/cand && cargo test -v && cargo doc -v && cargo clippy --all-features -- -D warnings && cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand && cargo +1.80.1 build -v)
+          python3 - <<'PY' >/tmp/vp8l-files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data)<12 or data[:4]!=b'RIFF' or data[8:12]!=b'WEBP': return []
+              out=[];p=12
+              while p+8<=len(data):
+                  f=data[p:p+4];n=int.from_bytes(data[p+4:p+8],'little');out.append(f);p+=8+n+(n&1)
+              return out
+          files=[]
+          for path in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+              c=chunks(path.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: files.append(path)
+          if not files: raise SystemExit('no static VP8L fixtures')
+          print(*files,sep='\n')
+          PY
+          echo "COUNT=$(wc -l </tmp/vp8l-files.txt)" >> "$GITHUB_ENV"
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::{hint::black_box,io::Cursor,time::Instant};
+          #[inline] fn hb(mut h:u64,b:u8)->u64{h^=b as u64;h.wrapping_mul(1099511628211)}
+          fn decode_hash(data:&[u8])->u64{let mut d=WebPDecoder::new(Cursor::new(data)).unwrap();let mut b=vec![0;d.output_buffer_size().unwrap()];d.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603,|h,&x|hb(h,x))}
+          fn decode_once(data:&[u8])->u64{let mut d=WebPDecoder::new(Cursor::new(data)).unwrap();let mut b=vec![0;d.output_buffer_size().unwrap()];d.read_image(&mut b).unwrap();black_box((b.len()as u64)^b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();if mode=="hash"{for p in a{let d=std::fs::read(&p).unwrap();println!("{} {:016x}",p,decode_hash(&d));}return}let n:usize=a.next().unwrap().parse().unwrap();let paths:Vec<_>=a.collect();let images:Vec<Vec<u8>>=paths.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();for d in &images{black_box(decode_once(d));}let t=Instant::now();let mut s=0u64;for _ in 0..n{for d in &images{s=s.wrapping_add(decode_once(d));}}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*images.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand; do mkdir -p "$d/examples"; cp /tmp/bench.rs "$d/examples/row_batch_bench.rs"; (cd "$d" && cargo build --release --example row_batch_bench); done
+      - name: Generate large lossless workload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+              f.write(f'P6\n{w} {h}\n255\n'.encode())
+              row=bytearray(w*3)
+              for y in range(h):
+                  for x in range(w):
+                      i=x*3
+                      row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255
+                      row[i+1]=(x*2+y*7+((x*y)>>10))&255
+                      row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+                  f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          ls -lh /tmp/large.webp
+      - name: Hash and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BASE_FILES </tmp/vp8l-files.txt
+          CAND_FILES=(); for p in "${BASE_FILES[@]}"; do CAND_FILES+=("${p/\/tmp\/base/\/tmp\/cand}"); done
+          B=/tmp/base/target/release/examples/row_batch_bench
+          C=/tmp/cand/target/release/examples/row_batch_bench
+          "$B" hash "${BASE_FILES[@]}" | sed 's#/tmp/base#/tmp/tree#' >/tmp/base.hash
+          "$C" hash "${CAND_FILES[@]}" | sed 's#/tmp/cand#/tmp/tree#' >/tmp/cand.hash
+          diff -u /tmp/base.hash /tmp/cand.hash
+          test "$($B hash /tmp/large.webp | awk '{print $2}')" = "$($C hash /tmp/large.webp | awk '{print $2}')"
+          : >/tmp/r.tsv
+          taskset -c 0 "$B" bench 20 "${BASE_FILES[@]}" >/dev/null
+          taskset -c 0 "$C" bench 20 "${CAND_FILES[@]}" >/dev/null
+          taskset -c 0 "$B" bench 2 /tmp/large.webp >/dev/null
+          taskset -c 0 "$C" bench 2 /tmp/large.webp >/dev/null
+          for r in {1..13}; do
+            if ((r%2)); then o='base cand'; else o='cand base'; fi
+            for v in $o; do
+              if [[ $v == base ]]; then x=$B; files=("${BASE_FILES[@]}"); else x=$C; files=("${CAND_FILES[@]}"); fi
+              u=$(taskset -c 0 "$x" bench 100 "${files[@]}")
+              printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u" >>/tmp/r.tsv
+              u=$(taskset -c 0 "$x" bench 5 /tmp/large.webp)
+              printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u" >>/tmp/r.tsv
+            done
+          done
+      - name: Persist result
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# VP8L row-batched inverse-transform benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`',f'- static VP8L fixtures: `{os.environ["COUNT"]}`','- full decoded outputs match for fixture corpus and generated 2048x2048 lossless image','- candidate passed tests, docs, Clippy, formatting, and Rust 1.80.1','','| Workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+              b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |')
+          pathlib.Path('benchmark-vp8l-row-batches.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-row-batches.md; git commit -m 'Record VP8L row-batch benchmark'; git push origin HEAD:bench-vp8l-row-batches
