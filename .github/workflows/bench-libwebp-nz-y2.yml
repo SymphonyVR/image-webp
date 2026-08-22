@@ -1,0 +1,97 @@
+name: Libwebp-style Y2 transform benchmark
+on:
+  push:
+    branches: [ bench-libwebp-nz-y2 ]
+    paths: [ .github/workflows/bench-libwebp-nz-y2.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply nz/Y2 candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASE=13448c6a17180ee9939154b052dd70b44cd1729c" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git reset --hard 13448c6a17180ee9939154b052dd70b44cd1729c
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossy/mod.rs');s=p.read_text()
+          a=s.index('    fn read_coefficients(\n');b=s.index('    fn read_residual_data(\n',a)
+          old=s[a:b]
+          new='''    fn read_coefficients(\n        &mut self,\n        block: &mut [i32; 16],\n        p: usize,\n        plane: Plane,\n        complexity: usize,\n        dcq: i16,\n        acq: i16,\n    ) -> Result<u8, DecodingError> {\n        assert!(complexity <= 2);\n\n        let first_coeff = if plane == Plane::YCoeff1 { 1usize } else { 0usize };\n        let probs = &self.token_probs[plane as usize];\n        let decoder = &mut self.partitions[p];\n        let mut res = decoder.start_accumulated_result();\n        let mut complexity = complexity;\n        let mut skip_eob = false;\n        let mut end = 16u8;\n\n        for i in first_coeff..16usize {\n            let band = COEFF_BANDS[i] as usize;\n            let probs = &probs[band][complexity];\n            let value = decoder.read_dct_value(probs, skip_eob).or_accumulate(&mut res);\n            if value == DCT_VALUE_EOB {\n                end = i as u8;\n                break;\n            }\n            if value == 0 {\n                skip_eob = true;\n                complexity = 0;\n                continue;\n            }\n            skip_eob = false;\n            complexity = if value.unsigned_abs() == 1 { 1 } else { 2 };\n            let zigzag = ZIGZAG[i] as usize;\n            block[zigzag] = i32::from(value) * i32::from(if zigzag > 0 { acq } else { dcq });\n        }\n        decoder.check(res, end)\n    }\n\n'''
+          s=s[:a]+new+s[b:]
+          old='''            let n = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;\n\n            self.left.complexity[0] = if n { 1 } else { 0 };\n            self.top[mbx].complexity[0] = if n { 1 } else { 0 };\n\n            transform::iwht4x4(&mut block);\n\n            for k in 0usize..16 {\n                blocks[16 * k] = block[k];\n            }\n'''
+          new='''            let nz = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;\n            let n = nz > 0;\n\n            self.left.complexity[0] = if n { 1 } else { 0 };\n            self.top[mbx].complexity[0] = if n { 1 } else { 0 };\n\n            if nz > 1 {\n                transform::iwht4x4(&mut block);\n                for k in 0usize..16 {\n                    blocks[16 * k] = block[k];\n                }\n            } else {\n                let dc0 = (block[0] + 3) >> 3;\n                for k in 0usize..16 {\n                    blocks[16 * k] = dc0;\n                }\n            }\n'''
+          if old not in s: raise SystemExit('Y2 marker missing')
+          s=s.replace(old,new,1)
+          old='''                let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;\n\n                if block[0] != 0 || n {'''
+          new='''                let nz = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;\n                let n = nz > if plane == Plane::YCoeff1 { 1 } else { 0 };\n\n                if block[0] != 0 || n {'''
+          if old not in s: raise SystemExit('luma marker missing')
+          s=s.replace(old,new,1)
+          old='''                    let n =\n                        self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;\n                    if block[0] != 0 || n {'''
+          new='''                    let nz =\n                        self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;\n                    let n = nz > 0;\n                    if block[0] != 0 || n {'''
+          if old not in s: raise SystemExit('chroma marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git diff --check
+          git add src/lossy/mod.rs
+          git commit -m 'Preserve VP8 coefficient extent for Y2 transform'
+          echo "CAND=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+      - name: Build and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$CAND"
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};
+          #[inline]fn hb(mut h:u64,b:u8)->u64{h^=b as u64;h.wrapping_mul(1099511628211)}
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut h=1469598103934665603u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{for z in t.to_le_bytes(){h=hb(h,z)}for &z in &b{h=hb(h,z)}},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();for &z in &b{h=hb(h,z)}}h}
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut s=0u64;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{let m=b.len()/2;s=s.wrapping_add(t as u64)^b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();let m=b.len()/2;s=b[0]as u64^((b[m]as u64)<<8)^((b[b.len()-1]as u64)<<16)}black_box(s)}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if mode=="hash"{println!("{:016x}",hash(&d));return}let n:usize=a.next().unwrap().parse().unwrap();black_box(dec(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/nz_y2.rs";(cd "$d"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example nz_y2);done
+          mkdir -p /tmp/119 /tmp/136
+          curl -L --fail --retry 5 -o /tmp/a.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/a.zip -d /tmp/119
+          curl -L --fail --retry 5 -o /tmp/b.zip https://github.com/user-attachments/files/20597234/honk.webp.zip;unzip -q /tmp/b.zip -d /tmp/136
+          I119=$(find /tmp/119 -iname '*.webp'|head -n1);I136=$(find /tmp/136 -iname '*.webp'|head -n1);B=/tmp/base/target/release/examples/nz_y2;C=/tmp/cand/target/release/examples/nz_y2
+          H119=$($B hash "$I119");test "$H119" = "$($C hash "$I119")";H136=$($B hash "$I136");test "$H136" = "$($C hash "$I136")";echo "H119=$H119" >> "$GITHUB_ENV";echo "H136=$H136" >> "$GITHUB_ENV";: >/tmp/r.tsv
+          for r in {1..11};do if ((r%2));then o='base cand';else o='cand base';fi;for v in $o;do [[ $v == base ]]&&x=$B||x=$C;u=$(taskset -c 0 "$x" bench "$I119" 3);printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$x" bench "$I136" 20);printf 'issue136\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# Libwebp-style coefficient extent and Y2 benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`','- full-output hashes match outside timed region','','| Workload | baseline | candidate | ratio | paired median | range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('issue119','issue136'):
+              b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {b/c:.3f}x | {statistics.median(p):.3f}x | {min(p):.3f}–{max(p):.3f}x |')
+          pathlib.Path('/tmp/result.md').write_text('\n'.join(L+['','```tsv']+['\t'.join(r) for r in rows]+['```','']))
+          PY
+          git reset --hard 13448c6a17180ee9939154b052dd70b44cd1729c
+          cp /tmp/result.md benchmark-libwebp-nz-y2.md
+          git add benchmark-libwebp-nz-y2.md
+          git commit -m 'Record libwebp-style Y2 transform benchmark'
+          git push origin HEAD:bench-libwebp-nz-y2
