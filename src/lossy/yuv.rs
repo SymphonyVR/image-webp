@@ -73,6 +73,7 @@ fn yuv_to_b(y: u8, u: u8) -> u8 {
 /// Fills an rgb buffer with the image from the yuv buffers
 /// Size of the buffer is assumed to be correct
 /// BPP is short for bytes per pixel, allows both rgb and rgba to be decoded
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
     buffer: &mut [u8],
     y_buffer: &[u8],
@@ -337,6 +338,7 @@ fn set_alpha<const BPP: usize>(pixel: &mut [u8], alpha_row: &[u8], x: usize) {
 
 /// Simple conversion, not currently used but could add a config to allow for using the simple
 #[allow(unused)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
     buffer: &mut [u8],
     y_buffer: &[u8],
@@ -597,7 +599,16 @@ mod tests {
         ];
 
         let mut rgb_buffer = [0u8; 16 * 3];
-        fill_rgb_buffer_fancy::<3>(&mut rgb_buffer, &y_buffer, &u_buffer, &v_buffer, 4, 4, 4);
+        fill_rgb_buffer_fancy::<3>(
+            &mut rgb_buffer,
+            &y_buffer,
+            &u_buffer,
+            &v_buffer,
+            &[],
+            4,
+            4,
+            4,
+        );
 
         #[rustfmt::skip]
         let upsampled_u_buffer = [
