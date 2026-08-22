@@ -1,0 +1,62 @@
+name: Quick-screen VP8L LZ candidates
+on:
+  push:
+    branches: [ bench-vp8l-lz-quick ]
+    paths: [ .github/workflows/bench-vp8l-lz-quick.yml ]
+permissions:
+  contents: write
+jobs:
+  quick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build quick variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          for v in base cache bulk pattern cache_bulk cache_pattern;do git worktree add --detach "/tmp/$v" "$BASE";done
+          python3 - <<'PY'
+          from pathlib import Path
+          def cache(root):
+            p=Path(root)/'src/lossless/decoder/mod.rs';s=p.read_text();old='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        for pixel in data[index * 4..][..length * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n                    }\n''';new='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        let n = length.min(dist);\n                        let start = index + length - n;\n                        for pixel in data[start * 4..][..n * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n                    }\n''';
+            if old not in s:raise SystemExit('cache marker');p.write_text(s.replace(old,new,1))
+          def bulk(root):
+            p=Path(root)/'src/lossless/decoder/mod.rs';s=p.read_text();old='''                if dist == 1 {\n                    let value: [u8; 4] = data[(index - dist) * 4..][..4].try_into().unwrap();\n                    for i in 0..length {\n                        data[index * 4 + i * 4..][..4].copy_from_slice(&value);\n                    }\n                } else {\n                    if index + length + 3 <= num_values {\n''';new='''                if dist == 1 {\n                    let value: [u8; 4] = data[(index - dist) * 4..][..4].try_into().unwrap();\n                    for i in 0..length {\n                        data[index * 4 + i * 4..][..4].copy_from_slice(&value);\n                    }\n                } else if dist >= length {\n                    let src = (index - dist) * 4; let dst = index * 4; let n = length * 4;\n                    let (before, after) = data.split_at_mut(dst);\n                    after[..n].copy_from_slice(&before[src..src+n]);\n                } else {\n                    if index + length + 3 <= num_values {\n''';
+            if old not in s:raise SystemExit('bulk marker');p.write_text(s.replace(old,new,1))
+          def pattern(root):
+            p=Path(root)/'src/lossless/decoder/mod.rs';s=p.read_text();marker='const ALPHABET_SIZE: [u16; HUFFMAN_CODES_PER_META_CODE] = [256 + 24, 256, 256, 256, 40];\n';helper='''\n#[inline]\nfn copy_backreference(data: &mut [u8], index: usize, distance: usize, length: usize) {\n    let dst=index*4;let n=length*4;let src=(index-distance)*4;\n    if distance>=length {let (a,b)=data.split_at_mut(dst);b[..n].copy_from_slice(&a[src..src+n]);return;}\n    let period=distance*4;let (a,b)=data.split_at_mut(dst);let d=&mut b[..n];d[..period].copy_from_slice(&a[src..src+period]);let mut copied=period;while copied<n{let amount=copied.min(n-copied);d.copy_within(..amount,copied);copied+=amount;}\n}\n''';
+            if marker not in s:raise SystemExit('pattern marker');s=s.replace(marker,marker+helper,1);start=s.index('                if dist == 1 {\n                    let value: [u8; 4]');end=s.index('                index += length;',start);repl='''                copy_backreference(data,index,dist,length);\n                if dist != 1 {\n                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        for pixel in data[index*4..][..length*4].chunks_exact(4) { color_cache.insert(pixel.try_into().unwrap()); }\n                    }\n                }\n''';p.write_text(s[:start]+repl+s[end:])
+          cache('/tmp/cache');bulk('/tmp/bulk');pattern('/tmp/pattern');cache('/tmp/cache_bulk');bulk('/tmp/cache_bulk');pattern('/tmp/cache_pattern')
+          p=Path('/tmp/cache_pattern/src/lossless/decoder/mod.rs');s=p.read_text();old='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        for pixel in data[index*4..][..length*4].chunks_exact(4) { color_cache.insert(pixel.try_into().unwrap()); }\n                    }\n''';new='''                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                        let n=length.min(dist);let start=index+length-n;\n                        for pixel in data[start*4..][..n*4].chunks_exact(4) { color_cache.insert(pixel.try_into().unwrap()); }\n                    }\n''';
+          if old not in s:raise SystemExit('cache pattern marker');p.write_text(s.replace(old,new,1))
+          PY
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[0]as u64^((b[b.len()/2]as u64)<<8))}fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if m=="h"{println!("{:x}",hash(&d));return}let n:usize=a.next().unwrap().parse().unwrap();let t=Instant::now();for _ in 0..n{black_box(dec(&d));}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for v in base cache bulk pattern cache_bulk cache_pattern;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/q.rs";(cd "/tmp/$v"&&cargo build --release --example q -q);done
+          sudo apt-get update -qq;sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/x.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());r=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):i=x*3;r[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;r[i+1]=(x*2+y*7+((x*y)>>10))&255;r[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(r)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/x.ppm -o /tmp/x.webp
+          H=$(/tmp/base/target/release/examples/q h /tmp/x.webp);for v in cache bulk pattern cache_bulk cache_pattern;do test "$H" = "$(/tmp/$v/target/release/examples/q h /tmp/x.webp)";done
+          : >/tmp/r
+          for r in {1..9};do for v in base cache bulk pattern cache_bulk cache_pattern;do u=$(taskset -c 0 "/tmp/$v/target/release/examples/q" t /tmp/x.webp 3);printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for r,v,x in R:x=float(x);g.setdefault(v,[]).append(x);rr.setdefault(int(r),{})[v]=x
+          L=['# VP8L LZ quick screen','',f'- CPU: `{os.environ["CPU"]}`','- generated 2048x2048 lossless; full hashes match','','| variant | median | paired vs baseline |','|---|---:|---:|']
+          for v in ['cache','bulk','pattern','cache_bulk','cache_pattern']:
+            p=[z['base']/z[v] for _,z in sorted(rr.items())];L.append(f'| {v} | {statistics.median(g[v]):.3f} us | {statistics.median(p):.4f}x |')
+          pathlib.Path('benchmark-vp8l-lz-quick.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-lz-quick.md;git commit -m 'Record VP8L LZ quick screen';git push origin HEAD:bench-vp8l-lz-quick
