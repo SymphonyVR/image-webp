@@ -1,0 +1,30 @@
+name: Materialize current VP8L distance-1 fill candidate
+on:
+  push:
+    branches: [ candidate-vp8l-dist1-doubling-current ]
+    paths: [ .github/workflows/materialize-vp8l-dist1-doubling-current.yml ]
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''                if dist == 1 {\n                    let value: [u8; 4] = data[(index - dist) * 4..][..4].try_into().unwrap();\n                    for i in 0..length {\n                        data[index * 4 + i * 4..][..4].copy_from_slice(&value);\n                    }\n                } else {\n'''
+          new='''                if dist == 1 {\n                    let destination_start = index * 4;\n                    let byte_len = length * 4;\n                    let value: [u8; 4] = data[destination_start - 4..destination_start]\n                        .try_into()\n                        .unwrap();\n                    let destination = &mut data[destination_start..destination_start + byte_len];\n                    destination[..4].copy_from_slice(&value);\n                    let mut copied = 4;\n                    while copied < byte_len {\n                        let amount = copied.min(byte_len - copied);\n                        destination.copy_within(..amount, copied);\n                        copied += amount;\n                    }\n                } else {\n'''
+          if old not in s: raise SystemExit('distance-1 marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/mod.rs
+          git commit -m 'Fill VP8L distance-1 backreferences exponentially'
+          git push origin HEAD:candidate-vp8l-dist1-doubling-current
