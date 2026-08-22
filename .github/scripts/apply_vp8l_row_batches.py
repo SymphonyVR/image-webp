@@ -43,16 +43,12 @@ pub(crate) fn apply_predictor_transform_rows(
         return Ok(());
     }
 
-    // The first row is reconstructed from the left pixel only.
     if start_row == 0 {
         image_data[3] = image_data[3].wrapping_add(255);
         apply_predictor_transform_1(image_data, 4..width * 4, width);
     }
 
     let first_predicted_row = start_row.max(1);
-
-    // Reconstruct the left border for this row batch. Previous batches have
-    // already reconstructed the row immediately above this batch.
     for y in first_predicted_row..end_row {
         for i in 0..4 {
             image_data[y * width * 4 + i] =
@@ -159,7 +155,8 @@ pub(crate) fn apply_color_transform_rows(
 }
 
 pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
-    apply_subtract_green_transform_rows(image_data, 0, image_data.len() / 4);
+    let end_pixel = image_data.len() / 4;
+    apply_subtract_green_transform_rows(image_data, 0, end_pixel);
 }
 
 pub(crate) fn apply_subtract_green_transform_rows(
@@ -177,7 +174,6 @@ pub(crate) fn apply_subtract_green_transform_rows(
 '''
 s = s[:start] + new_color + s[end:]
 
-# Add equivalence tests before the existing benchmark module.
 marker = '#[cfg(all(test, feature = "_benchmarks"))]\nmod benches {'
 tests = r'''#[cfg(test)]
 mod row_batch_tests {
@@ -209,14 +205,7 @@ mod row_batch_tests {
         let color_data = bytes(block_xsize * block_ysize * 4, &mut seed);
 
         let mut expected = source.clone();
-        apply_predictor_transform(
-            &mut expected,
-            width,
-            height,
-            size_bits,
-            &predictor_data,
-        )
-        .unwrap();
+        apply_predictor_transform(&mut expected, width, height, size_bits, &predictor_data).unwrap();
         apply_color_transform(&mut expected, width, size_bits, &color_data);
         apply_subtract_green_transform(&mut expected);
 
@@ -289,9 +278,6 @@ new_loop = r'''        let has_color_indexing = self.transform_order.iter().any(
         });
 
         if !has_color_indexing {
-            // Keep the active inverse-transform working set cache-local. The
-            // entropy decoder still owns the full output buffer; only the
-            // inverse-transform traversal is batched here.
             const ROW_BATCH: u16 = 16;
             let row_pixels = usize::from(transformed_width);
             let mut start_row = 0u16;
