@@ -6,7 +6,7 @@ use crate::decoder::{DecodingError, UpsamplingMethod};
 use common::*;
 use prediction::*;
 
-use arithmetic_decoder::ArithmeticDecoder;
+use arithmetic_decoder::{ArithmeticDecoder, DCT_VALUE_EOB};
 
 mod arithmetic_decoder;
 mod arithmetic_encoder;
@@ -88,26 +88,6 @@ const KEYFRAME_BPRED_MODE_NODES: [[[TreeNode; 9]; 10]; 10] = {
 
 const KEYFRAME_UV_MODE_NODES: [TreeNode; 3] =
     tree_nodes_from(KEYFRAME_UV_MODE_TREE, KEYFRAME_UV_MODE_PROBS);
-
-type TokenProbTreeNodes = [[[[TreeNode; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
-
-const COEFF_PROB_NODES: TokenProbTreeNodes = {
-    let mut output = [[[[TreeNode::UNINIT; 11]; 3]; 8]; 4];
-    let mut i = 0;
-    while i < output.len() {
-        let mut j = 0;
-        while j < output[i].len() {
-            let mut k = 0;
-            while k < output[i][j].len() {
-                output[i][j][k] = tree_nodes_from(DCT_TOKEN_TREE, COEFF_PROBS[i][j][k]);
-                k += 1;
-            }
-            j += 1;
-        }
-        i += 1;
-    }
-    output
-};
 
 #[derive(Default, Clone, Copy)]
 struct MacroBlock {
@@ -271,7 +251,7 @@ pub struct Vp8Decoder<R> {
     num_partitions: u8,
 
     segment_tree_nodes: [TreeNode; 3],
-    token_probs: Box<TokenProbTreeNodes>,
+    token_probs: Box<TokenProbTables>,
 
     // Section 9.11
     prob_skip_false: Option<Prob>,
@@ -330,7 +310,7 @@ impl<R: Read> Vp8Decoder<R> {
             num_partitions: 1,
 
             segment_tree_nodes: SEGMENT_TREE_NODE_DEFAULTS,
-            token_probs: Box::new(COEFF_PROB_NODES),
+            token_probs: Box::new(COEFF_PROBS),
 
             // Section 9.11
             prob_skip_false: None,
@@ -357,7 +337,7 @@ impl<R: Read> Vp8Decoder<R> {
                     for (t, prob) in ks.iter().enumerate().take(NUM_DCT_TOKENS - 1) {
                         if self.b.read_bool(*prob).or_accumulate(&mut res) {
                             let v = self.b.read_literal(8).or_accumulate(&mut res);
-                            self.token_probs[i][j][k][t].prob = v;
+                            self.token_probs[i][j][k][t] = v;
                         }
                     }
                 }
@@ -791,8 +771,6 @@ impl<R: Read> Vp8Decoder<R> {
         dcq: i16,
         acq: i16,
     ) -> Result<bool, DecodingError> {
-        // perform bounds checks once up front,
-        // so that the compiler doesn't have to insert them in the hot loop below
         assert!(complexity <= 2);
 
         let first_coeff = if plane == Plane::YCoeff1 {
@@ -802,69 +780,32 @@ impl<R: Read> Vp8Decoder<R> {
         };
         let probs = &self.token_probs[plane as usize];
         let decoder = &mut self.partitions[p];
-
         let mut res = decoder.start_accumulated_result();
-
         let mut complexity = complexity;
         let mut has_coefficients = false;
-        let mut skip = false;
+        let mut skip_eob = false;
 
         for i in first_coeff..16usize {
             let band = COEFF_BANDS[i] as usize;
-            let tree = &probs[band][complexity];
-
-            let token = decoder
-                .read_with_tree_with_first_node(tree, tree[skip as usize])
+            let probs = &probs[band][complexity];
+            let value = decoder
+                .read_dct_value(probs, skip_eob)
                 .or_accumulate(&mut res);
 
-            let mut abs_value = i32::from(match token {
-                DCT_EOB => break,
-
-                DCT_0 => {
-                    skip = true;
-                    has_coefficients = true;
-                    complexity = 0;
-                    continue;
-                }
-
-                literal @ DCT_1..=DCT_4 => i16::from(literal),
-
-                category @ DCT_CAT1..=DCT_CAT6 => {
-                    let probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];
-
-                    let mut extra = 0i16;
-
-                    for t in probs.iter().copied() {
-                        if t == 0 {
-                            break;
-                        }
-                        let b = decoder.read_bool(t).or_accumulate(&mut res);
-                        extra = extra + extra + i16::from(b);
-                    }
-
-                    i16::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]) + extra
-                }
-
-                c => panic!("unknown token: {c}"),
-            });
-
-            skip = false;
-
-            complexity = if abs_value == 0 {
-                0
-            } else if abs_value == 1 {
-                1
-            } else {
-                2
-            };
-
-            if decoder.read_sign().or_accumulate(&mut res) {
-                abs_value = -abs_value;
+            if value == DCT_VALUE_EOB {
+                break;
+            }
+            if value == 0 {
+                skip_eob = true;
+                has_coefficients = true;
+                complexity = 0;
+                continue;
             }
 
+            skip_eob = false;
+            complexity = if value.unsigned_abs() == 1 { 1 } else { 2 };
             let zigzag = ZIGZAG[i] as usize;
-            block[zigzag] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
-
+            block[zigzag] = i32::from(value) * i32::from(if zigzag > 0 { acq } else { dcq });
             has_coefficients = true;
         }
 

@@ -1,6 +1,11 @@
 use crate::decoder::DecodingError;
 
-use super::TreeNode;
+use super::{
+    common::{DCT_CAT_BASE, PROB_DCT_CAT},
+    TreeNode,
+};
+
+pub(crate) const DCT_VALUE_EOB: i16 = i16::MIN;
 
 #[must_use]
 #[repr(transparent)]
@@ -177,16 +182,6 @@ impl ArithmeticDecoder {
 
     // Do not inline this because inlining seems to worsen performance.
     #[inline(never)]
-    pub(crate) fn read_sign(&mut self) -> BitResult<bool> {
-        if let Some(b) = self.fast().read_sign() {
-            return BitResult::ok(b);
-        }
-
-        self.cold_read_flag()
-    }
-
-    // Do not inline this because inlining seems to worsen performance.
-    #[inline(never)]
     pub(crate) fn read_literal(&mut self, n: u8) -> BitResult<u8> {
         if let Some(v) = self.fast().read_literal(n) {
             return BitResult::ok(v);
@@ -203,6 +198,14 @@ impl ArithmeticDecoder {
         }
 
         self.cold_read_optional_signed_value(n)
+    }
+
+    #[inline(never)]
+    pub(crate) fn read_dct_value(&mut self, probs: &[u8; 11], skip_eob: bool) -> BitResult<i16> {
+        if let Some(value) = self.fast().read_dct_value(probs, skip_eob) {
+            return BitResult::ok(value);
+        }
+        self.cold_read_dct_value(probs, skip_eob)
     }
 
     // This is generic and inlined just to skip the first bounds check.
@@ -367,6 +370,86 @@ impl ArithmeticDecoder {
 
     #[cold]
     #[inline(never)]
+    fn cold_read_dct_value(&mut self, probs: &[u8; 11], skip_eob: bool) -> BitResult<i16> {
+        let mut res = self.start_accumulated_result();
+        if !skip_eob && !self.cold_read_bit(probs[0]).or_accumulate(&mut res) {
+            return self.keep_accumulating(res, DCT_VALUE_EOB);
+        }
+        if !self.cold_read_bit(probs[1]).or_accumulate(&mut res) {
+            return self.keep_accumulating(res, 0);
+        }
+
+        let abs = if !self.cold_read_bit(probs[2]).or_accumulate(&mut res) {
+            1i16
+        } else if !self.cold_read_bit(probs[3]).or_accumulate(&mut res) {
+            if !self.cold_read_bit(probs[4]).or_accumulate(&mut res) {
+                2
+            } else {
+                3 + if self.cold_read_bit(probs[5]).or_accumulate(&mut res) {
+                    1
+                } else {
+                    0
+                }
+            }
+        } else if !self.cold_read_bit(probs[6]).or_accumulate(&mut res) {
+            if !self.cold_read_bit(probs[7]).or_accumulate(&mut res) {
+                5 + if self
+                    .cold_read_bit(PROB_DCT_CAT[0][0])
+                    .or_accumulate(&mut res)
+                {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                7 + 2 * if self
+                    .cold_read_bit(PROB_DCT_CAT[1][0])
+                    .or_accumulate(&mut res)
+                {
+                    1
+                } else {
+                    0
+                } + if self
+                    .cold_read_bit(PROB_DCT_CAT[1][1])
+                    .or_accumulate(&mut res)
+                {
+                    1
+                } else {
+                    0
+                }
+            }
+        } else {
+            let hi = self.cold_read_bit(probs[8]).or_accumulate(&mut res);
+            let lo = self
+                .cold_read_bit(probs[9 + usize::from(hi)])
+                .or_accumulate(&mut res);
+            let cat = 2 + 2 * usize::from(hi) + usize::from(lo);
+            let mut extra = 0i16;
+            for prob in PROB_DCT_CAT[cat].iter().copied() {
+                if prob == 0 {
+                    break;
+                }
+                extra = extra
+                    + extra
+                    + if self.cold_read_bit(prob).or_accumulate(&mut res) {
+                        1
+                    } else {
+                        0
+                    };
+            }
+            i16::from(DCT_CAT_BASE[cat]) + extra
+        };
+
+        let signed = if self.cold_read_flag().or_accumulate(&mut res) {
+            -abs
+        } else {
+            abs
+        };
+        self.keep_accumulating(res, signed)
+    }
+
+    #[cold]
+    #[inline(never)]
     fn cold_read_with_tree(&mut self, tree: &[TreeNode], start: usize) -> BitResult<i8> {
         let mut index = start;
         let mut res = self.start_accumulated_result();
@@ -409,11 +492,6 @@ impl FastDecoder<'_> {
         self.commit_if_valid(value)
     }
 
-    fn read_sign(mut self) -> Option<bool> {
-        let value = self.fast_read_sign();
-        self.commit_if_valid(value)
-    }
-
     fn read_literal(mut self, n: u8) -> Option<u8> {
         let value = self.fast_read_literal(n);
         self.commit_if_valid(value)
@@ -432,6 +510,11 @@ impl FastDecoder<'_> {
         } else {
             i32::from(magnitude)
         };
+        self.commit_if_valid(value)
+    }
+
+    fn read_dct_value(mut self, probs: &[u8; 11], skip_eob: bool) -> Option<i16> {
+        let value = self.fast_read_dct_value(probs, skip_eob);
         self.commit_if_valid(value)
     }
 
@@ -614,6 +697,61 @@ impl FastDecoder<'_> {
             v = (v << 1) + u8::from(b);
         }
         v
+    }
+
+    fn fast_read_dct_value(&mut self, probs: &[u8; 11], skip_eob: bool) -> i16 {
+        if !skip_eob && !self.fast_read_bit(probs[0]) {
+            return DCT_VALUE_EOB;
+        }
+        if !self.fast_read_bit(probs[1]) {
+            return 0;
+        }
+
+        let abs = if !self.fast_read_bit(probs[2]) {
+            1i16
+        } else if !self.fast_read_bit(probs[3]) {
+            if !self.fast_read_bit(probs[4]) {
+                2
+            } else {
+                3 + if self.fast_read_bit(probs[5]) { 1 } else { 0 }
+            }
+        } else if !self.fast_read_bit(probs[6]) {
+            if !self.fast_read_bit(probs[7]) {
+                5 + if self.fast_read_bit(PROB_DCT_CAT[0][0]) {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                7 + 2 * if self.fast_read_bit(PROB_DCT_CAT[1][0]) {
+                    1
+                } else {
+                    0
+                } + if self.fast_read_bit(PROB_DCT_CAT[1][1]) {
+                    1
+                } else {
+                    0
+                }
+            }
+        } else {
+            let hi = self.fast_read_bit(probs[8]);
+            let lo = self.fast_read_bit(probs[9 + usize::from(hi)]);
+            let cat = 2 + 2 * usize::from(hi) + usize::from(lo);
+            let mut extra = 0i16;
+            for prob in PROB_DCT_CAT[cat].iter().copied() {
+                if prob == 0 {
+                    break;
+                }
+                extra = extra + extra + if self.fast_read_bit(prob) { 1 } else { 0 };
+            }
+            i16::from(DCT_CAT_BASE[cat]) + extra
+        };
+
+        if self.fast_read_sign() {
+            -abs
+        } else {
+            abs
+        }
     }
 
     fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {
