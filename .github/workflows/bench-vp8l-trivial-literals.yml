@@ -1,0 +1,87 @@
+name: VP8L trivial-literal benchmark
+on:
+  push:
+    branches: [ bench-vp8l-trivial-literals ]
+    paths: [ .github/workflows/bench-vp8l-trivial-literals.yml ]
+permissions:
+  contents: write
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Verify candidate and prepare corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=41490df368bb675e1f50922329b390968d352f10
+          CAND=75322420c001281928a4739ec8c5fc3698766e8c
+          echo "BASE=$BASE" >> "$GITHUB_ENV"; echo "CAND=$CAND" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"; git worktree add --detach /tmp/cand "$CAND"
+          (cd /tmp/cand && cargo test -v && cargo doc -v && cargo clippy --all-features -- -D warnings && cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand && cargo +1.80.1 build -v)
+          python3 - <<'PY' >/tmp/vp8l-files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data)<12 or data[:4]!=b'RIFF' or data[8:12]!=b'WEBP': return []
+              out=[];p=12
+              while p+8<=len(data):
+                  f=data[p:p+4];n=int.from_bytes(data[p+4:p+8],'little');out.append(f);p+=8+n+(n&1)
+              return out
+          files=[]
+          for path in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+              c=chunks(path.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: files.append(path)
+          if not files: raise SystemExit('no static VP8L fixtures')
+          print(*files,sep='\n')
+          PY
+          echo "COUNT=$(wc -l </tmp/vp8l-files.txt)" >> "$GITHUB_ENV"
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::{hint::black_box,io::Cursor,time::Instant};
+          #[inline] fn hb(mut h:u64,b:u8)->u64{h^=b as u64;h.wrapping_mul(1099511628211)}
+          fn decode_hash(data:&[u8])->u64{let mut d=WebPDecoder::new(Cursor::new(data)).unwrap();let mut b=vec![0;d.output_buffer_size().unwrap()];d.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603,|h,&x|hb(h,x))}
+          fn decode_once(data:&[u8])->u64{let mut d=WebPDecoder::new(Cursor::new(data)).unwrap();let mut b=vec![0;d.output_buffer_size().unwrap()];d.read_image(&mut b).unwrap();black_box((b.len() as u64)^b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();if mode=="hash"{for p in a{let d=std::fs::read(&p).unwrap();println!("{} {:016x}",p,decode_hash(&d));}return}let n:usize=a.next().unwrap().parse().unwrap();let paths:Vec<_>=a.collect();let images:Vec<Vec<u8>>=paths.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();for d in &images{black_box(decode_once(d));}let t=Instant::now();let mut s=0u64;for _ in 0..n{for d in &images{s=s.wrapping_add(decode_once(d));}}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*images.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand; do mkdir -p "$d/examples"; cp /tmp/bench.rs "$d/examples/vp8l_bench.rs"; (cd "$d" && cargo build --release --example vp8l_bench); done
+      - name: Hash all decoded outputs and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BASE_FILES </tmp/vp8l-files.txt
+          CAND_FILES=(); for p in "${BASE_FILES[@]}"; do CAND_FILES+=("${p/\/tmp\/base/\/tmp\/cand}"); done
+          B=/tmp/base/target/release/examples/vp8l_bench
+          C=/tmp/cand/target/release/examples/vp8l_bench
+          "$B" hash "${BASE_FILES[@]}" | sed 's#/tmp/base#/tmp/tree#' >/tmp/base.hash
+          "$C" hash "${CAND_FILES[@]}" | sed 's#/tmp/cand#/tmp/tree#' >/tmp/cand.hash
+          diff -u /tmp/base.hash /tmp/cand.hash
+          : >/tmp/r.tsv
+          taskset -c 0 "$B" bench 20 "${BASE_FILES[@]}" >/dev/null
+          taskset -c 0 "$C" bench 20 "${CAND_FILES[@]}" >/dev/null
+          for r in {1..17}; do
+            if ((r%2)); then o='base cand'; else o='cand base'; fi
+            for v in $o; do
+              if [[ $v == base ]]; then x=$B; files=("${BASE_FILES[@]}"); else x=$C; files=("${CAND_FILES[@]}"); fi
+              u=$(taskset -c 0 "$x" bench 120 "${files[@]}")
+              printf 'vp8l\t%s\t%s\t%s\n' "$r" "$v" "$u" >>/tmp/r.tsv
+            done
+          done
+      - name: Persist result
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv,os,statistics,pathlib
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault(v,[]).append(x);rr.setdefault(int(r),{})[v]=x
+          b=statistics.median(g['base']);c=statistics.median(g['cand']);p=[z['base']/z['cand'] for _,z in sorted(rr.items())]
+          L=['# VP8L trivial-literal benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`',f'- static VP8L fixtures: `{os.environ["COUNT"]}`','- full decoded output hash matched for every fixture','- candidate passed tests, docs, Clippy, formatting, and Rust 1.80.1','- normal release target; 17 alternating paired rounds','','| Workload | baseline | candidate | ratio of medians | paired median | range |','|---|---:|---:|---:|---:|---:|',f'| VP8L corpus | {b:.3f} us | {c:.3f} us | {b/c:.4f}x | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |']
+          pathlib.Path('benchmark-vp8l-trivial-literals.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-trivial-literals.md; git commit -m 'Record VP8L trivial-literal benchmark'; git push origin HEAD:bench-vp8l-trivial-literals
