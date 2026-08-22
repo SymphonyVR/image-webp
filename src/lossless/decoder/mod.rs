@@ -166,7 +166,7 @@ impl<R: BufRead> LosslessDecoder<R> {
         let color_cache_bits = self.read_color_cache()?;
         let color_cache = color_cache_bits.map(|bits| ColorCache {
             color_cache_bits: bits,
-            color_cache: vec![[0; 4]; 1 << bits],
+            color_cache: vec![0; 1 << bits],
         });
 
         let huffman_info = self.read_huffman_codes(is_argb_img, xsize, ysize, color_cache)?;
@@ -674,22 +674,24 @@ impl HuffmanInfo {
 #[derive(Debug, Clone)]
 struct ColorCache {
     color_cache_bits: u8,
-    color_cache: Vec<[u8; 4]>,
+    color_cache: Vec<u32>,
 }
 
 impl ColorCache {
     #[inline(always)]
     fn insert(&mut self, color: [u8; 4]) {
-        let [r, g, b, a] = color;
-        let color_u32 =
-            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);
-        let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);
-        self.color_cache[index as usize] = color;
+        let rgba = u32::from_le_bytes(color);
+        // The VP8L cache hash packs bytes as A-R-G-B. Our decoder stores
+        // pixels as R-G-B-A, so swap the red and blue byte lanes.
+        let hash_color =
+            (rgba & 0xff00_ff00) | ((rgba & 0x0000_00ff) << 16) | ((rgba & 0x00ff_0000) >> 16);
+        let index = (0x1e35a7bdu32.wrapping_mul(hash_color)) >> (32 - self.color_cache_bits);
+        self.color_cache[index as usize] = rgba;
     }
 
     #[inline(always)]
     fn lookup(&self, index: usize) -> [u8; 4] {
-        self.color_cache[index]
+        self.color_cache[index].to_le_bytes()
     }
 }
 
