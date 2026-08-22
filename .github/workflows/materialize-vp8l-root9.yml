@@ -1,0 +1,34 @@
+name: Materialize 9-bit VP8L Huffman roots
+on:
+  push:
+    branches: [ candidate-vp8l-root9 ]
+    paths: [ .github/workflows/materialize-vp8l-root9.yml ]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply and verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sed -i 's/const MAX_TABLE_BITS: u8 = 10;/const MAX_TABLE_BITS: u8 = 9;/' src/lossless/decoder/huffman.rs
+          git diff --check
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          cargo fmt -- --check
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/huffman.rs
+          git commit -m 'Use 9-bit VP8L Huffman root tables'
+          git rm .github/workflows/materialize-vp8l-root9.yml
+          git commit -m 'Finalize 9-bit VP8L Huffman candidate'
+          git push origin HEAD:candidate-vp8l-root9
