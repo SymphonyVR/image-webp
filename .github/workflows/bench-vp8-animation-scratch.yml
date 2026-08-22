@@ -1,0 +1,63 @@
+name: Benchmark reusable animation frame scratch
+on:
+  push:
+    branches: [ bench-vp8-animation-scratch ]
+    paths: [ .github/workflows/bench-vp8-animation-scratch.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Apply and verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/decoder.rs');s=p.read_text()
+          old='''    canvas: Option<Vec<u8>>,\n}\n''';new='''    canvas: Option<Vec<u8>>,\n    frame_scratch: Vec<u8>,\n}\n''';assert old in s;s=s.replace(old,new,1)
+          old='''            canvas: None,\n        }\n''';new='''            canvas: None,\n            frame_scratch: Vec::new(),\n        }\n''';assert old in s;s=s.replace(old,new,1)
+          old='''        let (frame, frame_has_alpha): (Vec<u8>, bool) = match chunk {\n''';new='''        let mut frame = std::mem::take(&mut self.animation.frame_scratch);\n        let frame_has_alpha = match chunk {\n''';assert old in s;s=s.replace(old,new,1)
+          old='''                let mut rgb_frame = vec![0; frame_width as usize * frame_height as usize * 3];\n                raw_frame.fill_rgb(&mut rgb_frame, self.webp_decode_options.lossy_upsampling);\n                (rgb_frame, false)\n''';new='''                frame.resize(frame_width as usize * frame_height as usize * 3, 0);\n                raw_frame.fill_rgb(&mut frame, self.webp_decode_options.lossy_upsampling);\n                false\n''';assert old in s;s=s.replace(old,new,1)
+          old='''                let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];\n                lossless_decoder.decode_frame(frame_width, frame_height, false, &mut rgba_frame)?;\n                (rgba_frame, true)\n''';new='''                frame.resize(frame_width as usize * frame_height as usize * 4, 0);\n                lossless_decoder.decode_frame(frame_width, frame_height, false, &mut frame)?;\n                true\n''';assert old in s;s=s.replace(old,new,1)
+          old='''                let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];\n                frame.fill_rgba(\n                    &mut rgba_frame,\n                    &alpha_chunk.data,\n                    self.webp_decode_options.lossy_upsampling,\n                );\n\n                (rgba_frame, true)\n''';new='''                let raw_frame = frame;\n                frame = std::mem::take(&mut self.animation.frame_scratch);\n                frame.resize(frame_width as usize * frame_height as usize * 4, 0);\n                raw_frame.fill_rgba(\n                    &mut frame,\n                    &alpha_chunk.data,\n                    self.webp_decode_options.lossy_upsampling,\n                );\n\n                true\n'''
+          # The ALPH arm already names the decoded VP8 frame `frame`, colliding with scratch. Rename that binding first.
+          s=s.replace('''                let frame = Vp8Decoder::decode_frame((&mut self.r).take(next_chunk_size))?;\n\n                let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];\n                frame.fill_rgba(\n                    &mut rgba_frame,\n                    &alpha_chunk.data,\n                    self.webp_decode_options.lossy_upsampling,\n                );\n\n                (rgba_frame, true)\n''','''                let raw_frame = Vp8Decoder::decode_frame((&mut self.r).take(next_chunk_size))?;\n\n                frame.resize(frame_width as usize * frame_height as usize * 4, 0);\n                raw_frame.fill_rgba(\n                    &mut frame,\n                    &alpha_chunk.data,\n                    self.webp_decode_options.lossy_upsampling,\n                );\n\n                true\n''',1)
+          old='''        if self.has_alpha() {\n            buf.copy_from_slice(self.animation.canvas.as_ref().unwrap());\n        } else {\n''';new='''        if self.has_alpha() {\n            buf.copy_from_slice(self.animation.canvas.as_ref().unwrap());\n        } else {\n''';assert old in s
+          # Restore scratch immediately before successful return.
+          marker='''        Ok(duration)\n    }\n''';assert marker in s;s=s.replace(marker,'''        self.animation.frame_scratch = frame;\n\n        Ok(duration)\n    }\n''',1)
+          p.write_text(s)
+          PY
+          cargo fmt
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/decoder.rs;git commit -m 'Reuse animation frame scratch storage'
+          CAND=$(git rev-parse HEAD);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CAND=$CAND" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          cargo test -q;cargo doc -q;cargo clippy --all-features -- -D warnings;cargo fmt -- --check;rustup toolchain install 1.80.1 --profile minimal;cargo +1.80.1 build -q
+      - name: Benchmark animations
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$CAND"
+          mkdir -p /tmp/i119;curl -L --fail --retry 3 -o /tmp/i119.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/i119.zip -d /tmp/i119;I119=$(find /tmp/i119 -type f -iname '*.webp'|head -1);RANDOM=/tmp/base/tests/images/animated/random_lossless.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};fn fnv(mut h:u64,b:&[u8])->u64{for &z in b{h=(h^z as u64).wrapping_mul(1099511628211)}h}fn run(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut h=1469598103934665603;loop{match x.read_frame(&mut b){Ok(t)=>{h=fnv(h,&t.to_le_bytes());h=fnv(h,&b)},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}h}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let p=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let d=std::fs::read(p).unwrap();if m=="hash"{println!("{:016x}",run(&d));return}black_box(run(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=run(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/as.rs";(cd "$d"&&cargo build --release --example as -q);done
+          B=/tmp/base/target/release/examples/as;C=/tmp/cand/target/release/examples/as;test "$($B hash "$I119" 1)" = "$($C hash "$I119" 1)";test "$($B hash "$RANDOM" 1)" = "$($C hash "$RANDOM" 1)";: >/tmp/r.tsv
+          for r in {1..21};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;u=$(taskset -c 0 "$X" bench "$I119" 3);printf 'issue119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench "$RANDOM" 200);printf 'random_lossless\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# Animation scratch reuse benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- candidate: `{os.environ["CAND"]}`',f'- CPU: `{os.environ["CPU"]}`','- full verification and all-frame hashes passed','','| workload | paired speedup | range |','|---|---:|---:|']
+          for w in ('issue119','random_lossless'):
+            q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          pathlib.Path('benchmark-vp8-animation-scratch.md').write_text('\n'.join(L+['']))
+          PY
+          cp benchmark-vp8-animation-scratch.md "$GITHUB_WORKSPACE/";cd "$GITHUB_WORKSPACE";git reset --hard "$BASE";cp /tmp/cand/src/decoder.rs src/decoder.rs;git add src/decoder.rs benchmark-vp8-animation-scratch.md;git commit -m 'Record animation scratch benchmark';git push origin HEAD:bench-vp8-animation-scratch
