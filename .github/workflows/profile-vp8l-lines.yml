@@ -1,0 +1,38 @@
+name: Profile VP8L source lines
+on:
+  push:
+    branches: [ profile-vp8l-lines ]
+    paths: [ .github/workflows/profile-vp8l-lines.yml ]
+permissions:
+  contents: write
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Callgrind with source annotation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          sudo apt-get update -qq;sudo apt-get install -y valgrind
+          mkdir -p examples
+          cat >examples/profile_vp8l_lines.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor};
+          fn main(){let d=std::fs::read("tests/images/gallery2/3_webp_ll.webp").unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[b.len()/2]);}
+          RS
+          RUSTFLAGS='-C debuginfo=2 -C force-frame-pointers=yes' cargo build --release --example profile_vp8l_lines
+          taskset -c 0 valgrind --tool=callgrind --collect-jumps=yes --callgrind-out-file=/tmp/v.callgrind target/release/examples/profile_vp8l_lines
+          callgrind_annotate --inclusive=no --threshold=0.01 --auto=yes /tmp/v.callgrind src/lossless/decoder/mod.rs >/tmp/mod.txt || true
+          callgrind_annotate --inclusive=no --threshold=0.01 --auto=yes /tmp/v.callgrind src/lossless/decoder/huffman.rs >/tmp/huffman.txt || true
+          callgrind_annotate --inclusive=no --threshold=0.01 --auto=yes /tmp/v.callgrind src/lossless/decoder/reverse_transform.rs >/tmp/transform.txt || true
+      - name: Persist raw source annotations
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib,os
+          L=['# VP8L source-line Callgrind profile','',f'- CPU: `{os.environ["CPU"]}`','- fixture: gallery2/3_webp_ll.webp (800x600)','- exact current optimized source; one full decode','','## decoder/mod.rs','','```text',pathlib.Path('/tmp/mod.txt').read_text(errors='replace')[:60000],'```','','## huffman.rs','','```text',pathlib.Path('/tmp/huffman.txt').read_text(errors='replace')[:30000],'```','','## reverse_transform.rs','','```text',pathlib.Path('/tmp/transform.txt').read_text(errors='replace')[:30000],'```','']
+          pathlib.Path('profile-vp8l-lines.md').write_text('\n'.join(L))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add profile-vp8l-lines.md;git commit -m 'Record VP8L source-line profile';git push origin HEAD:profile-vp8l-lines
