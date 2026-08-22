@@ -524,169 +524,111 @@ impl FastDecoder<'_> {
     }
 
     fn fast_read_bit(&mut self, probability: u8) -> bool {
-        let State {
-            mut chunk_index,
-            mut value,
-            mut range,
-            mut bit_count,
-        } = self.uncommitted_state;
+        let chunks = self.chunks;
+        let state = &mut self.uncommitted_state;
 
-        if bit_count < 0 {
-            let chunk = self.chunks.get(chunk_index).copied();
-            // We ignore invalid data inside the `fast_` functions,
-            // but we increase `chunk_index` below, so we can check
-            // whether we read invalid data in `commit_if_valid`.
-            let chunk = chunk.unwrap_or_default();
-
+        if state.bit_count < 0 {
+            let chunk = chunks.get(state.chunk_index).copied().unwrap_or_default();
             let v = u32::from_be_bytes(chunk);
-            chunk_index += 1;
-            value <<= 32;
-            value |= u64::from(v);
-            bit_count += 32;
+            state.chunk_index += 1;
+            state.value <<= 32;
+            state.value |= u64::from(v);
+            state.bit_count += 32;
         }
-        debug_assert!(bit_count >= 0);
+        debug_assert!(state.bit_count >= 0);
 
-        debug_assert!((128..=255).contains(&range));
+        debug_assert!((128..=255).contains(&state.range));
         let probability = u32::from(probability);
-        let split = 1 + (((range - 1) * probability) >> 8);
-        let bigsplit = u64::from(split) << bit_count;
+        let split = 1 + (((state.range - 1) * probability) >> 8);
+        let bigsplit = u64::from(split) << state.bit_count;
 
-        let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
-            range -= split;
-            value = new_value;
+        let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
+            state.range -= split;
+            state.value = new_value;
             true
         } else {
-            range = split;
+            state.range = split;
             false
         };
 
-        // Compute shift required to satisfy `range >= 128`.
-        // Apply that shift to `range` and `self.bitcount`.
-        //
-        // Subtract 24 because we only care about leading zeros in the
-        // lowest byte of `range` which is a `u32`.
-        debug_assert!((1..=254).contains(&range));
-        let shift = range.leading_zeros().saturating_sub(24);
-        range <<= shift;
-        bit_count -= shift as i32;
+        debug_assert!((1..=254).contains(&state.range));
+        let shift = state.range.leading_zeros().saturating_sub(24);
+        state.range <<= shift;
+        state.bit_count -= shift as i32;
 
-        debug_assert!((128..=254).contains(&range));
-        self.uncommitted_state = State {
-            chunk_index,
-            value,
-            range,
-            bit_count,
-        };
+        debug_assert!((128..=254).contains(&state.range));
         retval
     }
 
     fn fast_read_flag(&mut self) -> bool {
-        let State {
-            mut chunk_index,
-            mut value,
-            mut range,
-            mut bit_count,
-        } = self.uncommitted_state;
+        let chunks = self.chunks;
+        let state = &mut self.uncommitted_state;
 
-        if bit_count < 0 {
-            let chunk = self.chunks.get(chunk_index).copied();
-            // We ignore invalid data inside the `fast_` functions,
-            // but we increase `chunk_index` below, so we can check
-            // whether we read invalid data in `commit_if_valid`.
-            let chunk = chunk.unwrap_or_default();
-
+        if state.bit_count < 0 {
+            let chunk = chunks.get(state.chunk_index).copied().unwrap_or_default();
             let v = u32::from_be_bytes(chunk);
-            chunk_index += 1;
-            value <<= 32;
-            value |= u64::from(v);
-            bit_count += 32;
+            state.chunk_index += 1;
+            state.value <<= 32;
+            state.value |= u64::from(v);
+            state.bit_count += 32;
         }
-        debug_assert!(bit_count >= 0);
+        debug_assert!(state.bit_count >= 0);
 
-        debug_assert!((128..=255).contains(&range));
-        let half_range = range / 2;
-        let split = range - half_range;
-        let bigsplit = u64::from(split) << bit_count;
+        debug_assert!((128..=255).contains(&state.range));
+        let half_range = state.range / 2;
+        let split = state.range - half_range;
+        let bigsplit = u64::from(split) << state.bit_count;
 
-        let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
-            range = half_range;
-            value = new_value;
+        let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
+            state.range = half_range;
+            state.value = new_value;
             true
         } else {
-            range = split;
+            state.range = split;
             false
         };
 
-        // Compute shift required to satisfy `range >= 128`.
-        // A `range` of 64..127 requires a shift of 1. No shift if `range` is 128.
-        // Apply that shift to `range` and `self.bitcount`.
-        debug_assert!((64..=128).contains(&range));
-        let shift = if range == 0x80 { 0 } else { 1 };
-        range <<= shift;
-        bit_count -= shift;
+        debug_assert!((64..=128).contains(&state.range));
+        let shift = if state.range == 0x80 { 0 } else { 1 };
+        state.range <<= shift;
+        state.bit_count -= shift;
 
-        debug_assert!((128..=254).contains(&range));
-        self.uncommitted_state = State {
-            chunk_index,
-            value,
-            range,
-            bit_count,
-        };
+        debug_assert!((128..=254).contains(&state.range));
         retval
     }
 
     fn fast_read_sign(&mut self) -> bool {
-        let State {
-            mut chunk_index,
-            mut value,
-            mut range,
-            mut bit_count,
-        } = self.uncommitted_state;
+        let chunks = self.chunks;
+        let state = &mut self.uncommitted_state;
 
-        if bit_count < 0 {
-            let chunk = self.chunks.get(chunk_index).copied();
-            // We ignore invalid data inside the `fast_` functions,
-            // but we increase `chunk_index` below, so we can check
-            // whether we read invalid data in `commit_if_valid`.
-            let chunk = chunk.unwrap_or_default();
-
+        if state.bit_count < 0 {
+            let chunk = chunks.get(state.chunk_index).copied().unwrap_or_default();
             let v = u32::from_be_bytes(chunk);
-            chunk_index += 1;
-            value <<= 32;
-            value |= u64::from(v);
-            bit_count += 32;
+            state.chunk_index += 1;
+            state.value <<= 32;
+            state.value |= u64::from(v);
+            state.bit_count += 32;
         }
 
-        // Range is only 255 at the start of decoding. After reading any symbol, it is guaranteed
-        // to be at most 254. Sign bits are never the first symbol in a bit stream.
-        debug_assert!((128..=254).contains(&range));
-        let half_range = range / 2;
-        let split = range - half_range;
-        let bigsplit = u64::from(split) << bit_count;
+        debug_assert!((128..=254).contains(&state.range));
+        let half_range = state.range / 2;
+        let split = state.range - half_range;
+        let bigsplit = u64::from(split) << state.bit_count;
 
-        let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
-            range = half_range;
-            value = new_value;
+        let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
+            state.range = half_range;
+            state.value = new_value;
             true
         } else {
-            range = split;
+            state.range = split;
             false
         };
 
-        // Compute shift required to satisfy `range >= 128`.
-        // Since `range` lies in 64..127 it always requires a shift of 1.
-        // Apply that shift to `range` and `self.bitcount`.
-        debug_assert!((64..=127).contains(&range));
-        range <<= 1;
-        bit_count -= 1;
+        debug_assert!((64..=127).contains(&state.range));
+        state.range <<= 1;
+        state.bit_count -= 1;
 
-        debug_assert!((128..=254).contains(&range));
-        self.uncommitted_state = State {
-            chunk_index,
-            value,
-            range,
-            bit_count,
-        };
+        debug_assert!((128..=254).contains(&state.range));
         retval
     }
 
