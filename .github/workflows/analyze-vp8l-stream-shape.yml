@@ -1,0 +1,89 @@
+name: Analyze VP8L stream shape
+on:
+  push:
+    branches: [ analyze-vp8l-stream-shape ]
+    paths: [ .github/workflows/analyze-vp8l-stream-shape.yml ]
+permissions:
+  contents: write
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Instrument decoder
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''        let num_values = usize::from(width) * usize::from(height);\n\n        let huff_index = huffman_info.get_huff_index(0, 0);\n'''
+          new='''        let num_values = usize::from(width) * usize::from(height);\n        let shape_cache = huffman_info.color_cache.is_some();\n        let shape_groups = huffman_info.huffman_code_groups.len();\n        let shape_meta_bits = huffman_info.bits;\n        let mut shape_literals = 0usize;\n        let mut shape_backrefs = 0usize;\n        let mut shape_backref_pixels = 0usize;\n        let mut shape_cache_refs = 0usize;\n        let mut shape_dist1 = 0usize;\n        let mut shape_dist2 = 0usize;\n        let mut shape_dist3_4 = 0usize;\n        let mut shape_dist5_16 = 0usize;\n        let mut shape_dist_gt16 = 0usize;\n\n        let huff_index = huffman_info.get_huff_index(0, 0);\n'''
+          if old not in s: raise SystemExit('start marker missing')
+          s=s.replace(old,new,1)
+          old='''            if code < 256 {\n                //literal, so just use huffman codes and read as argb\n'''
+          new='''            if code < 256 {\n                shape_literals += 1;\n                //literal, so just use huffman codes and read as argb\n'''
+          if old not in s: raise SystemExit('literal marker missing')
+          s=s.replace(old,new,1)
+          old='''                let dist = Self::plane_code_to_distance(width, dist_code);\n\n                if index < dist || num_values - index < length {\n'''
+          new='''                let dist = Self::plane_code_to_distance(width, dist_code);\n                shape_backrefs += 1;\n                shape_backref_pixels += length;\n                match dist {\n                    1 => shape_dist1 += 1,\n                    2 => shape_dist2 += 1,\n                    3..=4 => shape_dist3_4 += 1,\n                    5..=16 => shape_dist5_16 += 1,\n                    _ => shape_dist_gt16 += 1,\n                }\n\n                if index < dist || num_values - index < length {\n'''
+          if old not in s: raise SystemExit('backref marker missing')
+          s=s.replace(old,new,1)
+          old='''            } else {\n                //color cache, so use previously stored pixels to get this pixel\n'''
+          new='''            } else {\n                shape_cache_refs += 1;\n                //color cache, so use previously stored pixels to get this pixel\n'''
+          if old not in s: raise SystemExit('cache marker missing')
+          s=s.replace(old,new,1)
+          old='''        Ok(())\n    }\n\n    /// Reads color cache data from the bitstream\n'''
+          new='''        eprintln!(\n            "VP8L_SHAPE width={} height={} cache={} groups={} meta_bits={} literals={} backrefs={} backref_pixels={} cache_refs={} dist1={} dist2={} dist3_4={} dist5_16={} dist_gt16={}",\n            width, height, shape_cache, shape_groups, shape_meta_bits, shape_literals, shape_backrefs,\n            shape_backref_pixels, shape_cache_refs, shape_dist1, shape_dist2, shape_dist3_4,\n            shape_dist5_16, shape_dist_gt16\n        );\n        Ok(())\n    }\n\n    /// Reads color cache data from the bitstream\n'''
+          if old not in s: raise SystemExit('end marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          mkdir -p examples
+          cat >examples/analyze_vp8l.rs <<'RS'
+          use image_webp::WebPDecoder;use std::io::Cursor;
+          fn main(){for p in std::env::args().skip(1){eprintln!("FILE {p}");let d=std::fs::read(&p).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();}}
+          RS
+          cargo build --release --example analyze_vp8l
+      - name: Collect fixture and large-image shapes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/vp8l.txt
+          from pathlib import Path
+          def chunks(d):
+              if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+              o=[];p=12
+              while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+              return o
+          for p in sorted(Path('tests/images').rglob('*.webp')):
+              c=chunks(p.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c:print(p.resolve())
+          PY
+          mapfile -t FILES </tmp/vp8l.txt
+          target/release/examples/analyze_vp8l "${FILES[@]}" 2>/tmp/fixtures.log
+          sudo apt-get update -qq
+          sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+              f.write(f'P6\n{w} {h}\n255\n'.encode())
+              row=bytearray(w*3)
+              for y in range(h):
+                  for x in range(w):
+                      i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+                  f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          target/release/examples/analyze_vp8l /tmp/large.webp 2>/tmp/large.log
+      - name: Persist analysis
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          L=['# VP8L stream-shape analysis','','Current optimized decoder instrumentation. Counts describe entropy events, not timed performance.','','## Static fixtures','','```text',Path('/tmp/fixtures.log').read_text().strip(),'```','','## Generated 2048x2048 lossless image','','```text',Path('/tmp/large.log').read_text().strip(),'```','']
+          Path('analysis-vp8l-stream-shape.md').write_text('\n'.join(L))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add analysis-vp8l-stream-shape.md;git commit -m 'Record VP8L stream-shape analysis';git push origin HEAD:analyze-vp8l-stream-shape
