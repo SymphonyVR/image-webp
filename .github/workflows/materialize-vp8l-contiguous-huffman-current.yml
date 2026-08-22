@@ -1,0 +1,69 @@
+name: Materialize contiguous VP8L Huffman tables
+on:
+  push:
+    branches: [ candidate-vp8l-contiguous-huffman-current ]
+    paths: [ .github/workflows/materialize-vp8l-contiguous-huffman-current.yml ]
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply source candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/huffman.rs');s=p.read_text()
+          old='''    Tree {\n        table_mask: u16,\n        primary_table: Vec<u16>,\n        secondary_table: Vec<u16>,\n    },\n'''
+          new='''    Tree {\n        table_mask: u16,\n        table: Box<[u16]>,\n    },\n'''
+          if old not in s: raise SystemExit('enum marker missing')
+          s=s.replace(old,new,1)
+          old='''        // Ensure indexes into the secondary table fit in 12 bits.\n        assert!(secondary_table.len() <= 4096);\n\n        Ok(Self(HuffmanTreeInner::Tree {\n            table_mask,\n            primary_table,\n            secondary_table,\n        }))\n'''
+          new='''        // Ensure indexes into the secondary table fit in 12 bits, then keep\n        // both decoding levels in one allocation. Secondary offsets remain\n        // relative to the end of the primary table.\n        assert!(secondary_table.len() <= 4096);\n        primary_table.extend_from_slice(&secondary_table);\n\n        Ok(Self(HuffmanTreeInner::Tree {\n            table_mask,\n            table: primary_table.into_boxed_slice(),\n        }))\n'''
+          if old not in s: raise SystemExit('build marker missing')
+          s=s.replace(old,new,1)
+          old='''        Self(HuffmanTreeInner::Tree {\n            primary_table: vec![(1 << 12) | zero, (1 << 12) | one],\n            table_mask: 0x1,\n            secondary_table: Vec::new(),\n        })\n'''
+          new='''        Self(HuffmanTreeInner::Tree {\n            table: vec![(1 << 12) | zero, (1 << 12) | one].into_boxed_slice(),\n            table_mask: 0x1,\n        })\n'''
+          if old not in s: raise SystemExit('two-node marker missing')
+          s=s.replace(old,new,1)
+          start=s.index('    #[inline(never)]\n    fn read_symbol_slowpath')
+          end=s.index('    /// Reads a symbol using the bit reader.',start)
+          slow=r'''    #[inline(never)]
+    fn read_symbol_slowpath<R: BufRead>(
+        table: &[u16],
+        primary_size: usize,
+        v: u16,
+        primary_table_entry: u16,
+        bit_reader: &mut BitReader<R>,
+    ) -> Result<u16, DecodingError> {
+        let length = primary_table_entry >> 12;
+        let mask = (1 << (length - MAX_TABLE_BITS as u16)) - 1;
+        let secondary_index = primary_size
+            + ((primary_table_entry & 0xfff) as usize)
+            + ((v >> MAX_TABLE_BITS) as usize & mask as usize);
+        let secondary_entry = table[secondary_index];
+        bit_reader.consume((secondary_entry & 0xf) as u8)?;
+        Ok(secondary_entry >> 4)
+    }
+
+'''
+          s=s[:start]+slow+s[end:]
+          old='''            HuffmanTreeInner::Tree {\n                primary_table,\n                secondary_table,\n                table_mask,\n            } => {\n                let v = bit_reader.peek_full() as u16;\n                let entry = primary_table[(v & table_mask) as usize];\n                if (entry >> 12) <= MAX_TABLE_BITS as u16 {\n                    bit_reader.consume((entry >> 12) as u8)?;\n                    return Ok(entry & 0xfff);\n                }\n\n                Self::read_symbol_slowpath(secondary_table, v, entry, bit_reader)\n            }\n'''
+          new='''            HuffmanTreeInner::Tree { table, table_mask } => {\n                let v = bit_reader.peek_full() as u16;\n                let primary_size = usize::from(*table_mask) + 1;\n                let entry = table[(v & table_mask) as usize];\n                if (entry >> 12) <= MAX_TABLE_BITS as u16 {\n                    bit_reader.consume((entry >> 12) as u8)?;\n                    return Ok(entry & 0xfff);\n                }\n\n                Self::read_symbol_slowpath(table, primary_size, v, entry, bit_reader)\n            }\n'''
+          if old not in s: raise SystemExit('read marker missing')
+          s=s.replace(old,new,1)
+          old='''            HuffmanTreeInner::Tree {\n                primary_table,\n                table_mask,\n                ..\n            } => {\n                let v = bit_reader.peek_full() as u16;\n                let entry = primary_table[(v & table_mask) as usize];\n'''
+          new='''            HuffmanTreeInner::Tree { table, table_mask } => {\n                let v = bit_reader.peek_full() as u16;\n                let entry = table[(v & table_mask) as usize];\n'''
+          if old not in s: raise SystemExit('peek marker missing')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          cargo fmt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/huffman.rs
+          git commit -m 'Store VP8L Huffman levels contiguously'
+          git push origin HEAD:candidate-vp8l-contiguous-huffman-current
