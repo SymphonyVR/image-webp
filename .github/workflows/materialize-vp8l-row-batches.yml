@@ -1,4 +1,5 @@
 name: Materialize VP8L row-batched inverse transforms
+# retry after wrapper borrow fix
 on:
   push:
     branches: [ candidate-vp8l-row-batches ]
