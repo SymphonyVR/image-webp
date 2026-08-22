@@ -1,0 +1,68 @@
+name: Profile current issue 119 decoder
+on:
+  push:
+    branches: [ profile-current-issue119-v2 ]
+    paths: [ .github/workflows/profile-current-issue119-v2.yml ]
+permissions:
+  contents: write
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Callgrind and build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "SOURCE_SHA=$(git rev-parse HEAD^)" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          sudo apt-get update -qq
+          sudo apt-get install -y valgrind
+          mkdir -p examples
+          cat >examples/profile_current.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};
+          use std::{hint::black_box,io::Cursor};
+          fn main(){let p=std::env::args().nth(1).unwrap();let data=std::fs::read(p).unwrap();let mut d=WebPDecoder::new(Cursor::new(data)).unwrap();let mut b=vec![0;d.output_buffer_size().unwrap()];let mut s=0u64;if d.is_animated(){loop{match d.read_frame(&mut b){Ok(t)=>{s=s.wrapping_add(t as u64)^b[b.len()/2]as u64},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{d.read_image(&mut b).unwrap();s=b[b.len()/2]as u64}black_box(s)}
+          RS
+          RUSTFLAGS='-C debuginfo=1 -C force-frame-pointers=yes' cargo build --release --example profile_current
+          mkdir -p /tmp/119
+          curl -L --fail --retry 5 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/sample.zip -d /tmp/119
+          echo "INPUT=$(find /tmp/119 -iname '*.webp'|head -n1)" >> "$GITHUB_ENV"
+      - name: Run Callgrind
+        shell: bash
+        run: |
+          set -euxo pipefail
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/current.callgrind target/release/examples/profile_current "$INPUT"
+          callgrind_annotate --inclusive=no --threshold=0.05 /tmp/current.callgrind >/tmp/exclusive.txt
+          callgrind_annotate --inclusive=yes --threshold=0.20 /tmp/current.callgrind >/tmp/inclusive.txt
+      - name: Persist concise profile
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,re
+          exc=pathlib.Path('/tmp/exclusive.txt').read_text(errors='replace').splitlines()
+          inc=pathlib.Path('/tmp/inclusive.txt').read_text(errors='replace').splitlines()
+          def selected(lines,limit=100):
+              out=[]
+              for line in lines:
+                  if 'PROGRAM TOTALS' in line or 'image_webp::' in line:
+                      out.append(line)
+                      if len(out)>=limit: break
+              return '\n'.join(out)
+          total=None
+          for line in exc:
+              m=re.search(r'^([0-9,]+) \(100\.0%\).*PROGRAM TOTALS',line)
+              if m: total=int(m.group(1).replace(',',''));break
+          L=['# Current issue 119 Callgrind profile','',f'- source: `{os.environ["SOURCE_SHA"]}`',f'- CPU: `{os.environ["CPU"]}`','- exact issue #119 animation; one complete decode; CPU 0','- current optimized branch; exclusive and inclusive attribution','']
+          if total is not None:L.append(f'- instruction references: `{total:,}`')
+          L += ['','## Exclusive image-webp attribution','','```text',selected(exc),'```','','## Inclusive image-webp attribution','','```text',selected(inc),'```','']
+          pathlib.Path('profile-current-issue119-v2.md').write_text('\n'.join(L))
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add profile-current-issue119-v2.md
+          git commit -m 'Record current issue 119 profile'
+          git push origin HEAD:profile-current-issue119-v2
