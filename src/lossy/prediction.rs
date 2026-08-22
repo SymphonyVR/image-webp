@@ -156,7 +156,13 @@ fn avg2(this: u8, right: u8) -> u8 {
     avg as u8
 }
 
-pub(crate) fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32]) {
+pub(crate) fn predict_4x4(
+    ws: &mut [u8],
+    stride: usize,
+    modes: &[IntraMode],
+    resdata: &[i32],
+    non_zero_blocks: u32,
+) {
     for sby in 0usize..4 {
         for sbx in 0usize..4 {
             let i = sbx + sby * 4;
@@ -176,8 +182,10 @@ pub(crate) fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], res
                 IntraMode::HU => predict_bhupred(ws, x0, y0, stride),
             }
 
-            let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
-            add_residue(ws, rb, y0, x0, stride);
+            if non_zero_blocks & (1u32 << i) != 0 {
+                let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
+                add_residue(ws, rb, y0, x0, stride);
+            }
         }
     }
 }
