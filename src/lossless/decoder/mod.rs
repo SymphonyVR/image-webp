@@ -715,6 +715,9 @@ impl<R: BufRead> BitReader<R> {
     /// the input stream.
     pub(crate) fn fill(&mut self) -> Result<(), DecodingError> {
         debug_assert!(self.nbits < 64);
+        if self.nbits >= 56 {
+            return Ok(());
+        }
 
         let mut buf = self.reader.fill_buf()?;
         if buf.len() >= 8 {
