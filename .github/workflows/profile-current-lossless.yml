@@ -1,0 +1,66 @@
+name: Profile current VP8L decoder
+on:
+  push:
+    branches: [ profile-current-lossless ]
+    paths: [ .github/workflows/profile-current-lossless.yml ]
+permissions:
+  contents: write
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Callgrind and prepare corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y valgrind
+          echo "SOURCE_SHA=$(git rev-parse HEAD^)" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          python3 - <<'PY' >/tmp/vp8l-files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data)<12 or data[:4]!=b'RIFF' or data[8:12]!=b'WEBP': return []
+              out=[];p=12
+              while p+8<=len(data):
+                  f=data[p:p+4];n=int.from_bytes(data[p+4:p+8],'little');out.append(f);p+=8+n+(n&1)
+              return out
+          files=[]
+          for path in sorted(Path('tests/images').rglob('*.webp')):
+              c=chunks(path.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: files.append(path.resolve())
+          if not files: raise SystemExit('no static VP8L fixtures')
+          print(*files,sep='\n')
+          PY
+          echo "COUNT=$(wc -l </tmp/vp8l-files.txt)" >> "$GITHUB_ENV"
+          cat >/tmp/profile.rs <<'RS'
+          use image_webp::WebPDecoder; use std::{hint::black_box,io::Cursor};
+          fn main(){let mut s=0u64;for p in std::env::args().skip(1){let d=std::fs::read(p).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();s=s.wrapping_add(b.len() as u64).wrapping_add(b[b.len()/2] as u64);}black_box(s)}
+          RS
+          mkdir -p examples; cp /tmp/profile.rs examples/vp8l_profile.rs
+          RUSTFLAGS='-C debuginfo=1 -C force-frame-pointers=yes' cargo build --release --example vp8l_profile
+      - name: Run Callgrind
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t FILES </tmp/vp8l-files.txt
+          taskset -c 0 valgrind --tool=callgrind --callgrind-out-file=/tmp/vp8l.cg target/release/examples/vp8l_profile "${FILES[@]}"
+          callgrind_annotate --inclusive=yes --threshold=0.03 /tmp/vp8l.cg >/tmp/inc.txt
+          callgrind_annotate --inclusive=no --threshold=0.03 /tmp/vp8l.cg >/tmp/self.txt
+      - name: Persist profile
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,re,pathlib
+          def total(p):
+              t=pathlib.Path(p).read_text(errors='replace');m=re.search(r'^([0-9,]+) \(100\.0%\).*PROGRAM TOTALS',t,re.M);return int(m.group(1).replace(',','')) if m else 0
+          def filt(p):
+              ls=pathlib.Path(p).read_text(errors='replace').splitlines();return '\n'.join([x for x in ls if 'PROGRAM TOTALS' in x or 'image_webp::' in x][:260])
+          L=['# Current VP8L Callgrind profile','',f'- source: `{os.environ["SOURCE_SHA"]}`',f'- CPU: `{os.environ["CPU"]}`',f'- static VP8L fixtures: `{os.environ["COUNT"]}`',f'- instruction references: `{total("/tmp/inc.txt"):,}`','', '## Inclusive','','```text',filt('/tmp/inc.txt'),'```','','## Self','','```text',filt('/tmp/self.txt'),'```','']
+          pathlib.Path('profile-current-lossless.md').write_text('\n'.join(L))
+          PY
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add profile-current-lossless.md; git commit -m 'Record current VP8L decoder profile'; git push origin HEAD:profile-current-lossless
