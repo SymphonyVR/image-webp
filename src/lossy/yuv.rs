@@ -113,21 +113,15 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
         let (v_row_1, v_row_2) = v_rows.split_at(chroma_buffer_width);
         let (row_buf_1, row_buf_2) = row_buffer.split_at_mut(width * BPP);
         let (y_row_1, y_row_2) = y_rows.split_at(buffer_width);
-        fill_row_fancy_with_2_uv_rows::<BPP>(
+        fill_row_pair_fancy::<BPP>(
             row_buf_1,
-            &y_row_1[..width],
-            &u_row_1[..chroma_width],
-            &u_row_2[..chroma_width],
-            &v_row_1[..chroma_width],
-            &v_row_2[..chroma_width],
-        );
-        fill_row_fancy_with_2_uv_rows::<BPP>(
             row_buf_2,
+            &y_row_1[..width],
             &y_row_2[..width],
-            &u_row_2[..chroma_width],
             &u_row_1[..chroma_width],
-            &v_row_2[..chroma_width],
+            &u_row_2[..chroma_width],
             &v_row_1[..chroma_width],
+            &v_row_2[..chroma_width],
         );
     }
 
@@ -151,71 +145,101 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
     }
 }
 
-/// Fills a row with the fancy interpolation as detailed
-fn fill_row_fancy_with_2_uv_rows<const BPP: usize>(
-    row_buffer: &mut [u8],
-    y_row: &[u8],
-    u_row_1: &[u8],
-    u_row_2: &[u8],
-    v_row_1: &[u8],
-    v_row_2: &[u8],
+#[inline(always)]
+fn pack_uv(u: u8, v: u8) -> u32 {
+    u32::from(u) | (u32::from(v) << 16)
+}
+
+#[inline(always)]
+fn interpolate_uv_square(
+    top_left: u32,
+    top_right: u32,
+    bottom_left: u32,
+    bottom_right: u32,
+) -> [u32; 4] {
+    let average = top_left + top_right + bottom_left + bottom_right + 0x0008_0008;
+    let diagonal_12 = (average + 2 * (top_right + bottom_left)) >> 3;
+    let diagonal_03 = (average + 2 * (top_left + bottom_right)) >> 3;
+    [
+        (diagonal_12 + top_left) >> 1,
+        (diagonal_03 + top_right) >> 1,
+        (diagonal_03 + bottom_left) >> 1,
+        (diagonal_12 + bottom_right) >> 1,
+    ]
+}
+
+#[inline(always)]
+fn set_pixel_packed_uv(rgb: &mut [u8], y: u8, uv: u32) {
+    set_pixel(rgb, y, (uv & 0xff) as u8, ((uv >> 16) & 0xff) as u8);
+}
+
+/// Fills two neighboring luma rows together so each 2x2 chroma square is
+/// interpolated once and reused for all four output pixels.
+#[allow(clippy::too_many_arguments)]
+fn fill_row_pair_fancy<const BPP: usize>(
+    top_buffer: &mut [u8],
+    bottom_buffer: &mut [u8],
+    top_y: &[u8],
+    bottom_y: &[u8],
+    top_u: &[u8],
+    bottom_u: &[u8],
+    top_v: &[u8],
+    bottom_v: &[u8],
 ) {
-    // need to do left pixel separately since it will only have one u/v value
-    {
-        let rgb1 = &mut row_buffer[0..3];
-        let y_value = y_row[0];
-        // first pixel uses the first u/v as the main one
-        let u_value = get_fancy_chroma_value(u_row_1[0], u_row_1[0], u_row_2[0], u_row_2[0]);
-        let v_value = get_fancy_chroma_value(v_row_1[0], v_row_1[0], v_row_2[0], v_row_2[0]);
-        set_pixel(rgb1, y_value, u_value, v_value);
+    let width = top_y.len();
+    debug_assert_eq!(bottom_y.len(), width);
+
+    let mut top_left = pack_uv(top_u[0], top_v[0]);
+    let mut bottom_left = pack_uv(bottom_u[0], bottom_v[0]);
+
+    let top_edge = (3 * top_left + bottom_left + 0x0002_0002) >> 2;
+    let bottom_edge = (3 * bottom_left + top_left + 0x0002_0002) >> 2;
+    set_pixel_packed_uv(&mut top_buffer[..3], top_y[0], top_edge);
+    set_pixel_packed_uv(&mut bottom_buffer[..3], bottom_y[0], bottom_edge);
+
+    let last_pair = (width - 1) >> 1;
+    for x in 1..=last_pair {
+        let top_right = pack_uv(top_u[x], top_v[x]);
+        let bottom_right = pack_uv(bottom_u[x], bottom_v[x]);
+        let values = interpolate_uv_square(top_left, top_right, bottom_left, bottom_right);
+        let left_pixel = 2 * x - 1;
+        let right_pixel = 2 * x;
+
+        set_pixel_packed_uv(
+            &mut top_buffer[left_pixel * BPP..][..3],
+            top_y[left_pixel],
+            values[0],
+        );
+        set_pixel_packed_uv(
+            &mut top_buffer[right_pixel * BPP..][..3],
+            top_y[right_pixel],
+            values[1],
+        );
+        set_pixel_packed_uv(
+            &mut bottom_buffer[left_pixel * BPP..][..3],
+            bottom_y[left_pixel],
+            values[2],
+        );
+        set_pixel_packed_uv(
+            &mut bottom_buffer[right_pixel * BPP..][..3],
+            bottom_y[right_pixel],
+            values[3],
+        );
+
+        top_left = top_right;
+        bottom_left = bottom_right;
     }
 
-    let rest_row_buffer = &mut row_buffer[BPP..];
-    let rest_y_row = &y_row[1..];
-
-    // we do two pixels at a time since they share the same u/v values
-    let mut main_row_chunks = rest_row_buffer.chunks_exact_mut(BPP * 2);
-    let mut main_y_chunks = rest_y_row.chunks_exact(2);
-
-    for (((((rgb, y_val), u_val_1), u_val_2), v_val_1), v_val_2) in (&mut main_row_chunks)
-        .zip(&mut main_y_chunks)
-        .zip(u_row_1.windows(2))
-        .zip(u_row_2.windows(2))
-        .zip(v_row_1.windows(2))
-        .zip(v_row_2.windows(2))
-    {
-        {
-            let rgb1 = &mut rgb[0..3];
-            let y_value = y_val[0];
-            // first pixel uses the first u/v as the main one
-            let u_value = get_fancy_chroma_value(u_val_1[0], u_val_1[1], u_val_2[0], u_val_2[1]);
-            let v_value = get_fancy_chroma_value(v_val_1[0], v_val_1[1], v_val_2[0], v_val_2[1]);
-            set_pixel(rgb1, y_value, u_value, v_value);
-        }
-        {
-            let rgb2 = &mut rgb[BPP..];
-            let y_value = y_val[1];
-            let u_value = get_fancy_chroma_value(u_val_1[1], u_val_1[0], u_val_2[1], u_val_2[0]);
-            let v_value = get_fancy_chroma_value(v_val_1[1], v_val_1[0], v_val_2[1], v_val_2[0]);
-            set_pixel(rgb2, y_value, u_value, v_value);
-        }
-    }
-
-    let final_pixel = main_row_chunks.into_remainder();
-    let final_y = main_y_chunks.remainder();
-
-    if let (rgb, [y_value]) = (final_pixel, final_y) {
-        let final_u_1 = *u_row_1.last().unwrap();
-        let final_u_2 = *u_row_2.last().unwrap();
-
-        let final_v_1 = *v_row_1.last().unwrap();
-        let final_v_2 = *v_row_2.last().unwrap();
-
-        let rgb1 = &mut rgb[0..3];
-        // first pixel uses the first u/v as the main one
-        let u_value = get_fancy_chroma_value(final_u_1, final_u_1, final_u_2, final_u_2);
-        let v_value = get_fancy_chroma_value(final_v_1, final_v_1, final_v_2, final_v_2);
-        set_pixel(rgb1, *y_value, u_value, v_value);
+    if width % 2 == 0 {
+        let pixel = width - 1;
+        let top_edge = (3 * top_left + bottom_left + 0x0002_0002) >> 2;
+        let bottom_edge = (3 * bottom_left + top_left + 0x0002_0002) >> 2;
+        set_pixel_packed_uv(&mut top_buffer[pixel * BPP..][..3], top_y[pixel], top_edge);
+        set_pixel_packed_uv(
+            &mut bottom_buffer[pixel * BPP..][..3],
+            bottom_y[pixel],
+            bottom_edge,
+        );
     }
 }
 
@@ -514,6 +538,43 @@ fn rgb_to_v_raw(rgb: &[u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_packed_fancy_interpolation_matches_scalar_formula() {
+        let mut seed = 0x0bad_f00du32;
+        for _ in 0..10_000 {
+            let mut next = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            };
+            let (tu0, tv0) = (next(), next());
+            let (tu1, tv1) = (next(), next());
+            let (bu0, bv0) = (next(), next());
+            let (bu1, bv1) = (next(), next());
+            let packed = interpolate_uv_square(
+                pack_uv(tu0, tv0),
+                pack_uv(tu1, tv1),
+                pack_uv(bu0, bv0),
+                pack_uv(bu1, bv1),
+            );
+            let expected_u = [
+                get_fancy_chroma_value(tu0, tu1, bu0, bu1),
+                get_fancy_chroma_value(tu1, tu0, bu1, bu0),
+                get_fancy_chroma_value(bu0, bu1, tu0, tu1),
+                get_fancy_chroma_value(bu1, bu0, tu1, tu0),
+            ];
+            let expected_v = [
+                get_fancy_chroma_value(tv0, tv1, bv0, bv1),
+                get_fancy_chroma_value(tv1, tv0, bv1, bv0),
+                get_fancy_chroma_value(bv0, bv1, tv0, tv1),
+                get_fancy_chroma_value(bv1, bv0, tv1, tv0),
+            ];
+            for i in 0..4 {
+                assert_eq!((packed[i] & 0xff) as u8, expected_u[i]);
+                assert_eq!(((packed[i] >> 16) & 0xff) as u8, expected_v[i]);
+            }
+        }
+    }
 
     #[test]
     fn test_fancy_grid() {
