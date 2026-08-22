@@ -1,0 +1,124 @@
+name: Benchmark VP8 DCT rare-path outlining
+on:
+  push:
+    branches: [ bench-vp8-dct-outline ]
+    paths: [ .github/workflows/bench-vp8-dct-outline.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Prepare variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE";cp -a /tmp/base /tmp/large;cp -a /tmp/base /tmp/cat36
+          python3 - <<'PY'
+          from pathlib import Path
+          def replace(root, kind):
+            p=Path(root)/'src/lossy/arithmetic_decoder.rs';s=p.read_text();a=s.index('    fn fast_read_dct_value(');b=s.index('    fn fast_read_with_tree',a)
+            if kind=='large':
+              f=r'''    fn fast_read_dct_value(&mut self, probs: &[u8; 11], skip_eob: bool) -> i16 {
+        if !skip_eob && !self.fast_read_bit(probs[0]) {
+            return DCT_VALUE_EOB;
+        }
+        if !self.fast_read_bit(probs[1]) {
+            return 0;
+        }
+
+        let abs = if !self.fast_read_bit(probs[2]) {
+            1
+        } else {
+            self.fast_read_large_dct_value(probs)
+        };
+
+        if self.fast_read_sign() { -abs } else { abs }
+    }
+
+    #[inline(never)]
+    fn fast_read_large_dct_value(&mut self, probs: &[u8; 11]) -> i16 {
+        if !self.fast_read_bit(probs[3]) {
+            if !self.fast_read_bit(probs[4]) {
+                2
+            } else {
+                3 + if self.fast_read_bit(probs[5]) { 1 } else { 0 }
+            }
+        } else if !self.fast_read_bit(probs[6]) {
+            if !self.fast_read_bit(probs[7]) {
+                5 + if self.fast_read_bit(PROB_DCT_CAT[0][0]) { 1 } else { 0 }
+            } else {
+                7 + 2 * if self.fast_read_bit(PROB_DCT_CAT[1][0]) { 1 } else { 0 }
+                    + if self.fast_read_bit(PROB_DCT_CAT[1][1]) { 1 } else { 0 }
+            }
+        } else {
+            self.fast_read_cat3_to_6(probs)
+        }
+    }
+
+    #[inline(never)]
+    fn fast_read_cat3_to_6(&mut self, probs: &[u8; 11]) -> i16 {
+        let hi = self.fast_read_bit(probs[8]);
+        let lo = self.fast_read_bit(probs[9 + usize::from(hi)]);
+        let cat = 2 + 2 * usize::from(hi) + usize::from(lo);
+        let mut extra = 0i16;
+        for prob in PROB_DCT_CAT[cat].iter().copied() {
+            if prob == 0 { break; }
+            extra = extra + extra + if self.fast_read_bit(prob) { 1 } else { 0 };
+        }
+        i16::from(DCT_CAT_BASE[cat]) + extra
+    }
+
+'''
+            else:
+              # Keep common 2..CAT2 path inline, outline only CAT3..CAT6.
+              old=s[a:b]
+              marker='''        } else {\n            let hi = self.fast_read_bit(probs[8]);\n            let lo = self.fast_read_bit(probs[9 + usize::from(hi)]);\n            let cat = 2 + 2 * usize::from(hi) + usize::from(lo);\n            let mut extra = 0i16;\n            for prob in PROB_DCT_CAT[cat].iter().copied() {\n                if prob == 0 {\n                    break;\n                }\n                extra = extra + extra + if self.fast_read_bit(prob) { 1 } else { 0 };\n            }\n            i16::from(DCT_CAT_BASE[cat]) + extra\n        };\n'''
+              repl='''        } else {\n            self.fast_read_cat3_to_6(probs)\n        };\n'''
+              if marker not in old: raise SystemExit('cat marker missing')
+              f=old.replace(marker,repl,1)+r'''    #[inline(never)]
+    fn fast_read_cat3_to_6(&mut self, probs: &[u8; 11]) -> i16 {
+        let hi = self.fast_read_bit(probs[8]);
+        let lo = self.fast_read_bit(probs[9 + usize::from(hi)]);
+        let cat = 2 + 2 * usize::from(hi) + usize::from(lo);
+        let mut extra = 0i16;
+        for prob in PROB_DCT_CAT[cat].iter().copied() {
+            if prob == 0 { break; }
+            extra = extra + extra + if self.fast_read_bit(prob) { 1 } else { 0 };
+        }
+        i16::from(DCT_CAT_BASE[cat]) + extra
+    }
+
+'''
+            p.write_text(s[:a]+f+s[b:])
+          replace('/tmp/large','large');replace('/tmp/cat36','cat36')
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          for d in /tmp/large /tmp/cat36;do (cd "$d"&&cargo fmt&&cargo test -q&&cargo doc -q&&cargo clippy --all-features -- -D warnings&&cargo fmt -- --check&&cargo +1.80.1 build -q);done
+      - name: Build and time issues
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/i119 /tmp/i136;curl -L --fail --retry 3 -o /tmp/i119.zip https://github.com/user-attachments/files/17482915/sample.zip;unzip -q /tmp/i119.zip -d /tmp/i119;curl -L --fail --retry 3 -o /tmp/i136.zip https://github.com/user-attachments/files/20597234/honk.webp.zip;unzip -q /tmp/i136.zip -d /tmp/i136;I119=$(find /tmp/i119 -type f -iname '*.webp'|head -1);I136=$(find /tmp/i136 -type f -iname '*.webp'|head -1)
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};fn fnv(mut h:u64,b:&[u8])->u64{for &z in b{h=(h^z as u64).wrapping_mul(1099511628211)}h}fn run(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];let mut h=1469598103934665603;if x.is_animated(){loop{match x.read_frame(&mut b){Ok(t)=>{h=fnv(h,&t.to_le_bytes());h=fnv(h,&b)},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{x.read_image(&mut b).unwrap();h=fnv(h,&b)}h}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let p=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let d=std::fs::read(p).unwrap();if m=="hash"{println!("{:016x}",run(&d));return}black_box(run(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=run(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+RS
+          for d in base large cat36;do mkdir -p "/tmp/$d/examples";cp /tmp/b.rs "/tmp/$d/examples/do.rs";(cd "/tmp/$d"&&cargo build --release --example do -q);done
+          B=/tmp/base/target/release/examples/do;for f in "$I119" "$I136";do H=$($B hash "$f" 1);for v in large cat36;do test "$H" = "$(/tmp/$v/target/release/examples/do hash "$f" 1)";done;done;: >/tmp/r.tsv
+          for r in {1..17};do V=(base large cat36);if ((r%2==0));then V=(cat36 large base);fi;for v in "${V[@]}";do X=/tmp/$v/target/release/examples/do;u=$(taskset -c 0 "$X" bench "$I119" 3);printf '119\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench "$I136" 20);printf '136\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# VP8 DCT rare-path outline matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- full verification + all-frame hashes passed','','| workload | variant | paired speedup | range |','|---|---|---:|---:|']
+          for w in ('119','136'):
+            for v in ('large','cat36'):
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| issue {w} | {v} | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          pathlib.Path('benchmark-vp8-dct-outline.md').write_text('\n'.join(L+['']))
+          PY
+          cp benchmark-vp8-dct-outline.md "$GITHUB_WORKSPACE/";cd "$GITHUB_WORKSPACE";git add benchmark-vp8-dct-outline.md;git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git commit -m 'Record VP8 DCT outline matrix';git push origin HEAD:bench-vp8-dct-outline
