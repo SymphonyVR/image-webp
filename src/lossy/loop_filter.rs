@@ -54,6 +54,7 @@ fn common_adjust_vertical(
 /// Used in both the simple and normal filters described in 15.2 and 15.3
 ///
 /// Adjusts the 2 middle pixels in a horizontal loop filter
+#[inline]
 fn common_adjust_horizontal(use_outer_taps: bool, pixels: &mut [u8]) -> i32 {
     let p1 = u2s(pixels[2]);
     let p0 = u2s(pixels[3]);
@@ -113,6 +114,7 @@ fn should_filter_vertical(
         && diff(pixels[point + stride], pixels[point]) <= interior_limit
 }
 
+#[inline]
 fn should_filter_horizontal(interior_limit: u8, edge_limit: u8, pixels: &[u8]) -> bool {
     assert!(pixels.len() >= 8); // one bounds check up front eliminates all subsequent checks in this function
     simple_threshold_horizontal(i32::from(edge_limit), pixels)
