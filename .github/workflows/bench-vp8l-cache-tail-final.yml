@@ -1,0 +1,70 @@
+name: Benchmark VP8L cache-tail on current tree
+on:
+  push:
+    branches: [ bench-vp8l-cache-tail-final ]
+    paths: [ .github/workflows/bench-vp8l-cache-tail-final.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify and benchmark fixed refs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=00c9bf309f8286509832948a67d4fbcdb2933adc
+          CAND=156a9db7b0118960be65d047f2e593297fee4aea
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$CAND"
+          (cd /tmp/cand && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check && cargo +1.80.1 build -q)
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP': return []
+            out=[];p=12
+            while p+8<=len(d):
+              f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');out.append(f);p+=8+n+(n&1)
+            return out
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c: print(p)
+          PY
+          sudo apt-get update -qq; sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode()); row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn dec(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[0]as u64^((b[b.len()/2]as u64)<<8)^((b[b.len()-1]as u64)<<16))}
+          fn hash(d:&[u8])->u64{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b.iter().fold(1469598103934665603u64,|h,&z|(h^z as u64).wrapping_mul(1099511628211))}
+          fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let p=a.next().unwrap();let d=std::fs::read(p).unwrap();if m=="hash"{println!("{:016x}",hash(&d));return}let n:usize=a.next().unwrap().parse().unwrap();black_box(dec(&d));let t=Instant::now();let mut s=0;for _ in 0..n{s^=dec(&d)}black_box(s);println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/bench.rs "$d/examples/cache_tail.rs";(cd "$d"&&cargo build --release --example cache_tail -q);done
+          B=/tmp/base/target/release/examples/cache_tail;C=/tmp/cand/target/release/examples/cache_tail;mapfile -t F </tmp/files.txt
+          for f in "${F[@]}";do cf=${f/\/tmp\/base/\/tmp\/cand};test "$($B hash "$f")" = "$($C hash "$cf")";done
+          test "$($B hash /tmp/large.webp)" = "$($C hash /tmp/large.webp)"
+          : >/tmp/r.tsv
+          for r in {1..25};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;start=$(date +%s%N);for f in "${F[@]}";do ff=$f;[[ $v == cand ]]&&ff=${f/\/tmp\/base/\/tmp\/cand};taskset -c 0 "$X" bench "$ff" 3 >/dev/null;done;end=$(date +%s%N);printf 'corpus\t%s\t%s\t%.3f\n' "$r" "$v" "$((end-start))e-3">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench /tmp/large.webp 3);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:x=float(x);g.setdefault((w,v),[]).append(x);rr.setdefault((w,int(r)),{})[v]=x
+          L=['# VP8L cache-tail final confirmation','',f'- CPU: `{os.environ["CPU"]}`','- baseline: `00c9bf309f8286509832948a67d4fbcdb2933adc`','- candidate source: `156a9db7b0118960be65d047f2e593297fee4aea`','- full hashes match; full verification passed','','| workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |')
+          pathlib.Path('benchmark-vp8l-cache-tail-final.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-cache-tail-final.md;git commit -m 'Record VP8L cache-tail final confirmation';git push origin HEAD:bench-vp8l-cache-tail-final
