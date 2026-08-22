@@ -1,0 +1,32 @@
+name: Materialize packed VP8L color-cache candidate
+on:
+  push:
+    branches: [ candidate-vp8l-packed-cache-current ]
+    paths: [ .github/workflows/materialize-vp8l-packed-cache-current.yml ]
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/mod.rs');s=p.read_text()
+          s=s.replace('color_cache: vec![[0; 4]; 1 << bits],','color_cache: vec![0; 1 << bits],',1)
+          s=s.replace('''    color_cache: Vec<[u8; 4]>,\n''','''    color_cache: Vec<u32>,\n''',1)
+          old='''    #[inline(always)]\n    fn insert(&mut self, color: [u8; 4]) {\n        let [r, g, b, a] = color;\n        let color_u32 =\n            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);\n        let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);\n        self.color_cache[index as usize] = color;\n    }\n\n    #[inline(always)]\n    fn lookup(&self, index: usize) -> [u8; 4] {\n        self.color_cache[index]\n    }\n'''
+          new='''    #[inline(always)]\n    fn insert(&mut self, color: [u8; 4]) {\n        let rgba = u32::from_le_bytes(color);\n        // The VP8L cache hash packs bytes as A-R-G-B. Our decoder stores\n        // pixels as R-G-B-A, so swap the red and blue byte lanes.\n        let hash_color = (rgba & 0xff00_ff00)\n            | ((rgba & 0x0000_00ff) << 16)\n            | ((rgba & 0x00ff_0000) >> 16);\n        let index = (0x1e35a7bdu32.wrapping_mul(hash_color)) >> (32 - self.color_cache_bits);\n        self.color_cache[index as usize] = rgba;\n    }\n\n    #[inline(always)]\n    fn lookup(&self, index: usize) -> [u8; 4] {\n        self.color_cache[index].to_le_bytes()\n    }\n'''
+          if old not in s: raise SystemExit('cache impl marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/mod.rs
+          git commit -m 'Pack VP8L color cache entries as u32'
+          git push origin HEAD:candidate-vp8l-packed-cache-current
