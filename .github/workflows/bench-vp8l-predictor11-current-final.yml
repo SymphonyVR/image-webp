@@ -1,0 +1,81 @@
+name: Confirm predictor-11 on current VP8L tree
+on:
+  push:
+    branches: [ bench-vp8l-predictor11-current-final ]
+    paths: [ .github/workflows/bench-vp8l-predictor11-current-final.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Prepare candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/reverse_transform.rs');s=p.read_text();a=s.index('pub fn apply_predictor_transform_11(');b=s.index('pub fn apply_predictor_transform_12(',a)
+          new=r'''pub fn apply_predictor_transform_11(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let top = &old[range.start - width * 4..];
+    let mut left: [u8; 4] = old[range.start - 4..range.start].try_into().unwrap();
+    let mut top_left: [u8; 4] = old[range.start - width * 4 - 4..range.start - width * 4].try_into().unwrap();
+    for (chunk, top) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)) {
+        let top: [u8; 4] = top.try_into().unwrap();
+        let dl = u16::from(top[0].abs_diff(top_left[0])) + u16::from(top[1].abs_diff(top_left[1])) + u16::from(top[2].abs_diff(top_left[2])) + u16::from(top[3].abs_diff(top_left[3]));
+        let dt = u16::from(left[0].abs_diff(top_left[0])) + u16::from(left[1].abs_diff(top_left[1])) + u16::from(left[2].abs_diff(top_left[2])) + u16::from(left[3].abs_diff(top_left[3]));
+        let predictor = if dl < dt { left } else { top };
+        chunk[0] = chunk[0].wrapping_add(predictor[0]);
+        chunk[1] = chunk[1].wrapping_add(predictor[1]);
+        chunk[2] = chunk[2].wrapping_add(predictor[2]);
+        chunk[3] = chunk[3].wrapping_add(predictor[3]);
+        top_left = top;
+        left.copy_from_slice(chunk);
+    }
+}
+'''
+          p.write_text(s[:a]+new+s[b:])
+          PY
+          (cd /tmp/cand && cargo fmt && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal;(cd /tmp/cand && cargo +1.80.1 build -q)
+      - name: Benchmark corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def c(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            q=c(p.read_bytes())
+            if b'VP8L' in q and b'ANIM' not in q:print(p)
+          PY
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(1469598103934665603u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:016x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base cand;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/p11_current.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example p11_current -q);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/p11_current;C=/tmp/cand/target/release/examples/p11_current
+          diff -u <($B h 1 "${BF[@]}") <($C h 1 "${CF[@]}")
+          : >/tmp/r
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" b 120 "${F[@]}");printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for r,v,x in R:g.setdefault(v,[]).append(float(x));rr.setdefault(int(r),{})[v]=float(x)
+          q=[z['base']/z['cand'] for _,z in sorted(rr.items())];b=statistics.median(g['base']);c=statistics.median(g['cand'])
+          Path('benchmark-vp8l-predictor11-current-final.md').write_text(f'# Current-tree VP8L predictor-11 confirmation\n\n- baseline: `{os.environ["BASE"]}`\n- CPU: `{os.environ["CPU"]}`\n- hashes + tests/docs/Clippy/fmt/MSRV 1.80.1 passed\n\n| baseline | candidate | paired median | range |\n|---:|---:|---:|---:|\n| {b:.3f} us | {c:.3f} us | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |\n')
+          PY
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail;git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-predictor11-current-final.md;git commit -m 'Record current VP8L predictor-11 confirmation';git push origin HEAD:bench-vp8l-predictor11-current-final
