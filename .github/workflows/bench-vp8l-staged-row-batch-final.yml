@@ -1,0 +1,250 @@
+name: Benchmark staged VP8L row batching
+on:
+  push:
+    branches: [ bench-vp8l-staged-row-batch-final ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Build staged candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^); echo "BASE=$BASE" >> "$GITHUB_ENV"; echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/reverse_transform.rs'); s=p.read_text()
+          a=s.index('pub(crate) fn apply_predictor_transform('); b=s.index('pub fn apply_predictor_transform_0(',a)
+          pred=r'''pub(crate) fn apply_predictor_transform(
+    image_data: &mut [u8], width: u16, height: u16, size_bits: u8, predictor_data: &[u8],
+) -> Result<(), DecodingError> {
+    apply_predictor_transform_rows(image_data, width, height, size_bits, predictor_data, 0, height)
+}
+
+pub(crate) fn apply_predictor_transform_rows(
+    image_data: &mut [u8], width: u16, height: u16, size_bits: u8,
+    predictor_data: &[u8], start_row: u16, end_row: u16,
+) -> Result<(), DecodingError> {
+    let block_xsize = usize::from(subsample_size(width, size_bits));
+    let width = usize::from(width); let height = usize::from(height);
+    let start_row = usize::from(start_row); let end_row = usize::from(end_row);
+    assert!(start_row <= end_row && end_row <= height);
+    if start_row == end_row { return Ok(()); }
+    if start_row == 0 {
+        image_data[3] = image_data[3].wrapping_add(255);
+        apply_predictor_transform_1(image_data, 4..width * 4, width);
+    }
+    let first = start_row.max(1);
+    for y in first..end_row {
+        for i in 0..4 {
+            image_data[y*width*4+i] = image_data[y*width*4+i].wrapping_add(image_data[(y-1)*width*4+i]);
+        }
+    }
+    for y in first..end_row {
+        for block_x in 0..block_xsize {
+            let block_index=(y >> size_bits)*block_xsize+block_x;
+            let predictor=predictor_data[block_index*4+1];
+            let start_index=(y*width+(block_x << size_bits).max(1))*4;
+            let end_index=(y*width+((block_x+1) << size_bits).min(width))*4;
+            match predictor {
+                0=>apply_predictor_transform_0(image_data,start_index..end_index,width),
+                1=>apply_predictor_transform_1(image_data,start_index..end_index,width),
+                2=>apply_predictor_transform_2(image_data,start_index..end_index,width),
+                3=>apply_predictor_transform_3(image_data,start_index..end_index,width),
+                4=>apply_predictor_transform_4(image_data,start_index..end_index,width),
+                5=>apply_predictor_transform_5(image_data,start_index..end_index,width),
+                6=>apply_predictor_transform_6(image_data,start_index..end_index,width),
+                7=>apply_predictor_transform_7(image_data,start_index..end_index,width),
+                8=>apply_predictor_transform_8(image_data,start_index..end_index,width),
+                9=>apply_predictor_transform_9(image_data,start_index..end_index,width),
+                10=>apply_predictor_transform_10(image_data,start_index..end_index,width),
+                11=>apply_predictor_transform_11(image_data,start_index..end_index,width),
+                12=>apply_predictor_transform_12(image_data,start_index..end_index,width),
+                13=>apply_predictor_transform_13(image_data,start_index..end_index,width),
+                _=>{}
+            }
+        }
+    }
+    Ok(())
+}
+'''
+          s=s[:a]+pred+s[b:]
+          a=s.index('pub(crate) fn apply_color_transform('); b=s.index('pub(crate) fn apply_subtract_green_transform(',a)
+          color=r'''pub(crate) fn apply_color_transform(
+    image_data: &mut [u8], width: u16, size_bits: u8, transform_data: &[u8],
+) {
+    let row_bytes=usize::from(width)*4; let height=image_data.len()/row_bytes;
+    apply_color_transform_rows(image_data,width,size_bits,transform_data,0,height as u16);
+}
+
+pub(crate) fn apply_color_transform_rows(
+    image_data: &mut [u8], width: u16, size_bits: u8, transform_data: &[u8],
+    start_row: u16, end_row: u16,
+) {
+    let block_xsize=usize::from(subsample_size(width,size_bits)); let width=usize::from(width);
+    let start_row=usize::from(start_row); let end_row=usize::from(end_row); let row_bytes=width*4;
+    assert!(start_row<=end_row && end_row*row_bytes<=image_data.len());
+    for (dy,row) in image_data[start_row*row_bytes..end_row*row_bytes].chunks_exact_mut(row_bytes).enumerate() {
+        let y=start_row+dy; let row_tf=&transform_data[(y >> size_bits)*block_xsize*4..];
+        for (block,transform) in row.chunks_mut(4 << size_bits).zip(row_tf.chunks_exact(4)) {
+            let red_to_blue=transform[0]; let green_to_blue=transform[1]; let green_to_red=transform[2];
+            for pixel in block.chunks_exact_mut(4) {
+                let green=u32::from(pixel[1]); let mut red=u32::from(pixel[0]); let mut blue=u32::from(pixel[2]);
+                red += color_transform_delta(green_to_red as i8, green as i8);
+                blue += color_transform_delta(green_to_blue as i8, green as i8);
+                blue += color_transform_delta(red_to_blue as i8, red as i8);
+                pixel[0]=(red & 0xff) as u8; pixel[2]=(blue & 0xff) as u8;
+            }
+        }
+    }
+}
+
+'''
+          s=s[:a]+color+s[b:]
+          old='''pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
+    for pixel in image_data.chunks_exact_mut(4) {
+        pixel[0] = pixel[0].wrapping_add(pixel[1]);
+        pixel[2] = pixel[2].wrapping_add(pixel[1]);
+    }
+}
+'''
+          new='''pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
+    apply_subtract_green_transform_rows(image_data, 0, image_data.len() / 4);
+}
+
+pub(crate) fn apply_subtract_green_transform_rows(image_data: &mut [u8], start_pixel: usize, end_pixel: usize) {
+    assert!(start_pixel <= end_pixel && end_pixel * 4 <= image_data.len());
+    for pixel in image_data[start_pixel*4..end_pixel*4].chunks_exact_mut(4) {
+        pixel[0] = pixel[0].wrapping_add(pixel[1]); pixel[2] = pixel[2].wrapping_add(pixel[1]);
+    }
+}
+'''
+          if old not in s: raise SystemExit('green marker')
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('/tmp/cand/src/lossless/decoder/mod.rs'); s=p.read_text()
+          old='''use reverse_transform::{
+    apply_color_indexing_transform, apply_color_transform, apply_predictor_transform,
+    apply_subtract_green_transform, TransformType,
+};'''
+          new='''use reverse_transform::{
+    apply_color_indexing_transform, apply_color_transform, apply_color_transform_rows,
+    apply_predictor_transform, apply_predictor_transform_rows, apply_subtract_green_transform,
+    apply_subtract_green_transform_rows, TransformType,
+};'''
+          if old not in s: raise SystemExit('import marker')
+          s=s.replace(old,new,1)
+          a=s.index('        let mut image_size = transformed_size;'); b=s.index('\n\n        Ok(())',a)
+          body=r'''        let has_color_indexing = self.transform_order.iter().any(|&i| {
+            matches!(self.transforms[usize::from(i)].as_ref(), Some(TransformType::ColorIndexingTransform { .. }))
+        });
+        if !has_color_indexing {
+            const ROW_BATCH: u16 = 16;
+            let width = transformed_width;
+            let row_bytes = usize::from(width) * 4;
+            let mut predictor_row: Option<Vec<u8>> = None;
+            let mut start_row = 0u16;
+            while start_row < self.height {
+                let end_row = (start_row + ROW_BATCH).min(self.height);
+                for &trans_index in self.transform_order.iter().rev() {
+                    let transform = self.transforms[usize::from(trans_index)].as_ref().unwrap();
+                    match transform {
+                        TransformType::PredictorTransform { size_bits, predictor_data } => {
+                            if start_row > 0 {
+                                let prev = (usize::from(start_row) - 1) * row_bytes;
+                                let final_prev = buf[prev..prev + row_bytes].to_vec();
+                                buf[prev..prev + row_bytes].copy_from_slice(predictor_row.as_ref().unwrap());
+                                apply_predictor_transform_rows(&mut buf[..transformed_size], width, self.height, *size_bits, predictor_data, start_row, end_row)?;
+                                let last = (usize::from(end_row) - 1) * row_bytes;
+                                predictor_row = Some(buf[last..last + row_bytes].to_vec());
+                                buf[prev..prev + row_bytes].copy_from_slice(&final_prev);
+                            } else {
+                                apply_predictor_transform_rows(&mut buf[..transformed_size], width, self.height, *size_bits, predictor_data, start_row, end_row)?;
+                                let last = (usize::from(end_row) - 1) * row_bytes;
+                                predictor_row = Some(buf[last..last + row_bytes].to_vec());
+                            }
+                        }
+                        TransformType::ColorTransform { size_bits, transform_data } =>
+                            apply_color_transform_rows(&mut buf[..transformed_size], width, *size_bits, transform_data, start_row, end_row),
+                        TransformType::SubtractGreen =>
+                            apply_subtract_green_transform_rows(&mut buf[..transformed_size], usize::from(start_row)*usize::from(width), usize::from(end_row)*usize::from(width)),
+                        TransformType::ColorIndexingTransform { .. } => unreachable!(),
+                    }
+                }
+                start_row = end_row;
+            }
+        } else {
+            let mut image_size = transformed_size;
+            let mut width = transformed_width;
+            for &trans_index in self.transform_order.iter().rev() {
+                let transform = self.transforms[usize::from(trans_index)].as_ref().unwrap();
+                match transform {
+                    TransformType::PredictorTransform { size_bits, predictor_data } =>
+                        apply_predictor_transform(&mut buf[..image_size], width, self.height, *size_bits, predictor_data)?,
+                    TransformType::ColorTransform { size_bits, transform_data } =>
+                        apply_color_transform(&mut buf[..image_size], width, *size_bits, transform_data),
+                    TransformType::SubtractGreen => apply_subtract_green_transform(&mut buf[..image_size]),
+                    TransformType::ColorIndexingTransform { table_size, table_data } => {
+                        width = self.width; image_size = usize::from(width) * usize::from(self.height) * 4;
+                        apply_color_indexing_transform(buf, width, self.height, *table_size, table_data);
+                    }
+                }
+            }
+        }'''
+          p.write_text(s[:a]+body+s[b:])
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand && cargo fmt && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check && cargo +1.80.1 build -q)
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP': return []
+            o=[];p=12
+            while p+8<=len(d): f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c: print(p)
+          PY
+          sudo apt-get update -qq; sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode()); row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3; row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255; row[i+1]=(x*2+y*7+((x*y)>>10))&255; row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand; do mkdir -p "$d/examples"; cp /tmp/b.rs "$d/examples/srb.rs"; (cd "$d" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example srb -q); done
+          mapfile -t BF </tmp/files.txt; CF=(); for p in "${BF[@]}"; do CF+=("${p/\/tmp\/base/\/tmp\/cand}"); done; B=/tmp/base/target/release/examples/srb; C=/tmp/cand/target/release/examples/srb
+          diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp)
+          : >/tmp/r.tsv
+          for r in {1..13}; do if ((r%2)); then O='base cand'; else O='cand base'; fi; for v in $O; do if [[ $v == base ]]; then X=$B;F=("${BF[@]}"); else X=$C;F=("${CF[@]}"); fi; u=$(taskset -c 0 "$X" t 70 "${F[@]}"); printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv; u=$(taskset -c 0 "$X" t 4 /tmp/large.webp); printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv; done; done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t')); rr={};g={}
+          for w,r,v,x in rows: rr.setdefault((w,int(r)),{})[v]=float(x);g.setdefault((w,v),[]).append(float(x))
+          L=['# Staged VP8L row-batch benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- full output hashes + tests/docs/Clippy/fmt/MSRV passed','','| workload | baseline | candidate | paired median | positive | range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+            q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w]; L.append(f'| {w} | {statistics.median(g[w,"base"]):.3f} us | {statistics.median(g[w,"cand"]):.3f} us | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-staged-row-batch-final.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-staged-row-batch-final.md
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com; git add benchmark-vp8l-staged-row-batch-final.md; git commit -m 'Record staged VP8L row batching'; git push origin HEAD:bench-vp8l-staged-row-batch-final
