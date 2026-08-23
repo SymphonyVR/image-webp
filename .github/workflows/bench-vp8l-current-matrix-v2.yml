@@ -1,0 +1,307 @@
+name: Benchmark current VP8L scalar candidates
+
+on:
+  push:
+    branches: [ bench-vp8l-current-matrix-v2 ]
+    paths: [ .github/workflows/bench-vp8l-current-matrix-v2.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+
+      - name: Prepare and verify variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          for v in base bulk pattern pred11 pred2; do
+            git worktree add --detach "/tmp/$v" "$BASE"
+          done
+
+          cat >/tmp/patch.py <<'PY'
+          from pathlib import Path
+
+          def bulk(root):
+              p = Path(root) / 'src/lossless/decoder/mod.rs'
+              s = p.read_text()
+              old = '''                } else {\n                    if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n'''
+              new = '''                } else {\n                    if dist >= length {\n                        let source_start = (index - dist) * 4;\n                        let destination_start = index * 4;\n                        let byte_len = length * 4;\n                        let (before_destination, destination) =\n                            data.split_at_mut(destination_start);\n                        destination[..byte_len].copy_from_slice(\n                            &before_destination[source_start..source_start + byte_len],\n                        );\n                    } else if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n'''
+              if old not in s:
+                  raise SystemExit('bulk marker missing')
+              p.write_text(s.replace(old, new, 1))
+
+          def pattern(root):
+              p = Path(root) / 'src/lossless/decoder/mod.rs'
+              s = p.read_text()
+              old = '''                } else {\n                    if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n                        data.copy_within(start..start + 16, index * 4);\n\n                        if length > 4 || dist < 4 {\n                            for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {\n                                data.copy_within(start + i..start + i + 16, index * 4 + i);\n                            }\n                        }\n                    } else {\n                        for i in 0..length * 4 {\n                            data[index * 4 + i] = data[index * 4 + i - dist * 4];\n                        }\n                    }\n\n'''
+              new = '''                } else {\n                    let source_start = (index - dist) * 4;\n                    let destination_start = index * 4;\n                    let byte_len = length * 4;\n                    if dist >= length {\n                        let (before_destination, destination) =\n                            data.split_at_mut(destination_start);\n                        destination[..byte_len].copy_from_slice(\n                            &before_destination[source_start..source_start + byte_len],\n                        );\n                    } else {\n                        let period_bytes = dist * 4;\n                        let (before_destination, destination_tail) =\n                            data.split_at_mut(destination_start);\n                        let destination = &mut destination_tail[..byte_len];\n                        destination[..period_bytes].copy_from_slice(\n                            &before_destination[source_start..source_start + period_bytes],\n                        );\n                        let mut copied = period_bytes;\n                        while copied < byte_len {\n                            let amount = copied.min(byte_len - copied);\n                            destination.copy_within(..amount, copied);\n                            copied += amount;\n                        }\n                    }\n\n'''
+              if old not in s:
+                  raise SystemExit('pattern marker missing')
+              p.write_text(s.replace(old, new, 1))
+
+          def pred11(root):
+              p = Path(root) / 'src/lossless/decoder/reverse_transform.rs'
+              s = p.read_text()
+              a = s.index('pub fn apply_predictor_transform_11(')
+              b = s.index('pub fn apply_predictor_transform_12(', a)
+              replacement = r'''pub fn apply_predictor_transform_11(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let top = &old[range.start - width * 4..];
+
+    let mut left: [u8; 4] = old[range.start - 4..range.start].try_into().unwrap();
+    let mut top_left: [u8; 4] = old[range.start - width * 4 - 4..range.start - width * 4]
+        .try_into()
+        .unwrap();
+
+    for (chunk, top) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)) {
+        let top: [u8; 4] = top.try_into().unwrap();
+        let distance_to_left = u16::from(top[0].abs_diff(top_left[0]))
+            + u16::from(top[1].abs_diff(top_left[1]))
+            + u16::from(top[2].abs_diff(top_left[2]))
+            + u16::from(top[3].abs_diff(top_left[3]));
+        let distance_to_top = u16::from(left[0].abs_diff(top_left[0]))
+            + u16::from(left[1].abs_diff(top_left[1]))
+            + u16::from(left[2].abs_diff(top_left[2]))
+            + u16::from(left[3].abs_diff(top_left[3]));
+        let prediction = if distance_to_left < distance_to_top { left } else { top };
+        chunk[0] = chunk[0].wrapping_add(prediction[0]);
+        chunk[1] = chunk[1].wrapping_add(prediction[1]);
+        chunk[2] = chunk[2].wrapping_add(prediction[2]);
+        chunk[3] = chunk[3].wrapping_add(prediction[3]);
+        top_left = top;
+        left.copy_from_slice(chunk);
+    }
+}
+'''
+              p.write_text(s[:a] + replacement + s[b:])
+
+          def pred2(root):
+              p = Path(root) / 'src/lossless/decoder/reverse_transform.rs'
+              s = p.read_text()
+              old = '''pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {\n    assert!(range.end <= image_data.len());\n    let mut i = range.start;\n    while i < range.end {\n        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4]);\n        i += 1;\n    }\n}\n'''
+              new = '''pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {\n    assert!(range.end <= image_data.len());\n    let len = range.end - range.start;\n    let (previous_rows, current) = image_data[..range.end].split_at_mut(range.start);\n    let top = &previous_rows[range.start - width * 4..][..len];\n    for (pixel, top) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)) {\n        pixel[0] = pixel[0].wrapping_add(top[0]);\n        pixel[1] = pixel[1].wrapping_add(top[1]);\n        pixel[2] = pixel[2].wrapping_add(top[2]);\n        pixel[3] = pixel[3].wrapping_add(top[3]);\n    }\n}\n'''
+              if old not in s:
+                  raise SystemExit('predictor-2 marker missing')
+              p.write_text(s.replace(old, new, 1))
+
+          bulk('/tmp/bulk')
+          pattern('/tmp/pattern')
+          pred11('/tmp/pred11')
+          pred2('/tmp/pred2')
+          PY
+          python3 /tmp/patch.py
+
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in bulk pattern pred11 pred2; do
+            (
+              cd "/tmp/$v"
+              cargo fmt
+              cargo test -q
+              cargo doc -q
+              cargo clippy --all-features -- -D warnings
+              cargo fmt -- --check
+              cargo +1.80.1 build -q
+            )
+          done
+
+      - name: Prepare workloads and benchmark binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data) < 12 or data[:4] != b'RIFF' or data[8:12] != b'WEBP':
+                  return []
+              out = []
+              p = 12
+              while p + 8 <= len(data):
+                  fourcc = data[p:p+4]
+                  n = int.from_bytes(data[p+4:p+8], 'little')
+                  out.append(fourcc)
+                  p += 8 + n + (n & 1)
+              return out
+          for path in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+              c = chunks(path.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c:
+                  print(path)
+          PY
+
+          sudo apt-get update -qq
+          sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w = h = 2048
+          with open('/tmp/large.ppm', 'wb') as f:
+              f.write(f'P6\n{w} {h}\n255\n'.encode())
+              row = bytearray(w * 3)
+              for y in range(h):
+                  for x in range(w):
+                      i = x * 3
+                      row[i] = (x * 3 + y * 5 + ((x >> 5) ^ (y >> 4)) * 17) & 255
+                      row[i + 1] = (x * 2 + y * 7 + ((x * y) >> 10)) & 255
+                      row[i + 2] = (x * 11 + y * 3 + ((x + y) >> 3) * 9) & 255
+                  f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::{hint::black_box, io::Cursor, time::Instant};
+
+          fn decode(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              decoder.read_image(&mut buf).unwrap();
+              black_box(
+                  u64::from(buf[0])
+                      ^ (u64::from(buf[buf.len() / 2]) << 8)
+                      ^ (u64::from(buf[buf.len() - 1]) << 16),
+              )
+          }
+
+          fn hash(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              decoder.read_image(&mut buf).unwrap();
+              buf.iter().fold(1469598103934665603u64, |h, &b| {
+                  (h ^ u64::from(b)).wrapping_mul(1099511628211)
+              })
+          }
+
+          fn main() {
+              let mut args = std::env::args().skip(1);
+              let mode = args.next().unwrap();
+              let iterations: usize = args.next().unwrap().parse().unwrap();
+              let paths: Vec<_> = args.collect();
+              let inputs: Vec<Vec<u8>> = paths
+                  .iter()
+                  .map(std::fs::read)
+                  .collect::<Result<_, _>>()
+                  .unwrap();
+              if mode == "hash" {
+                  for input in &inputs {
+                      println!("{:016x}", hash(input));
+                  }
+                  return;
+              }
+              for input in &inputs {
+                  black_box(decode(input));
+              }
+              let start = Instant::now();
+              let mut checksum = 0u64;
+              for _ in 0..iterations {
+                  for input in &inputs {
+                      checksum ^= decode(input);
+                  }
+              }
+              black_box(checksum);
+              println!(
+                  "{:.3}",
+                  start.elapsed().as_secs_f64() * 1_000_000.0
+                      / (iterations * inputs.len()) as f64
+              );
+          }
+          RS
+
+          for v in base bulk pattern pred11 pred2; do
+            mkdir -p "/tmp/$v/examples"
+            cp /tmp/bench.rs "/tmp/$v/examples/vp8l_matrix.rs"
+            (cd "/tmp/$v" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example vp8l_matrix -q)
+          done
+
+      - name: Verify output and run paired matrix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BASE_FILES </tmp/files.txt
+          BASE_BIN=/tmp/base/target/release/examples/vp8l_matrix
+          BASE_HASH="$($BASE_BIN hash 1 "${BASE_FILES[@]}" /tmp/large.webp)"
+
+          for v in bulk pattern pred11 pred2; do
+            FILES=()
+            for p in "${BASE_FILES[@]}"; do FILES+=("${p/\/tmp\/base/\/tmp\/$v}"); done
+            BIN="/tmp/$v/target/release/examples/vp8l_matrix"
+            test "$BASE_HASH" = "$($BIN hash 1 "${FILES[@]}" /tmp/large.webp)"
+          done
+
+          : >/tmp/results.tsv
+          for round in {1..11}; do
+            if (( round % 2 )); then
+              ORDER=(base bulk pattern pred11 pred2)
+            else
+              ORDER=(pred2 pred11 pattern bulk base)
+            fi
+            for v in "${ORDER[@]}"; do
+              BIN="/tmp/$v/target/release/examples/vp8l_matrix"
+              FILES=()
+              for p in "${BASE_FILES[@]}"; do
+                if [[ $v == base ]]; then FILES+=("$p"); else FILES+=("${p/\/tmp\/base/\/tmp\/$v}"); fi
+              done
+              value=$(taskset -c 0 "$BIN" bench 80 "${FILES[@]}")
+              printf 'corpus\t%s\t%s\t%s\n' "$round" "$v" "$value" >>/tmp/results.tsv
+              value=$(taskset -c 0 "$BIN" bench 3 /tmp/large.webp)
+              printf 'large\t%s\t%s\t%s\n' "$round" "$v" "$value" >>/tmp/results.tsv
+            done
+          done
+
+          python3 - <<'PY'
+          import csv, os, statistics
+          from pathlib import Path
+
+          rows = list(csv.reader(open('/tmp/results.tsv'), delimiter='\t'))
+          by_round = {}
+          medians = {}
+          for workload, round_no, variant, value in rows:
+              value = float(value)
+              by_round.setdefault((workload, int(round_no)), {})[variant] = value
+              medians.setdefault((workload, variant), []).append(value)
+
+          lines = [
+              '# Current-tree VP8L scalar candidate matrix', '',
+              f'- baseline: `{os.environ["BASE"]}`',
+              f'- CPU: `{os.environ["CPU"]}`',
+              '- all candidates: tests/docs/Clippy/fmt/MSRV 1.80.1 + full output hashes passed',
+              '- 11 alternating paired rounds, release `-C target-cpu=native`, CPU 0', '',
+              '| workload | variant | baseline median | candidate median | paired speedup | range |',
+              '|---|---|---:|---:|---:|---:|',
+          ]
+          for workload in ('corpus', 'large'):
+              base_median = statistics.median(medians[workload, 'base'])
+              for variant in ('bulk', 'pattern', 'pred11', 'pred2'):
+                  candidate_median = statistics.median(medians[workload, variant])
+                  ratios = [
+                      values['base'] / values[variant]
+                      for (w, _), values in sorted(by_round.items())
+                      if w == workload
+                  ]
+                  lines.append(
+                      f'| {workload} | {variant} | {base_median:.3f} us | '
+                      f'{candidate_median:.3f} us | {statistics.median(ratios):.4f}x | '
+                      f'{min(ratios):.4f}–{max(ratios):.4f}x |'
+                  )
+          lines += ['', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode']
+          lines += ['\t'.join(row) for row in rows]
+          lines += ['```', '']
+          Path('benchmark-vp8l-current-matrix-v2.md').write_text('\n'.join(lines))
+          PY
+          cat benchmark-vp8l-current-matrix-v2.md
+
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-current-matrix-v2.md
+          git commit -m 'Record current VP8L scalar candidate matrix'
+          git push origin HEAD:bench-vp8l-current-matrix-v2
