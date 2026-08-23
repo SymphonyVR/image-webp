@@ -1,0 +1,96 @@
+name: Confirm current-tree VP8L Huffman inlining
+
+on:
+  push:
+    branches: [ bench-vp8l-huffman-inline-current ]
+    paths: [ .github/workflows/bench-vp8l-huffman-inline-current.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Prepare candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/huffman.rs');s=p.read_text()
+          marker='''    pub(crate) fn read_symbol<R: BufRead>(\n'''
+          if marker not in s: raise SystemExit('read_symbol marker missing')
+          p.write_text(s.replace(marker, '    #[inline(always)]\n    pub(crate) fn read_symbol<R: BufRead>(\n', 1))
+          PY
+          (cd /tmp/cand && cargo fmt && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand && cargo +1.80.1 build -q)
+
+      - name: Prepare benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP': return []
+            out=[];p=12
+            while p+8<=len(d):
+              fourcc=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');out.append(fourcc);p+=8+n+(n&1)
+            return out
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c: print(p)
+          PY
+          sudo apt-get update -qq
+          sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base cand;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/hi_current.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example hi_current -q);done
+
+      - name: Verify and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done
+          B=/tmp/base/target/release/examples/hi_current;C=/tmp/cand/target/release/examples/hi_current
+          diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp)
+          : >/tmp/r
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 100 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;u=$(taskset -c 0 "$X" t 3 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in R:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# Current-tree VP8L Huffman inline confirmation','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- `#[inline(always)]` on `HuffmanTree::read_symbol`','- full hashes + tests/docs/Clippy/fmt/MSRV 1.80.1 passed','','| workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |')
+          pathlib.Path('benchmark-vp8l-huffman-inline-current.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-huffman-inline-current.md
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-huffman-inline-current.md;git commit -m 'Record current VP8L Huffman inline confirmation';git push origin HEAD:bench-vp8l-huffman-inline-current
