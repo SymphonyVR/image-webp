@@ -1,0 +1,55 @@
+name: Benchmark VP8L Huffman inline matrix
+on:
+  push:
+    branches: [ bench-vp8l-huffman-inline-matrix ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=2d4578f05c46f7d55060ec7384d8dac654107ba1
+          for v in base inline always;do git worktree add --detach "/tmp/$v" "$BASE";done
+          python3 - <<'PY'
+          from pathlib import Path
+          for v,attr in [('inline','#[inline]\n'),('always','#[inline(always)]\n')]:
+            p=Path('/tmp')/v/'src/lossless/decoder/huffman.rs';s=p.read_text();m='''    pub(crate) fn read_symbol<R: BufRead>(\n'''
+            if m not in s:raise SystemExit('read_symbol marker missing')
+            p.write_text(s.replace(m,'    '+attr+'    pub(crate) fn read_symbol<R: BufRead>(\n',1))
+          PY
+          for v in inline always;do (cd "/tmp/$v"&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q);done
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            p=12;o=[]
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base inline always;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/hi.rs";(cd "/tmp/$v"&&cargo build --release --example hi -q);done
+          mapfile -t F </tmp/files.txt;H=$(/tmp/base/target/release/examples/hi h 1 "${F[@]}");for v in inline always;do VF=();for p in "${F[@]}";do VF+=("${p/\/tmp\/base/\/tmp\/$v}");done;test "$H" = "$(/tmp/$v/target/release/examples/hi h 1 "${VF[@]}")";done
+          : >/tmp/r
+          for r in {1..17};do for v in base inline always;do X="/tmp/$v/target/release/examples/hi";VF=();for p in "${F[@]}";do VF+=("${p/\/tmp\/base/\/tmp\/$v}");done;u=$(taskset -c 0 "$X" t 100 "${VF[@]}");printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for r,v,x in R:g.setdefault(v,[]).append(float(x));rr.setdefault(int(r),{})[v]=float(x)
+          L=['# VP8L Huffman inline matrix','','| variant | median | paired vs baseline |','|---|---:|---:|']
+          for v in ('inline','always'):
+            p=[z['base']/z[v] for _,z in sorted(rr.items())];L.append(f'| {v} | {statistics.median(g[v]):.3f} us | {statistics.median(p):.4f}x |')
+          pathlib.Path('benchmark-vp8l-huffman-inline-matrix.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-huffman-inline-matrix.md;git commit -m 'Record Huffman inline matrix';git push origin HEAD:bench-vp8l-huffman-inline-matrix
