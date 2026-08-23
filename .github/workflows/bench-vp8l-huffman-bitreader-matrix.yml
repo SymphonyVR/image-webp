@@ -1,0 +1,115 @@
+name: Benchmark VP8L Huffman and BitReader candidates
+
+on:
+  push:
+    branches: [ bench-vp8l-huffman-bitreader-matrix ]
+    paths: [ .github/workflows/bench-vp8l-huffman-bitreader-matrix.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt }
+      - name: Build candidates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          for v in sorted clen huff fill inline all;do git worktree add --detach "/tmp/$v" "$BASE";done
+          cat >/tmp/patch.py <<'PY'
+          import sys
+          from pathlib import Path
+          v=sys.argv[1];root=Path(sys.argv[2]);hp=root/'src/lossless/decoder/huffman.rs';mp=root/'src/lossless/decoder/mod.rs';h=hp.read_text();m=mp.read_text()
+          def sorted_stack():
+              global h
+              old='''        let mut next_index = offsets;\n        let mut sorted_symbols = vec![0u16; code_lengths.len()];\n        for symbol in 0..code_lengths.len() {\n'''
+              new='''        let mut next_index = offsets;\n        let mut sorted_stack = [0u16; 512];\n        let mut sorted_heap = Vec::new();\n        let sorted_symbols: &mut [u16] = if code_lengths.len() <= sorted_stack.len() {\n            &mut sorted_stack[..code_lengths.len()]\n        } else {\n            sorted_heap.resize(code_lengths.len(), 0);\n            sorted_heap.as_mut_slice()\n        };\n        for symbol in 0..code_lengths.len() {\n'''
+              if old not in h:raise SystemExit('sorted marker')
+              h=h.replace(old,new,1)
+          def clen_stack():
+              global h,m
+              h=h.replace('pub(crate) fn build_implicit(code_lengths: Vec<u16>) -> Result<Self, DecodingError> {','pub(crate) fn build_implicit(code_lengths: &[u16]) -> Result<Self, DecodingError> {',1)
+              m=m.replace('let mut code_length_code_lengths = vec![0; CODE_LENGTH_CODES];','let mut code_length_code_lengths = [0u16; CODE_LENGTH_CODES];',1)
+              m=m.replace('self.read_huffman_code_lengths(code_length_code_lengths, alphabet_size)?','self.read_huffman_code_lengths(&code_length_code_lengths, alphabet_size)?',1)
+              m=m.replace('code_length_code_lengths: Vec<u16>,','code_length_code_lengths: &[u16],',1)
+              m=m.replace('let table = HuffmanTree::build_implicit(code_length_code_lengths)?;','let table = HuffmanTree::build_implicit(code_length_code_lengths)?;',1)
+              m=m.replace('HuffmanTree::build_implicit(new_code_lengths)','HuffmanTree::build_implicit(&new_code_lengths)',1)
+          def fill_guard():
+              global m
+              old='''        while index < num_values {\n            self.bit_reader.fill()?;\n''';new='''        while index < num_values {\n            if self.bit_reader.nbits < 56 {\n                self.bit_reader.fill()?;\n            }\n'''
+              if old not in m:raise SystemExit('fill marker')
+              m=m.replace(old,new,1)
+          def inline_bits():
+              global m
+              m=m.replace('    pub(crate) fn fill(&mut self) -> Result<(), DecodingError> {','    #[inline(always)]\n    pub(crate) fn fill(&mut self) -> Result<(), DecodingError> {',1)
+              m=m.replace('    pub(crate) fn consume(&mut self, num: u8) -> Result<(), DecodingError> {','    #[inline(always)]\n    pub(crate) fn consume(&mut self, num: u8) -> Result<(), DecodingError> {',1)
+          if v in ('sorted','huff','all'):sorted_stack()
+          if v in ('clen','huff','all'):clen_stack()
+          if v in ('fill','all'):fill_guard()
+          if v in ('inline','all'):inline_bits()
+          hp.write_text(h);mp.write_text(m)
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in sorted clen huff fill inline all;do python3 /tmp/patch.py "$v" "/tmp/$v";(cd "/tmp/$v"&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q);done
+      - name: Prepare workloads
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn image(d:&[u8])->Vec<u8>{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b}fn hash(d:&[u8])->u64{image(d).iter().fold(1469598103934665603u64,|h,&b|(h^u64::from(b)).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="hash"{for d in&ds{println!("{:016x}",hash(d))}return}for d in&ds{black_box(image(d));}let t=Instant::now();for _ in 0..n{for d in&ds{black_box(image(d));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base sorted clen huff fill inline all;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/huffbit.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example huffbit -q);done
+      - name: Verify and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt;B=/tmp/base/target/release/examples/huffbit
+          for v in sorted clen huff fill inline all;do CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done;C="/tmp/$v/target/release/examples/huffbit";diff -u <($B hash 1 "${BF[@]}" /tmp/large.webp) <($C hash 1 "${CF[@]}" /tmp/large.webp);done
+          : >/tmp/r.tsv
+          for r in {1..13};do for v in base sorted clen huff fill inline all;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X="/tmp/$v/target/release/examples/huffbit";F=();for p in "${BF[@]}";do F+=("${p/\/tmp\/base/\/tmp\/$v}");done;fi;u=$(taskset -c 0 "$X" bench 60 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench 3 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os
+          from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          vs=['sorted','clen','huff','fill','inline','all'];lines=['# VP8L Huffman / BitReader matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- all candidates: hashes match, cargo test passes, MSRV 1.80.1 builds','','| workload | candidate | base median | candidate median | paired median | positive | range |','|---|---|---:|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+            for v in vs:
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];lines.append(f'| {w} | {v} | {statistics.median(g[w,"base"]):.3f} us | {statistics.median(g[w,v]):.3f} us | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-huffman-bitreader-matrix.md').write_text('\n'.join(lines+['']))
+          PY
+          cat benchmark-vp8l-huffman-bitreader-matrix.md
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-huffman-bitreader-matrix.md;git commit -m 'Record VP8L Huffman BitReader matrix';git push origin HEAD:bench-vp8l-huffman-bitreader-matrix
