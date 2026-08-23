@@ -464,6 +464,10 @@ impl<R: BufRead> LosslessDecoder<R> {
         let huff_index = huffman_info.get_huff_index(0, 0);
         let mut tree = &huffman_info.huffman_code_groups[huff_index];
         let mut index = 0;
+        // Pixels in [last_cached, index) are decoded literals that have not yet
+        // been reflected into the VP8L color cache. Cache-coded pixels are not
+        // included because re-inserting a cache lookup cannot change its slot.
+        let mut last_cached = 0;
 
         let mut next_block_start = 0;
         while index < num_values {
@@ -502,10 +506,14 @@ impl<R: BufRead> LosslessDecoder<R> {
                         }
 
                         if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                            color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
+                            // Every pixel in this run is identical, so one insertion
+                            // produces the same final cache state as inserting all n.
                             color_cache.insert(value);
                         }
 
                         index += n;
+                        last_cached = index;
                         continue;
                     }
                 }
@@ -529,9 +537,6 @@ impl<R: BufRead> LosslessDecoder<R> {
                 data[index * 4 + 2] = blue;
                 data[index * 4 + 3] = alpha;
 
-                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                    color_cache.insert([red, green, blue, alpha]);
-                }
                 index += 1;
             } else if code < 256 + 24 {
                 //backward reference, so go back and use that to add image data
@@ -545,6 +550,14 @@ impl<R: BufRead> LosslessDecoder<R> {
                 if index < dist || num_values - index < length {
                     return Err(DecodingError::BitStreamError);
                 }
+
+                // A backreference itself does not observe the cache, but its
+                // optimized tail update assumes the cache already represents all
+                // pixels before `index`. Flush only pending literals here.
+                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                    color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
+                }
+                last_cached = index;
 
                 if dist == 1 {
                     let value: [u8; 4] = data[(index - dist) * 4..][..4].try_into().unwrap();
@@ -573,21 +586,33 @@ impl<R: BufRead> LosslessDecoder<R> {
                         // final occurrence of each phase is needed to reproduce the final cache.
                         let cache_pixels = length.min(dist);
                         let cache_start = index + length - cache_pixels;
-                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {
-                            color_cache.insert(pixel.try_into().unwrap());
-                        }
+                        color_cache.insert_pixels(
+                            &data[cache_start * 4..][..cache_pixels * 4],
+                        );
                     }
                 }
                 index += length;
+                // The dist==1 run repeats a color that was already represented in
+                // the cache; all other backreferences performed the optimized tail
+                // update above. Either way the cache is current through `index`.
+                last_cached = index;
             } else {
                 //color cache, so use previously stored pixels to get this pixel
                 let color_cache = huffman_info
                     .color_cache
                     .as_mut()
                     .ok_or(DecodingError::BitStreamError)?;
+                // This is the first operation that can observe cache state, so
+                // materialize the pending literal inserts immediately beforehand.
+                color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
+                last_cached = index;
+
                 let color = color_cache.lookup((code - 280).into());
                 data[index * 4..][..4].copy_from_slice(&color);
                 index += 1;
+                // A cache lookup hashes back to the slot it came from, so it does
+                // not need to be re-inserted later.
+                last_cached = index;
 
                 if index < next_block_start {
                     if let Some((bits, code)) = tree[GREEN].peek_symbol(&self.bit_reader) {
@@ -596,6 +621,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                             data[index * 4..][..4]
                                 .copy_from_slice(&color_cache.lookup((code - 280).into()));
                             index += 1;
+                            last_cached = index;
                         }
                     }
                 }
@@ -690,6 +716,14 @@ impl ColorCache {
             (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);
         let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);
         self.color_cache[index as usize] = color;
+    }
+
+    #[inline]
+    fn insert_pixels(&mut self, pixels: &[u8]) {
+        debug_assert_eq!(pixels.len() % 4, 0);
+        for pixel in pixels.chunks_exact(4) {
+            self.insert([pixel[0], pixel[1], pixel[2], pixel[3]]);
+        }
     }
 
     #[inline(always)]
