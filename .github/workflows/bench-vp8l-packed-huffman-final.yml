@@ -1,0 +1,185 @@
+name: Benchmark packed VP8L Huffman literals
+on:
+  push:
+    branches: [ bench-vp8l-packed-huffman-final ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          hp=Path('/tmp/cand/src/lossless/decoder/huffman.rs');h=hp.read_text()
+          marker='''    pub(crate) const fn is_single_node(&self) -> bool {\n        matches!(self.0, HuffmanTreeInner::Single(_))\n    }\n'''
+          add=r'''    pub(crate) fn max_code_bits(&self) -> u8 {
+        match &self.0 {
+            HuffmanTreeInner::Single(_) => 0,
+            HuffmanTreeInner::Tree { primary_table, .. } => primary_table
+                .iter()
+                .map(|entry| (entry >> 12) as u8)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    pub(crate) fn packed_lookup(&self, bits: u16) -> (u8, u16) {
+        match &self.0 {
+            HuffmanTreeInner::Single(symbol) => (0, *symbol),
+            HuffmanTreeInner::Tree { primary_table, table_mask, .. } => {
+                let entry = primary_table[usize::from(bits & *table_mask)];
+                let n = (entry >> 12) as u8;
+                debug_assert!(n <= MAX_TABLE_BITS);
+                (n, entry & 0xfff)
+            }
+        }
+    }
+
+'''
+          if marker not in h:raise SystemExit('huffman marker')
+          hp.write_text(h.replace(marker,add+marker,1))
+
+          mp=Path('/tmp/cand/src/lossless/decoder/mod.rs');m=mp.read_text()
+          marker='''type HuffmanCodeGroup = [HuffmanTree; HUFFMAN_CODES_PER_META_CODE];\n'''
+          add=r'''
+#[derive(Clone, Copy, Debug, Default)]
+struct PackedHuffmanEntry {
+    bits: u8,
+    code: u16,
+    rgba: u32,
+}
+
+'''
+          if marker not in m:raise SystemExit('type marker')
+          m=m.replace(marker,marker+add,1)
+          m=m.replace('''        let mut hufftree_groups = Vec::new();\n\n        for _i in 0..num_huff_groups {\n''','''        let mut hufftree_groups = Vec::new();\n        let mut packed_offsets = Vec::with_capacity(num_huff_groups as usize);\n        let mut packed_entries = Vec::new();\n\n        for _i in 0..num_huff_groups {\n''',1)
+          old='''            hufftree_groups.push(group);\n        }\n\n        let huffman_mask = if huffman_bits == 0 {\n'''
+          new=r'''            let max_literal_bits: u16 = group[..4]
+                .iter()
+                .map(|tree| u16::from(tree.max_code_bits()))
+                .sum();
+            let all_single = group[..4].iter().all(|tree| tree.is_single_node());
+            let packed_offset = if !all_single && max_literal_bits < 6 {
+                let offset = packed_entries.len();
+                for raw in 0u16..64 {
+                    let mut bits = raw;
+                    let (green_bits, green) = group[GREEN].packed_lookup(bits);
+                    bits >>= green_bits;
+                    if green >= 256 {
+                        packed_entries.push(PackedHuffmanEntry {
+                            bits: green_bits,
+                            code: green,
+                            rgba: 0,
+                        });
+                        continue;
+                    }
+                    let (red_bits, red) = group[RED].packed_lookup(bits);
+                    bits >>= red_bits;
+                    let (blue_bits, blue) = group[BLUE].packed_lookup(bits);
+                    bits >>= blue_bits;
+                    let (alpha_bits, alpha) = group[ALPHA].packed_lookup(bits);
+                    debug_assert!(red < 256 && blue < 256 && alpha < 256);
+                    packed_entries.push(PackedHuffmanEntry {
+                        bits: green_bits + red_bits + blue_bits + alpha_bits,
+                        code: green,
+                        rgba: u32::from_le_bytes([red as u8, green as u8, blue as u8, alpha as u8]),
+                    });
+                }
+                Some(offset)
+            } else {
+                None
+            };
+            packed_offsets.push(packed_offset);
+            hufftree_groups.push(group);
+        }
+
+        let huffman_mask = if huffman_bits == 0 {
+'''
+          if old not in m:raise SystemExit('group push marker')
+          m=m.replace(old,new,1)
+          m=m.replace('''            huffman_code_groups: hufftree_groups,\n        };\n''','''            huffman_code_groups: hufftree_groups,\n            packed_offsets,\n            packed_entries,\n        };\n''',1)
+          m=m.replace('''        let mut tree = &huffman_info.huffman_code_groups[huff_index];\n        let mut index = 0;\n''','''        let mut tree = &huffman_info.huffman_code_groups[huff_index];\n        let mut packed_offset = huffman_info.packed_offsets[huff_index];\n        let mut index = 0;\n''',1)
+          m=m.replace('''                tree = &huffman_info.huffman_code_groups[huff_index];\n\n                // Fast path''','''                tree = &huffman_info.huffman_code_groups[huff_index];\n                packed_offset = huffman_info.packed_offsets[huff_index];\n\n                // Fast path''',1)
+          old='''            let code = tree[GREEN].read_symbol(&mut self.bit_reader)?;\n\n            //check code\n            if code < 256 {\n'''
+          new=r'''            let code = if let Some(offset) = packed_offset {
+                let entry = huffman_info.packed_entries
+                    [offset + (self.bit_reader.peek_full() as usize & 63)];
+                self.bit_reader.consume(entry.bits)?;
+                if entry.code < 256 {
+                    let value = entry.rgba.to_le_bytes();
+                    data[index * 4..][..4].copy_from_slice(&value);
+                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                        color_cache.insert(value);
+                    }
+                    index += 1;
+                    continue;
+                }
+                entry.code
+            } else {
+                tree[GREEN].read_symbol(&mut self.bit_reader)?
+            };
+
+            //check code
+            if code < 256 {
+'''
+          if old not in m:raise SystemExit('decode marker')
+          m=m.replace(old,new,1)
+          m=m.replace('''    huffman_code_groups: Vec<HuffmanCodeGroup>,\n}\n''','''    huffman_code_groups: Vec<HuffmanCodeGroup>,\n    packed_offsets: Vec<Option<usize>>,\n    packed_entries: Vec<PackedHuffmanEntry>,\n}\n''',1)
+          mp.write_text(m)
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand && cargo fmt && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check && cargo +1.80.1 build -q)
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/ph.rs";(cd "$d"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example ph -q);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/ph;C=/tmp/cand/target/release/examples/ph
+          diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp)
+          : >/tmp/r.tsv;for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 70 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" t 4 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={};g={}
+          for w,r,v,x in rows:rr.setdefault((w,int(r)),{})[v]=float(x);g.setdefault((w,v),[]).append(float(x))
+          L=['# Packed VP8L Huffman-literal benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests/docs/Clippy/fmt/MSRV passed','','| workload | baseline | candidate | paired median | positive | range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+            q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {statistics.median(g[w,"base"]):.3f} us | {statistics.median(g[w,"cand"]):.3f} us | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-packed-huffman-final.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-packed-huffman-final.md
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-packed-huffman-final.md;git commit -m 'Record packed VP8L Huffman literals';git push origin HEAD:bench-vp8l-packed-huffman-final
