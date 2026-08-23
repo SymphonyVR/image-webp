@@ -1,0 +1,62 @@
+name: Benchmark VP8L libwebp single-group hoist
+on:
+  push:
+    branches: [ bench-vp8l-libwebp-single-group-v2 ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=2d4578f05c46f7d55060ec7384d8dac654107ba1
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''            if index >= next_block_start {\n                let x = index % usize::from(width);\n                let y = index / usize::from(width);\n                next_block_start = (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))\n                    + y * usize::from(width)\n                    + 1;\n\n                let huff_index = huffman_info.get_huff_index(x as u16, y as u16);\n                tree = &huffman_info.huffman_code_groups[huff_index];\n'''
+          new='''            if index >= next_block_start {\n                let huff_index = if huffman_info.bits == 0 {\n                    // libwebp keeps the sole group for the whole stream when\n                    // there is no meta-Huffman image.\n                    next_block_start = num_values;\n                    0\n                } else {\n                    let x = index % usize::from(width);\n                    let y = index / usize::from(width);\n                    next_block_start =\n                        (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))\n                            + y * usize::from(width)\n                            + 1;\n                    huffman_info.get_huff_index(x as u16, y as u16)\n                };\n                tree = &huffman_info.huffman_code_groups[huff_index];\n'''
+          if old not in s: raise SystemExit('group marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo doc -q&&cargo clippy --all-features -- -D warnings&&cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal;(cd /tmp/cand&&cargo +1.80.1 build -q)
+          echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            p=12;o=[]
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(1469598103934665603u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/sg2.rs";(cd "$d"&&cargo build --release --example sg2 -q);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/sg2;C=/tmp/cand/target/release/examples/sg2
+          diff -u <($B h 1 "${BF[@]}") <($C h 1 "${CF[@]}")
+          : >/tmp/r
+          for r in {1..21};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 100 "${F[@]}");printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,os,pathlib
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for r,v,x in R:g.setdefault(v,[]).append(float(x));rr.setdefault(int(r),{})[v]=float(x)
+          p=[z['base']/z['cand'] for _,z in sorted(rr.items())];b=statistics.median(g['base']);c=statistics.median(g['cand'])
+          pathlib.Path('benchmark-vp8l-libwebp-single-group-v2.md').write_text(f'# VP8L libwebp single-group benchmark\n\n- CPU: `{os.environ["CPU"]}`\n- hashes match; full verification passed\n\n| baseline | candidate | paired median | range |\n|---:|---:|---:|---:|\n| {b:.3f} us | {c:.3f} us | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |\n')
+          PY
+          cp /tmp/cand/src/lossless/decoder/mod.rs src/lossless/decoder/mod.rs;git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add src/lossless/decoder/mod.rs benchmark-vp8l-libwebp-single-group-v2.md;git commit -m 'Record libwebp single-group benchmark';git push origin HEAD:bench-vp8l-libwebp-single-group-v2
