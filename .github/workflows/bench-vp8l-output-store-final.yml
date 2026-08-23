@@ -1,0 +1,82 @@
+name: Benchmark VP8L output store shapes
+on:
+  push:
+    branches: [ bench-vp8l-output-store-final ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE";for v in literal fill both;do git worktree add --detach "/tmp/$v" "$BASE";done
+          cat >/tmp/patch.py <<'PY'
+          import sys
+          from pathlib import Path
+          v=sys.argv[1];p=Path(sys.argv[2])/'src/lossless/decoder/mod.rs';s=p.read_text()
+          if v in ('fill','both'):
+            old='''                        for i in 0..n {\n                            data[index * 4 + i * 4..][..4].copy_from_slice(&value);\n                        }\n'''
+            new='''                        for pixel in data[index * 4..(index + n) * 4].chunks_exact_mut(4) {\n                            pixel.copy_from_slice(&value);\n                        }\n'''
+            if old not in s:raise SystemExit('fill marker')
+            s=s.replace(old,new,1)
+          if v in ('literal','both'):
+            old='''                data[index * 4] = red;\n                data[index * 4 + 1] = green;\n                data[index * 4 + 2] = blue;\n                data[index * 4 + 3] = alpha;\n\n                if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                    color_cache.insert([red, green, blue, alpha]);\n                }\n'''
+            new='''                let value = [red, green, blue, alpha];\n                data[index * 4..][..4].copy_from_slice(&value);\n\n                if let Some(color_cache) = huffman_info.color_cache.as_mut() {\n                    color_cache.insert(value);\n                }\n'''
+            if old not in s:raise SystemExit('literal marker')
+            s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in literal fill both;do python3 /tmp/patch.py "$v" "/tmp/$v";(cd "/tmp/$v"&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q);done
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base literal fill both;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/store.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example store -q);done
+          mapfile -t BF </tmp/files.txt;B=/tmp/base/target/release/examples/store
+          for v in literal fill both;do CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done;C="/tmp/$v/target/release/examples/store";diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp);done
+          : >/tmp/r.tsv;for r in {1..13};do for v in base literal fill both;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X="/tmp/$v/target/release/examples/store";F=();for p in "${BF[@]}";do F+=("${p/\/tmp\/base/\/tmp\/$v}");done;fi;u=$(taskset -c 0 "$X" t 70 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" t 4 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={}
+          for w,r,v,x in rows:rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# VP8L output-store matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests + MSRV passed','','| workload | candidate | paired median | positive | range |','|---|---|---:|---:|---:|']
+          for w in ('corpus','large'):
+            for v in ('literal','fill','both'):
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {v} | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-output-store-final.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-output-store-final.md
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-output-store-final.md;git commit -m 'Record VP8L output stores';git push origin HEAD:bench-vp8l-output-store-final
