@@ -1,0 +1,54 @@
+name: Benchmark VP8L slice-backed input
+on:
+  push:
+    branches: [ bench-vp8l-slice-input ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=2d4578f05c46f7d55060ec7384d8dac654107ba1
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/decoder.rs');s=p.read_text()
+          old='''        } else if let Some(range) = self.chunks.get(&WebPRiffChunk::VP8L) {\n            let mut decoder = LosslessDecoder::new(range_reader(&mut self.r, range.clone())?);\n\n            if self.has_alpha {\n'''
+          new='''        } else if let Some(range) = self.chunks.get(&WebPRiffChunk::VP8L) {\n            // libwebp-style contiguous compressed input. The public reader remains generic;\n            // only the VP8L payload is staged into one slice for the entropy decoder.\n            let mut compressed = Vec::with_capacity((range.end - range.start) as usize);\n            range_reader(&mut self.r, range.clone())?.read_to_end(&mut compressed)?;\n            let mut decoder = LosslessDecoder::new(Cursor::new(compressed));\n\n            if self.has_alpha {\n'''
+          if old not in s: raise SystemExit('lossless input marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q)
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            p=12;o=[]
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/si.rs";(cd "$d"&&cargo build --release --example si -q);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/si;C=/tmp/cand/target/release/examples/si
+          diff -u <($B h 1 "${BF[@]}") <($C h 1 "${CF[@]}")
+          : >/tmp/r
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 100 "${F[@]}");printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for r,v,x in R:g.setdefault(v,[]).append(float(x));rr.setdefault(int(r),{})[v]=float(x)
+          p=[z['base']/z['cand'] for _,z in sorted(rr.items())];pathlib.Path('benchmark-vp8l-slice-input.md').write_text(f'# VP8L slice-input benchmark\n\n- paired median: **{statistics.median(p):.4f}x**\n- range: {min(p):.4f}–{max(p):.4f}x\n')
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-slice-input.md;git commit -m 'Record slice-input benchmark';git push origin HEAD:bench-vp8l-slice-input
