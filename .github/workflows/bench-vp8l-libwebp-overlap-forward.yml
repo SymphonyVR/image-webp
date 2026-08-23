@@ -1,0 +1,53 @@
+name: Benchmark VP8L libwebp overlap forward copy
+on:
+  push:
+    branches: [ bench-vp8l-libwebp-overlap-forward ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=2d4578f05c46f7d55060ec7384d8dac654107ba1
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''                } else {\n                    if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n                        data.copy_within(start..start + 16, index * 4);\n\n                        if length > 4 || dist < 4 {\n                            for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {\n                                data.copy_within(start + i..start + i + 16, index * 4 + i);\n                            }\n                        }\n                    } else {\n                        for i in 0..length * 4 {\n                            data[index * 4 + i] = data[index * 4 + i - dist * 4];\n                        }\n                    }\n\n'''
+          new='''                } else {\n                    // libwebp's scalar overlapping fallback copies one packed pixel\n                    // at a time. Preserve that dataflow safely with [u8; 4].\n                    for i in 0..length {\n                        let src = (index + i - dist) * 4;\n                        let value: [u8; 4] = data[src..src + 4].try_into().unwrap();\n                        data[(index + i) * 4..][..4].copy_from_slice(&value);\n                    }\n\n'''
+          if old not in s: raise SystemExit('overlap-copy marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q)
+          sudo apt-get update -qq;sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());r=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;r[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;r[i+1]=(x*2+y*7+((x*y)>>10))&255;r[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(r)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let a:Vec<_>=std::env::args().skip(1).collect();let x=std::fs::read(&a[1]).unwrap();if a[0]=="h"{println!("{:x}",h(&x));return}let n:usize=a[2].parse().unwrap();let t=Instant::now();for _ in 0..n{black_box(d(&x));}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/of.rs";(cd "$d"&&cargo build --release --example of -q);done
+          B=/tmp/base/target/release/examples/of;C=/tmp/cand/target/release/examples/of;test "$($B h /tmp/large.webp 1)" = "$($C h /tmp/large.webp 1)"
+          : >/tmp/r
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;u=$(taskset -c 0 "$X" t /tmp/large.webp 3);printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));rr={}
+          for r,v,x in R:rr.setdefault(int(r),{})[v]=float(x)
+          p=[z['base']/z['cand'] for _,z in sorted(rr.items())];pathlib.Path('benchmark-vp8l-libwebp-overlap-forward.md').write_text(f'# VP8L overlap-forward benchmark\n\n- paired median: **{statistics.median(p):.4f}x**\n- range: {min(p):.4f}–{max(p):.4f}x\n')
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-libwebp-overlap-forward.md;git commit -m 'Record overlap-forward benchmark';git push origin HEAD:bench-vp8l-libwebp-overlap-forward
