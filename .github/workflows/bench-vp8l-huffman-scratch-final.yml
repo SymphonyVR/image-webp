@@ -1,0 +1,102 @@
+name: Benchmark VP8L Huffman scratch reuse
+on:
+  push:
+    branches: [ bench-vp8l-huffman-scratch-final ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE";for v in reuse reserve reuse_sorted all;do git worktree add --detach "/tmp/$v" "$BASE";done
+          cat >/tmp/patch.py <<'PY'
+          import sys
+          from pathlib import Path
+          v=sys.argv[1];root=Path(sys.argv[2]);hp=root/'src/lossless/decoder/huffman.rs';mp=root/'src/lossless/decoder/mod.rs';h=hp.read_text();m=mp.read_text()
+          def slice_build():
+            global h
+            h=h.replace('pub(crate) fn build_implicit(code_lengths: Vec<u16>) -> Result<Self, DecodingError> {','pub(crate) fn build_implicit(code_lengths: &[u16]) -> Result<Self, DecodingError> {',1)
+          def sorted_stack():
+            global h
+            old='''        let mut next_index = offsets;\n        let mut sorted_symbols = vec![0u16; code_lengths.len()];\n        for symbol in 0..code_lengths.len() {\n'''
+            new='''        let mut next_index = offsets;\n        let mut sorted_stack = [0u16; 512];\n        let mut sorted_heap = Vec::new();\n        let sorted_symbols: &mut [u16] = if code_lengths.len() <= sorted_stack.len() {\n            &mut sorted_stack[..code_lengths.len()]\n        } else {\n            sorted_heap.resize(code_lengths.len(), 0);\n            sorted_heap.as_mut_slice()\n        };\n        for symbol in 0..code_lengths.len() {\n'''
+            if old not in h:raise SystemExit('sorted marker')
+            h=h.replace(old,new,1)
+          def reuse():
+            global h,m
+            slice_build()
+            m=m.replace('let mut hufftree_groups = Vec::new();','let mut hufftree_groups = Vec::new();\n        let mut code_lengths_scratch = Vec::new();',1)
+            m=m.replace('let tree = self.read_huffman_code(alphabet_size)?;','let tree = self.read_huffman_code(alphabet_size, &mut code_lengths_scratch)?;',1)
+            m=m.replace('fn read_huffman_code(&mut self, alphabet_size: u16) -> Result<HuffmanTree, DecodingError> {','fn read_huffman_code(&mut self, alphabet_size: u16, code_lengths_scratch: &mut Vec<u16>) -> Result<HuffmanTree, DecodingError> {',1)
+            m=m.replace('let mut code_length_code_lengths = vec![0; CODE_LENGTH_CODES];','let mut code_length_code_lengths = [0u16; CODE_LENGTH_CODES];',1)
+            old='''            let new_code_lengths =\n                self.read_huffman_code_lengths(code_length_code_lengths, alphabet_size)?;\n\n            HuffmanTree::build_implicit(new_code_lengths)\n'''
+            new='''            self.read_huffman_code_lengths(&code_length_code_lengths, alphabet_size, code_lengths_scratch)?;\n            HuffmanTree::build_implicit(code_lengths_scratch.as_slice())\n'''
+            if old not in m:raise SystemExit('read code marker')
+            m=m.replace(old,new,1)
+            m=m.replace('''        code_length_code_lengths: Vec<u16>,\n        num_symbols: u16,\n    ) -> Result<Vec<u16>, DecodingError> {\n        let table = HuffmanTree::build_implicit(code_length_code_lengths)?;''','''        code_length_code_lengths: &[u16],\n        num_symbols: u16,\n        code_lengths: &mut Vec<u16>,\n    ) -> Result<(), DecodingError> {\n        let table = HuffmanTree::build_implicit(code_length_code_lengths)?;''',1)
+            m=m.replace('''        let mut code_lengths = vec![0; usize::from(num_symbols)];\n        let mut prev_code_len = 8; //default code length\n''','''        code_lengths.clear();\n        code_lengths.resize(usize::from(num_symbols), 0);\n        let mut prev_code_len = 8; //default code length\n''',1)
+            m=m.replace('''        Ok(code_lengths)\n    }\n\n    /// Decodes and returns a single huffman tree''','''        Ok(())\n    }\n\n    /// Decodes and returns a single huffman tree''',1)
+          if v in ('reuse','reuse_sorted','all'):reuse()
+          if v in ('reuse_sorted','all'):sorted_stack()
+          if v in ('reserve','all'):
+            old='let mut hufftree_groups = Vec::new();'
+            new='let mut hufftree_groups = Vec::with_capacity(num_huff_groups as usize);'
+            if old not in m:raise SystemExit('reserve marker')
+            m=m.replace(old,new,1)
+          hp.write_text(h);mp.write_text(m)
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in reuse reserve reuse_sorted all;do python3 /tmp/patch.py "$v" "/tmp/$v";(cd "/tmp/$v"&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q);done
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base reuse reserve reuse_sorted all;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/hs.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example hs -q);done
+          mapfile -t BF </tmp/files.txt;B=/tmp/base/target/release/examples/hs
+          for v in reuse reserve reuse_sorted all;do CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done;C="/tmp/$v/target/release/examples/hs";diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp);done
+          : >/tmp/r.tsv;for r in {1..13};do for v in base reuse reserve reuse_sorted all;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X="/tmp/$v/target/release/examples/hs";F=();for p in "${BF[@]}";do F+=("${p/\/tmp\/base/\/tmp\/$v}");done;fi;u=$(taskset -c 0 "$X" t 70 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" t 4 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={}
+          for w,r,v,x in rows:rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# VP8L Huffman scratch matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests + MSRV passed','','| workload | candidate | paired median | positive | range |','|---|---|---:|---:|---:|']
+          for w in ('corpus','large'):
+            for v in ('reuse','reserve','reuse_sorted','all'):
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {v} | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-huffman-scratch-final.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-huffman-scratch-final.md
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-huffman-scratch-final.md;git commit -m 'Record VP8L Huffman scratch matrix';git push origin HEAD:bench-vp8l-huffman-scratch-final
