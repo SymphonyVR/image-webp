@@ -464,6 +464,9 @@ impl<R: BufRead> LosslessDecoder<R> {
         let huff_index = huffman_info.get_huff_index(0, 0);
         let mut tree = &huffman_info.huffman_code_groups[huff_index];
         let mut index = 0;
+        // Match libwebp's last_cached strategy: decoded pixels are only
+        // inserted when a cache lookup can observe the cache state.
+        let mut last_cached = 0usize;
 
         let mut next_block_start = 0;
         while index < num_values {
@@ -501,10 +504,6 @@ impl<R: BufRead> LosslessDecoder<R> {
                             data[index * 4 + i * 4..][..4].copy_from_slice(&value);
                         }
 
-                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                            color_cache.insert(value);
-                        }
-
                         index += n;
                         continue;
                     }
@@ -529,9 +528,6 @@ impl<R: BufRead> LosslessDecoder<R> {
                 data[index * 4 + 2] = blue;
                 data[index * 4 + 3] = alpha;
 
-                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                    color_cache.insert([red, green, blue, alpha]);
-                }
                 index += 1;
             } else if code < 256 + 24 {
                 //backward reference, so go back and use that to add image data
@@ -566,21 +562,17 @@ impl<R: BufRead> LosslessDecoder<R> {
                             data[index * 4 + i] = data[index * 4 + i - dist * 4];
                         }
                     }
-
-                    if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                        // The cache is unobservable while a backreference is copied. For an
-                        // overlapping copy, output is periodic with period `dist`, so only the
-                        // final occurrence of each phase is needed to reproduce the final cache.
-                        let cache_pixels = length.min(dist);
-                        let cache_start = index + length - cache_pixels;
-                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {
-                            color_cache.insert(pixel.try_into().unwrap());
-                        }
-                    }
                 }
                 index += length;
             } else {
-                //color cache, so use previously stored pixels to get this pixel
+                // Color-cache state is only observable at a cache lookup. Bring it
+                // up to date in one tight pass, like libwebp's `last_cached`.
+                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                    for pixel in data[last_cached * 4..index * 4].chunks_exact(4) {
+                        color_cache.insert(pixel.try_into().unwrap());
+                    }
+                    last_cached = index;
+                }
                 let color_cache = huffman_info
                     .color_cache
                     .as_mut()
