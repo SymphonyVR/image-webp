@@ -1,0 +1,157 @@
+name: Benchmark VP8L color scalar candidates
+
+on:
+  push:
+    branches: [ bench-vp8l-color-scalar-matrix ]
+    paths: [ .github/workflows/bench-vp8l-color-scalar-matrix.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt }
+
+      - name: Build scalar candidates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          for v in hoist signed incremental combined exact; do git worktree add --detach "/tmp/$v" "$BASE"; done
+
+          cat >/tmp/patch.py <<'PY'
+          import sys
+          from pathlib import Path
+          variant=sys.argv[1]
+          p=Path(sys.argv[2])/'src/lossless/decoder/reverse_transform.rs'
+          s=p.read_text()
+          a=s.index('pub(crate) fn apply_color_transform(')
+          b=s.index('\npub(crate) fn apply_subtract_green_transform',a)
+
+          def body(arith='orig', incremental=False, exact=False):
+              pre='''pub(crate) fn apply_color_transform(\n    image_data: &mut [u8],\n    width: u16,\n    size_bits: u8,\n    transform_data: &[u8],\n) {\n    let block_xsize = usize::from(subsample_size(width, size_bits));\n    let width = usize::from(width);\n    let block_bytes = 4usize << size_bits;\n'''
+              if incremental:
+                  pre += '''    let tile_mask = (1usize << size_bits) - 1;\n    let mut row_transform_data_start = 0usize;\n\n'''
+              pre += '''    for (y, row) in image_data.chunks_exact_mut(width * 4).enumerate() {\n'''
+              if incremental:
+                  pre += '''        let row_tf_data = &transform_data[row_transform_data_start..];\n'''
+              else:
+                  pre += '''        let row_transform_data_start = (y >> size_bits) * block_xsize * 4;\n        let row_tf_data = &transform_data[row_transform_data_start..];\n'''
+
+              if arith=='orig':
+                  pix='''            let red_to_blue = transform[0];\n            let green_to_blue = transform[1];\n            let green_to_red = transform[2];\n\n            for pixel in block.chunks_exact_mut(4) {\n                let green = u32::from(pixel[1]);\n                let mut temp_red = u32::from(pixel[0]);\n                let mut temp_blue = u32::from(pixel[2]);\n\n                temp_red += color_transform_delta(green_to_red as i8, green as i8);\n                temp_blue += color_transform_delta(green_to_blue as i8, green as i8);\n                temp_blue += color_transform_delta(red_to_blue as i8, temp_red as i8);\n\n                pixel[0] = (temp_red & 0xff) as u8;\n                pixel[2] = (temp_blue & 0xff) as u8;\n            }\n'''
+              elif arith=='hoist':
+                  pix='''            let red_to_blue = transform[0] as i8;\n            let green_to_blue = transform[1] as i8;\n            let green_to_red = transform[2] as i8;\n\n            for pixel in block.chunks_exact_mut(4) {\n                let green = u32::from(pixel[1]);\n                let mut temp_red = u32::from(pixel[0]);\n                let mut temp_blue = u32::from(pixel[2]);\n\n                temp_red += color_transform_delta(green_to_red, green as i8);\n                temp_blue += color_transform_delta(green_to_blue, green as i8);\n                temp_blue += color_transform_delta(red_to_blue, temp_red as i8);\n\n                pixel[0] = (temp_red & 0xff) as u8;\n                pixel[2] = (temp_blue & 0xff) as u8;\n            }\n'''
+              else:
+                  pix='''            let red_to_blue = i32::from(transform[0] as i8);\n            let green_to_blue = i32::from(transform[1] as i8);\n            let green_to_red = i32::from(transform[2] as i8);\n\n            for pixel in block.chunks_exact_mut(4) {\n                let green = i32::from(pixel[1] as i8);\n                let red = pixel[0].wrapping_add(((green_to_red * green) >> 5) as u8);\n                let mut blue = pixel[2].wrapping_add(((green_to_blue * green) >> 5) as u8);\n                blue = blue.wrapping_add(((red_to_blue * i32::from(red as i8)) >> 5) as u8);\n                pixel[0] = red;\n                pixel[2] = blue;\n            }\n'''
+
+              if exact:
+                  loop='''        let mut blocks = row.chunks_exact_mut(block_bytes);\n        let mut transforms = row_tf_data.chunks_exact(4);\n        for (block, transform) in (&mut blocks).zip(&mut transforms) {\n''' + pix + '''        }\n        let rem = blocks.into_remainder();\n        if !rem.is_empty() {\n            if let Some(transform) = transforms.next() {\n                let block = rem;\n''' + ''.join('                '+line+'\n' for line in pix.splitlines()) + '''            }\n        }\n'''
+              else:
+                  loop='''        for (block, transform) in row.chunks_mut(block_bytes).zip(row_tf_data.chunks_exact(4)) {\n''' + pix + '''        }\n'''
+              post=''
+              if incremental:
+                  post='''        if ((y + 1) & tile_mask) == 0 {\n            row_transform_data_start += block_xsize * 4;\n        }\n'''
+              return pre+loop+post+'    }\n}\n'
+
+          if variant=='hoist': new=body('hoist',False,False)
+          elif variant=='signed': new=body('signed',False,False)
+          elif variant=='incremental': new=body('orig',True,False)
+          elif variant=='combined': new=body('signed',True,False)
+          elif variant=='exact': new=body('signed',True,True)
+          else: raise SystemExit(variant)
+          p.write_text(s[:a]+new+s[b:])
+          PY
+
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in hoist signed incremental combined exact; do
+            python3 /tmp/patch.py "$v" "/tmp/$v"
+            (cd "/tmp/$v" && cargo fmt && cargo test -q && cargo +1.80.1 build -q)
+          done
+
+      - name: Prepare workloads and binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data)<12 or data[:4]!=b'RIFF' or data[8:12]!=b'WEBP': return []
+              out=[];p=12
+              while p+8<=len(data):
+                  f=data[p:p+4];n=int.from_bytes(data[p+4:p+8],'little');out.append(f);p+=8+n+(n&1)
+              return out
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+              c=chunks(p.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: print(p)
+          PY
+          sudo apt-get update -qq
+          sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+              f.write(f'P6\n{w} {h}\n255\n'.encode()); row=bytearray(w*3)
+              for y in range(h):
+                  for x in range(w):
+                      i=x*3; row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255; row[i+1]=(x*2+y*7+((x*y)>>10))&255; row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+                  f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn image(d:&[u8])->Vec<u8>{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b}
+          fn hash(d:&[u8])->u64{image(d).iter().fold(1469598103934665603u64,|h,&b|(h^u64::from(b)).wrapping_mul(1099511628211))}
+          fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="hash"{for d in&ds{println!("{:016x}",hash(d))}return}for d in&ds{black_box(image(d));}let t=Instant::now();for _ in 0..n{for d in&ds{black_box(image(d));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base hoist signed incremental combined exact; do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/color_matrix.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example color_matrix -q);done
+
+      - name: Verify and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt
+          B=/tmp/base/target/release/examples/color_matrix
+          for v in hoist signed incremental combined exact; do
+            CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done
+            C="/tmp/$v/target/release/examples/color_matrix"
+            diff -u <($B hash 1 "${BF[@]}" /tmp/large.webp) <($C hash 1 "${CF[@]}" /tmp/large.webp)
+          done
+          : >/tmp/r.tsv
+          for r in {1..13};do
+            for v in base hoist signed incremental combined exact;do
+              if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X="/tmp/$v/target/release/examples/color_matrix";F=();for p in "${BF[@]}";do F+=("${p/\/tmp\/base/\/tmp\/$v}");done;fi
+              u=$(taskset -c 0 "$X" bench 60 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+              u=$(taskset -c 0 "$X" bench 3 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+            done
+          done
+          python3 - <<'PY'
+          import csv,statistics,os
+          from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          vs=['hoist','signed','incremental','combined','exact']
+          lines=['# VP8L color scalar matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- all candidates: VP8L hashes match, cargo test passes, MSRV 1.80.1 builds','','| workload | candidate | base median | candidate median | paired median | positive rounds | range |','|---|---|---:|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+            for v in vs:
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w]
+              lines.append(f'| {w} | {v} | {statistics.median(g[w,"base"]):.3f} us | {statistics.median(g[w,v]):.3f} us | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-color-scalar-matrix.md').write_text('\n'.join(lines+['']))
+          PY
+          cat benchmark-vp8l-color-scalar-matrix.md
+
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-color-scalar-matrix.md
+          git commit -m 'Record VP8L color scalar matrix'
+          git push origin HEAD:bench-vp8l-color-scalar-matrix
