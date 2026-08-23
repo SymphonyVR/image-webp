@@ -1,0 +1,180 @@
+name: Benchmark secondary VP8L transforms
+
+on:
+  push:
+    branches: [ bench-vp8l-secondary-transform-matrix ]
+    paths: [ .github/workflows/bench-vp8l-secondary-transform-matrix.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt }
+      - name: Build candidates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          for v in green palette-noscratch palette-stack palette-both all;do git worktree add --detach "/tmp/$v" "$BASE";done
+          cat >/tmp/patch.py <<'PY'
+          import sys
+          from pathlib import Path
+          v=sys.argv[1];p=Path(sys.argv[2])/'src/lossless/decoder/reverse_transform.rs';s=p.read_text()
+          if v in ('green','all'):
+            a=s.index('pub(crate) fn apply_subtract_green_transform(');b=s.index('\npub(crate) fn apply_color_indexing_transform(',a)
+            new='''pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
+    for pixel in image_data.chunks_exact_mut(4) {
+        let value = u32::from_le_bytes(pixel.try_into().unwrap());
+        let green = (value >> 8) & 0xff;
+        let red_blue = ((value & 0x00ff00ff).wrapping_add(green | (green << 16))) & 0x00ff00ff;
+        pixel.copy_from_slice(&((value & 0xff00ff00) | red_blue).to_le_bytes());
+    }
+}
+'''
+            s=s[:a]+new+s[b:]
+          if v in ('palette-stack','palette-both','all'):
+            old='''    let expanded_lookup_table_storage: Vec<[u8; EXP_ENTRY_SIZE]> = (0..256u16)
+        .map(|packed_byte_value_u16| {
+            let mut entry_pixels_array = [0u8; EXP_ENTRY_SIZE]; // Uses const generic
+            let packed_byte_value = packed_byte_value_u16 as u8;
+
+            // Loop bound is effectively constant for each instantiation.
+            for pixel_sub_index in 0..pixels_per_packed_byte_usize {
+                let shift_amount = (pixel_sub_index as u8) * bits_per_entry_u8;
+                let k = (packed_byte_value >> shift_amount) & mask_u8;
+
+                let color_source_array: [u8; 4] = if k < table_size {
+                    let color_data_offset = usize::from(k) * 4;
+                    table_data[color_data_offset..color_data_offset + 4]
+                        .try_into()
+                        .unwrap()
+                } else {
+                    [0u8; 4] // WebP spec: out-of-bounds indices are [0,0,0,0]
+                };
+
+                let array_fill_offset = pixel_sub_index * 4;
+                entry_pixels_array[array_fill_offset..array_fill_offset + 4]
+                    .copy_from_slice(&color_source_array);
+            }
+            entry_pixels_array
+        })
+        .collect();
+
+    let expanded_lookup_table_array: &[[u8; EXP_ENTRY_SIZE]; 256] =
+        expanded_lookup_table_storage.as_slice().try_into().unwrap();
+'''
+            new='''    let mut expanded_lookup_table_array = [[0u8; EXP_ENTRY_SIZE]; 256];
+    for (packed_byte_value, entry_pixels_array) in expanded_lookup_table_array.iter_mut().enumerate() {
+        let packed_byte_value = packed_byte_value as u8;
+        for pixel_sub_index in 0..pixels_per_packed_byte_usize {
+            let shift_amount = (pixel_sub_index as u8) * bits_per_entry_u8;
+            let k = (packed_byte_value >> shift_amount) & mask_u8;
+            let color_source_array: [u8; 4] = if k < table_size {
+                let color_data_offset = usize::from(k) * 4;
+                table_data[color_data_offset..color_data_offset + 4].try_into().unwrap()
+            } else {
+                [0u8; 4]
+            };
+            let array_fill_offset = pixel_sub_index * 4;
+            entry_pixels_array[array_fill_offset..array_fill_offset + 4].copy_from_slice(&color_source_array);
+        }
+    }
+'''
+            if old not in s:raise SystemExit('palette stack marker missing')
+            s=s.replace(old,new,1)
+          if v in ('palette-noscratch','palette-both','all'):
+            a=s.index('    let mut packed_indices_for_row: Vec<u8> = vec![0; packed_image_width_in_blocks];')
+            b=s.index('\n}\n\n//predictor functions',a)
+            old=s[a:b]
+            new='''    for y_rev_idx in 0..height as usize {
+        let y = height as usize - 1 - y_rev_idx;
+        let packed_row_input_global_offset = y * input_stride_bytes_packed;
+        let output_row_global_offset = y * output_stride_bytes_expanded;
+
+        for block_index in (0..packed_image_width_in_blocks).rev() {
+            let packed_index = image_data[packed_row_input_global_offset + block_index * 4 + 1];
+            let output_offset = output_row_global_offset + block_index * EXP_ENTRY_SIZE;
+            let copy_len = if block_index + 1 == packed_image_width_in_blocks {
+                final_block_expanded_size_bytes
+            } else {
+                EXP_ENTRY_SIZE
+            };
+            image_data[output_offset..output_offset + copy_len]
+                .copy_from_slice(&expanded_lookup_table_array[packed_index as usize][..copy_len]);
+        }
+    }
+'''
+            s=s[:a]+new+s[b:]
+          p.write_text(s)
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in green palette-noscratch palette-stack palette-both all;do python3 /tmp/patch.py "$v" "/tmp/$v";(cd "/tmp/$v"&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q);done
+      - name: Prepare workloads
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/palette.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3);colors=[(10,20,30),(230,40,80),(20,220,60),(80,90,240),(240,210,20),(160,30,200),(30,200,210),(245,245,245)]
+            for y in range(h):
+              for x in range(w):
+                c=colors[((x>>5)+(y>>5)*3)&7];i=x*3;row[i:i+3]=bytes(c)
+              f.write(row)
+          with open('/tmp/green.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                g=(x*3+y*5+((x>>4)^(y>>4))*7)&255;i=x*3;row[i]=g;row[i+1]=g;row[i+2]=g
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/palette.ppm -o /tmp/palette.webp
+          cwebp -quiet -lossless -z 9 /tmp/green.ppm -o /tmp/green.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn image(d:&[u8])->Vec<u8>{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b}fn hash(d:&[u8])->u64{image(d).iter().fold(1469598103934665603u64,|h,&b|(h^u64::from(b)).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="hash"{for d in&ds{println!("{:016x}",hash(d))}return}for d in&ds{black_box(image(d));}let t=Instant::now();for _ in 0..n{for d in&ds{black_box(image(d));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base green palette-noscratch palette-stack palette-both all;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/secondary.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example secondary -q);done
+      - name: Verify and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt;B=/tmp/base/target/release/examples/secondary
+          for v in green palette-noscratch palette-stack palette-both all;do CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done;C="/tmp/$v/target/release/examples/secondary";diff -u <($B hash 1 "${BF[@]}" /tmp/palette.webp /tmp/green.webp) <($C hash 1 "${CF[@]}" /tmp/palette.webp /tmp/green.webp);done
+          : >/tmp/r.tsv
+          for r in {1..11};do for v in base green palette-noscratch palette-stack palette-both all;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X="/tmp/$v/target/release/examples/secondary";F=();for p in "${BF[@]}";do F+=("${p/\/tmp\/base/\/tmp\/$v}");done;fi;u=$(taskset -c 0 "$X" bench 50 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench 3 /tmp/palette.webp);printf 'palette\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench 3 /tmp/green.webp);printf 'green\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os
+          from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          vs=['green','palette-noscratch','palette-stack','palette-both','all'];lines=['# VP8L secondary-transform matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- all candidates: hashes match, cargo test passes, MSRV 1.80.1 builds','','| workload | candidate | base median | candidate median | paired median | positive | range |','|---|---|---:|---:|---:|---:|---:|']
+          for w in ('corpus','palette','green'):
+            for v in vs:
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];lines.append(f'| {w} | {v} | {statistics.median(g[w,"base"]):.3f} us | {statistics.median(g[w,v]):.3f} us | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-secondary-transform-matrix.md').write_text('\n'.join(lines+['']))
+          PY
+          cat benchmark-vp8l-secondary-transform-matrix.md
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-secondary-transform-matrix.md;git commit -m 'Record VP8L secondary transform matrix';git push origin HEAD:bench-vp8l-secondary-transform-matrix
