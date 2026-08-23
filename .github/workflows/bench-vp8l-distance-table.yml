@@ -1,0 +1,149 @@
+name: Benchmark VP8L plane-distance table
+
+on:
+  push:
+    branches: [ bench-vp8l-distance-table ]
+    paths: [ .github/workflows/bench-vp8l-distance-table.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+
+      - name: Build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$BASE"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('/tmp/cand/src/lossless/decoder/mod.rs')
+          s = p.read_text()
+          old = '''        let num_values = usize::from(width) * usize::from(height);\n\n        let huff_index = huffman_info.get_huff_index(0, 0);\n'''
+          new = '''        let num_values = usize::from(width) * usize::from(height);\n        let plane_distances = Self::build_plane_distances(width);\n\n        let huff_index = huffman_info.get_huff_index(0, 0);\n'''
+          if old not in s:
+              raise SystemExit('decode marker missing')
+          s = s.replace(old, new, 1)
+
+          old = '''                let dist = Self::plane_code_to_distance(width, dist_code);\n'''
+          new = '''                let dist = if dist_code > 120 {\n                    dist_code - 120\n                } else {\n                    plane_distances[dist_code - 1]\n                };\n'''
+          if old not in s:
+              raise SystemExit('distance call missing')
+          s = s.replace(old, new, 1)
+
+          a = s.index('    /// Gets distance to pixel\n    fn plane_code_to_distance(')
+          b = s.index('\n    }\n}', a) + len('\n    }')
+          replacement = '''    /// Precomputes the width-dependent spatial distance codes for this stream.\n    fn build_plane_distances(xsize: u16) -> [usize; 120] {\n        std::array::from_fn(|index| {\n            let (xoffset, yoffset) = DISTANCE_MAP[index];\n            let dist = i32::from(xoffset) + i32::from(yoffset) * i32::from(xsize);\n            if dist < 1 {\n                1\n            } else {\n                dist as usize\n            }\n        })\n    }'''
+          s = s[:a] + replacement + s[b:]
+          p.write_text(s)
+          PY
+
+          (
+            cd /tmp/cand
+            cargo fmt
+            cargo test -q
+            cargo doc -q
+            cargo clippy --all-features -- -D warnings
+            cargo fmt -- --check
+          )
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand && cargo +1.80.1 build -q)
+
+      - name: Prepare workloads
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data) < 12 or data[:4] != b'RIFF' or data[8:12] != b'WEBP': return []
+              out=[]; p=12
+              while p+8 <= len(data):
+                  fourcc=data[p:p+4]; n=int.from_bytes(data[p+4:p+8], 'little')
+                  out.append(fourcc); p += 8+n+(n&1)
+              return out
+          for path in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+              c=chunks(path.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: print(path)
+          PY
+
+          sudo apt-get update -qq
+          sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+              f.write(f'P6\n{w} {h}\n255\n'.encode()); row=bytearray(w*3)
+              for y in range(h):
+                  for x in range(w):
+                      i=x*3
+                      row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255
+                      row[i+1]=(x*2+y*7+((x*y)>>10))&255
+                      row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+                  f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::{hint::black_box,io::Cursor,time::Instant};
+          fn image(d:&[u8])->Vec<u8>{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b}
+          fn hash(d:&[u8])->u64{image(d).iter().fold(1469598103934665603u64,|h,&b|(h^u64::from(b)).wrapping_mul(1099511628211))}
+          fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="hash"{for d in&ds{println!("{:016x}",hash(d))}return}for d in&ds{black_box(image(d));}let t=Instant::now();for _ in 0..n{for d in&ds{black_box(image(d));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand; do
+            mkdir -p "$d/examples"; cp /tmp/b.rs "$d/examples/distance_table.rs"
+            (cd "$d" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example distance_table -q)
+          done
+
+      - name: Verify and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt
+          CF=(); for p in "${BF[@]}"; do CF+=("${p/\/tmp\/base/\/tmp\/cand}"); done
+          B=/tmp/base/target/release/examples/distance_table
+          C=/tmp/cand/target/release/examples/distance_table
+          diff -u <($B hash 1 "${BF[@]}" /tmp/large.webp) <($C hash 1 "${CF[@]}" /tmp/large.webp)
+          : >/tmp/r.tsv
+          for r in {1..17}; do
+            if ((r%2)); then ORDER='base cand'; else ORDER='cand base'; fi
+            for v in $ORDER; do
+              if [[ $v == base ]]; then X=$B; F=("${BF[@]}"); else X=$C; F=("${CF[@]}"); fi
+              u=$(taskset -c 0 "$X" bench 80 "${F[@]}"); printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u" >>/tmp/r.tsv
+              u=$(taskset -c 0 "$X" bench 3 /tmp/large.webp); printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u" >>/tmp/r.tsv
+            done
+          done
+          python3 - <<'PY'
+          import csv,statistics,os
+          from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t')); g={}; rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          lines=['# VP8L precomputed plane-distance benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests/docs/Clippy/fmt/MSRV 1.80.1 passed','','| workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+              b=statistics.median(g[w,'base']); c=statistics.median(g[w,'cand']); q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w]
+              lines.append(f'| {w} | {b:.3f} us | {c:.3f} us | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-distance-table.md').write_text('\n'.join(lines+['']))
+          PY
+          cat benchmark-vp8l-distance-table.md
+
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-distance-table.md
+          git commit -m 'Record VP8L plane-distance benchmark'
+          git push origin HEAD:bench-vp8l-distance-table
