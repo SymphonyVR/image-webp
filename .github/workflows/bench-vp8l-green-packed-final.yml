@@ -1,0 +1,81 @@
+name: Benchmark packed subtract-green
+on:
+  push:
+    branches: [ bench-vp8l-green-packed-final ]
+    paths: [ .github/workflows/bench-vp8l-green-packed-final.yml ]
+permissions: { contents: write }
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/reverse_transform.rs');s=p.read_text();a=s.index('pub(crate) fn apply_subtract_green_transform(');b=s.index('\npub(crate) fn apply_color_indexing_transform(',a)
+          new='''pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
+    for pixel in image_data.chunks_exact_mut(4) {
+        let value = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+        let green = (value >> 8) & 0xff;
+        let red_blue = ((value & 0x00ff00ff).wrapping_add(green | (green << 16))) & 0x00ff00ff;
+        pixel.copy_from_slice(&((value & 0xff00ff00) | red_blue).to_le_bytes());
+    }
+}
+'''
+          p.write_text(s[:a]+new+s[b:])
+          PY
+          rustup toolchain install 1.80.1 --profile minimal;cd /tmp/cand;cargo fmt;cargo test -q;cargo doc -q;cargo clippy --all-features -- -D warnings;cargo fmt -- --check;cargo +1.80.1 build -q
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/green.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());r=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                g=(x*3+y*5+((x>>4)^(y>>4))*7)&255;i=x*3;r[i]=g;r[i+1]=g;r[i+2]=g
+              f.write(r)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/green.ppm -o /tmp/green.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/gpf.rs";(cd "$d"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example gpf -q);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/gpf;C=/tmp/cand/target/release/examples/gpf;diff -u <($B h 1 "${BF[@]}" /tmp/green.webp) <($C h 1 "${CF[@]}" /tmp/green.webp)
+          : >/tmp/r.tsv;for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 60 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" t 4 /tmp/green.webp);printf 'green\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          R=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={}
+          for w,r,v,x in R:rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# Final VP8L packed subtract-green benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + full verification passed','','| workload | paired median | positive | range |','|---|---:|---:|---:|']
+          for w in ('corpus','green'):
+            q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-green-packed-final.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-green-packed-final.md
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail;git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-green-packed-final.md;git commit -m 'Record final packed subtract-green';git push origin HEAD:bench-vp8l-green-packed-final
