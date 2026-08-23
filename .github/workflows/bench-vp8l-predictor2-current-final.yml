@@ -1,0 +1,100 @@
+name: Confirm predictor-2 on current VP8L tree
+
+on:
+  push:
+    branches: [ bench-vp8l-predictor2-current-final ]
+    paths: [ .github/workflows/bench-vp8l-predictor2-current-final.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Prepare variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/reverse_transform.rs')
+          s=p.read_text()
+          old='''pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {\n    assert!(range.end <= image_data.len());\n    let mut i = range.start;\n    while i < range.end {\n        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4]);\n        i += 1;\n    }\n}\n'''
+          new='''pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {\n    assert!(range.end <= image_data.len());\n    let len = range.end - range.start;\n    let (previous_rows, current) = image_data[..range.end].split_at_mut(range.start);\n    let top = &previous_rows[range.start - width * 4..][..len];\n    for (pixel, top) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)) {\n        pixel[0] = pixel[0].wrapping_add(top[0]);\n        pixel[1] = pixel[1].wrapping_add(top[1]);\n        pixel[2] = pixel[2].wrapping_add(top[2]);\n        pixel[3] = pixel[3].wrapping_add(top[3]);\n    }\n}\n'''
+          if old not in s: raise SystemExit('predictor2 marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/cand && cargo fmt && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal
+          (cd /tmp/cand && cargo +1.80.1 build -q)
+      - name: Prepare benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP': return []
+            out=[];p=12
+            while p+8<=len(d):
+              f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');out.append(f);p+=8+n+(n&1)
+            return out
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c: print(p)
+          PY
+          sudo apt-get update -qq
+          sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn image(d:&[u8])->Vec<u8>{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b}
+          fn hash(d:&[u8])->u64{image(d).iter().fold(1469598103934665603u64,|h,&b|(h^u64::from(b)).wrapping_mul(1099511628211))}
+          fn main(){let mut a=std::env::args().skip(1);let mode=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if mode=="hash"{for d in&ds{println!("{:016x}",hash(d))}return}for d in&ds{black_box(image(d));}let t=Instant::now();for _ in 0..n{for d in&ds{black_box(image(d));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base cand;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/p2_current.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example p2_current -q);done
+      - name: Verify and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done
+          B=/tmp/base/target/release/examples/p2_current;C=/tmp/cand/target/release/examples/p2_current
+          diff -u <($B hash 1 "${BF[@]}" /tmp/large.webp) <($C hash 1 "${CF[@]}" /tmp/large.webp)
+          : >/tmp/r.tsv
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" bench 100 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" bench 3 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os
+          from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# Current-tree VP8L predictor-2 confirmation','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests/docs/Clippy/fmt/MSRV 1.80.1 passed','','| workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-predictor2-current-final.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-predictor2-current-final.md
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-predictor2-current-final.md;git commit -m 'Record current VP8L predictor-2 confirmation';git push origin HEAD:bench-vp8l-predictor2-current-final
