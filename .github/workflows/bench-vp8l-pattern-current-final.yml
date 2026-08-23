@@ -1,0 +1,82 @@
+name: Confirm VP8L overlap pattern copies
+on:
+  push:
+    branches: [ bench-vp8l-pattern-current-final ]
+    paths: [ .github/workflows/bench-vp8l-pattern-current-final.yml ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Prepare variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''                } else {\n                    if index + length + 3 <= num_values {\n                        let start = (index - dist) * 4;\n                        data.copy_within(start..start + 16, index * 4);\n\n                        if length > 4 || dist < 4 {\n                            for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {\n                                data.copy_within(start + i..start + i + 16, index * 4 + i);\n                            }\n                        }\n                    } else {\n                        for i in 0..length * 4 {\n                            data[index * 4 + i] = data[index * 4 + i - dist * 4];\n                        }\n                    }\n\n'''
+          new='''                } else {\n                    let source_start = (index - dist) * 4;\n                    let destination_start = index * 4;\n                    let byte_len = length * 4;\n                    if dist >= length {\n                        let (before_destination, destination) = data.split_at_mut(destination_start);\n                        destination[..byte_len].copy_from_slice(\n                            &before_destination[source_start..source_start + byte_len],\n                        );\n                    } else {\n                        let period_bytes = dist * 4;\n                        let (before_destination, destination_tail) = data.split_at_mut(destination_start);\n                        let destination = &mut destination_tail[..byte_len];\n                        destination[..period_bytes].copy_from_slice(\n                            &before_destination[source_start..source_start + period_bytes],\n                        );\n                        let mut copied = period_bytes;\n                        while copied < byte_len {\n                            let amount = copied.min(byte_len - copied);\n                            destination.copy_within(..amount, copied);\n                            copied += amount;\n                        }\n                    }\n\n'''
+          if old not in s:raise SystemExit('copy marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/cand && cargo fmt && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal;(cd /tmp/cand && cargo +1.80.1 build -q)
+      - name: Prepare benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def c(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            q=c(p.read_bytes())
+            if b'VP8L' in q and b'ANIM' not in q:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(1469598103934665603u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:016x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base cand;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/pattern_current.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example pattern_current -q);done
+      - name: Verify and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/pattern_current;C=/tmp/cand/target/release/examples/pattern_current
+          diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp)
+          : >/tmp/r
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" b 100 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;u=$(taskset -c 0 "$X" b 3 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in R:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# Current-tree VP8L overlap-pattern confirmation','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests/docs/Clippy/fmt/MSRV 1.80.1 passed','','| workload | baseline | candidate | paired median | range |','|---|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+            b=statistics.median(g[w,'base']);c=statistics.median(g[w,'cand']);q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {b:.3f} us | {c:.3f} us | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-pattern-current-final.md').write_text('\n'.join(L+['']))
+          PY
+      - name: Persist
+        shell: bash
+        run: |
+          set -euxo pipefail;git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-pattern-current-final.md;git commit -m 'Record current VP8L overlap-pattern confirmation';git push origin HEAD:bench-vp8l-pattern-current-final
