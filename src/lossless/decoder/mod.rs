@@ -470,13 +470,20 @@ impl<R: BufRead> LosslessDecoder<R> {
             self.bit_reader.fill()?;
 
             if index >= next_block_start {
-                let x = index % usize::from(width);
-                let y = index / usize::from(width);
-                next_block_start = (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))
-                    + y * usize::from(width)
-                    + 1;
-
-                let huff_index = huffman_info.get_huff_index(x as u16, y as u16);
+                let huff_index = if huffman_info.bits == 0 {
+                    // libwebp keeps the sole group for the whole stream when
+                    // there is no meta-Huffman image.
+                    next_block_start = num_values;
+                    0
+                } else {
+                    let x = index % usize::from(width);
+                    let y = index / usize::from(width);
+                    next_block_start = (x | usize::from(huffman_info.mask))
+                        .min(usize::from(width - 1))
+                        + y * usize::from(width)
+                        + 1;
+                    huffman_info.get_huff_index(x as u16, y as u16)
+                };
                 tree = &huffman_info.huffman_code_groups[huff_index];
 
                 // Fast path: If all the codes each contain only a single
