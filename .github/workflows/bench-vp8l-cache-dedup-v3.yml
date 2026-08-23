@@ -1,0 +1,143 @@
+name: Benchmark VP8L cache-tail bitmap dedup
+
+on:
+  push:
+    branches: [ bench-vp8l-cache-dedup-v3 ]
+    paths: [ .github/workflows/bench-vp8l-cache-dedup-v3.yml ]
+
+permissions:
+  contents: write
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+
+      - name: Prepare variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          for v in base t8 t16 t32 t64; do git worktree add --detach "/tmp/$v" "$BASE"; done
+
+          cat >/tmp/patch.py <<'PY'
+          from pathlib import Path
+
+          def apply(root, threshold):
+              p=Path(root)/'src/lossless/decoder/mod.rs'
+              s=p.read_text()
+              old='''    #[inline(always)]\n    fn insert(&mut self, color: [u8; 4]) {\n        let [r, g, b, a] = color;\n        let color_u32 =\n            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);\n        let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);\n        self.color_cache[index as usize] = color;\n    }\n'''
+              new=f'''    #[inline(always)]\n    fn index_for(&self, color: [u8; 4]) -> usize {{\n        let [r, g, b, a] = color;\n        let color_u32 =\n            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b) | (u32::from(a) << 24);\n        ((0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits)) as usize\n    }}\n\n    #[inline(always)]\n    fn insert(&mut self, color: [u8; 4]) {{\n        let index = self.index_for(color);\n        self.color_cache[index] = color;\n    }}\n\n    #[inline]\n    fn insert_backreference_tail(&mut self, pixels: &[u8]) {{\n        const DEDUP_THRESHOLD: usize = {threshold};\n        let pixel_count = pixels.len() / 4;\n        if pixel_count < DEDUP_THRESHOLD {{\n            for pixel in pixels.chunks_exact(4) {{\n                self.insert([pixel[0], pixel[1], pixel[2], pixel[3]]);\n            }}\n            return;\n        }}\n\n        // Cache state is unobservable during the copy. Walking backwards lets\n        // us keep only the final write to each cache slot. 11 cache bits means\n        // at most 2048 slots, represented by this 256-byte stack bitmap.\n        let mut seen = [0u64; 32];\n        for pixel in pixels.rchunks_exact(4) {{\n            let color = [pixel[0], pixel[1], pixel[2], pixel[3]];\n            let index = self.index_for(color);\n            let word = index >> 6;\n            let bit = 1u64 << (index & 63);\n            if seen[word] & bit == 0 {{\n                seen[word] |= bit;\n                self.color_cache[index] = color;\n            }}\n        }}\n    }}\n'''
+              if old not in s: raise SystemExit(f'cache marker missing: {root}')
+              s=s.replace(old,new,1)
+              old='''                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {\n                            color_cache.insert(pixel.try_into().unwrap());\n                        }\n'''
+              new='''                        color_cache.insert_backreference_tail(\n                            &data[cache_start * 4..][..cache_pixels * 4],\n                        );\n'''
+              if old not in s: raise SystemExit(f'tail marker missing: {root}')
+              p.write_text(s.replace(old,new,1))
+
+          for threshold in (8,16,32,64):
+              apply(f'/tmp/t{threshold}', threshold)
+          PY
+          python3 /tmp/patch.py
+
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in t8 t16 t32 t64; do
+            (cd "/tmp/$v" && cargo fmt && cargo test -q && cargo doc -q && cargo clippy --all-features -- -D warnings && cargo fmt -- --check && cargo +1.80.1 build -q)
+          done
+
+      - name: Prepare workloads
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(data):
+              if len(data)<12 or data[:4]!=b'RIFF' or data[8:12]!=b'WEBP': return []
+              out=[]; p=12
+              while p+8<=len(data):
+                  fourcc=data[p:p+4]; n=int.from_bytes(data[p+4:p+8],'little')
+                  out.append(fourcc); p += 8+n+(n&1)
+              return out
+          for path in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+              c=chunks(path.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: print(path)
+          PY
+
+          sudo apt-get update -qq
+          sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+              f.write(f'P6\n{w} {h}\n255\n'.encode()); row=bytearray(w*3)
+              for y in range(h):
+                  for x in range(w):
+                      i=x*3
+                      row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255
+                      row[i+1]=(x*2+y*7+((x*y)>>10))&255
+                      row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+                  f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::{hint::black_box,io::Cursor,time::Instant};
+          fn image(d:&[u8])->Vec<u8>{let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();b}
+          fn hash(d:&[u8])->u64{image(d).iter().fold(1469598103934665603u64,|h,&b|(h^u64::from(b)).wrapping_mul(1099511628211))}
+          fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="hash"{for d in&ds{println!("{:016x}",hash(d))}return}for d in&ds{black_box(image(d));}let t=Instant::now();for _ in 0..n{for d in&ds{black_box(image(d));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base t8 t16 t32 t64; do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/cache_dedup.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example cache_dedup -q);done
+
+      - name: Verify and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mapfile -t BF </tmp/files.txt
+          B=/tmp/base/target/release/examples/cache_dedup
+          BH="$($B hash 1 "${BF[@]}" /tmp/large.webp)"
+          for v in t8 t16 t32 t64; do
+            CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done
+            test "$BH" = "$(/tmp/$v/target/release/examples/cache_dedup hash 1 "${CF[@]}" /tmp/large.webp)"
+          done
+
+          : >/tmp/r.tsv
+          for r in {1..13}; do
+            if ((r%2));then ORDER=(base t8 t16 t32 t64);else ORDER=(t64 t32 t16 t8 base);fi
+            for v in "${ORDER[@]}";do
+              X=/tmp/$v/target/release/examples/cache_dedup
+              F=();for p in "${BF[@]}";do if [[ $v == base ]];then F+=("$p");else F+=("${p/\/tmp\/base/\/tmp\/$v}");fi;done
+              u=$(taskset -c 0 "$X" bench 80 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+              u=$(taskset -c 0 "$X" bench 3 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+            done
+          done
+
+          python3 - <<'PY'
+          import csv,statistics,os
+          from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in rows:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          lines=['# VP8L cache-tail bitmap dedup matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- all variants pass full hashes + tests/docs/Clippy/fmt/MSRV 1.80.1','','| workload | threshold | base median | candidate median | paired speedup | range |','|---|---:|---:|---:|---:|---:|']
+          for w in ('corpus','large'):
+              bm=statistics.median(g[w,'base'])
+              for v in ('t8','t16','t32','t64'):
+                  cm=statistics.median(g[w,v]); q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w]
+                  lines.append(f'| {w} | {v[1:]} | {bm:.3f} us | {cm:.3f} us | {statistics.median(q):.4f}x | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-cache-dedup-v3.md').write_text('\n'.join(lines+['']))
+          PY
+          cat benchmark-vp8l-cache-dedup-v3.md
+
+      - name: Persist result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-cache-dedup-v3.md
+          git commit -m 'Record VP8L cache-tail bitmap dedup matrix'
+          git push origin HEAD:bench-vp8l-cache-dedup-v3
