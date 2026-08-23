@@ -1,0 +1,174 @@
+name: Benchmark packed VP8L predictor lanes
+on:
+  push:
+    branches: [ bench-vp8l-packed-predictors-final ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE"
+          for v in direct avg both;do git worktree add --detach "/tmp/$v" "$BASE";done
+          cat >/tmp/patch.py <<'PY'
+          import sys
+          from pathlib import Path
+          v=sys.argv[1];p=Path(sys.argv[2])/'src/lossless/decoder/reverse_transform.rs';s=p.read_text()
+          marker='''fn average2_autovec(a: u8, b: u8) -> u8 {\n    (a & b) + ((a ^ b) >> 1)\n}\n'''
+          helpers=r'''
+#[inline(always)]
+fn load_pixel_u32(pixel: &[u8]) -> u32 {
+    u32::from_le_bytes(pixel[..4].try_into().unwrap())
+}
+#[inline(always)]
+fn average2_u32(a: u32, b: u32) -> u32 {
+    (((a ^ b) & 0xfefefefe) >> 1) + (a & b)
+}
+#[inline(always)]
+fn add_pixels_u32(a: u32, b: u32) -> u32 {
+    let hi = (a & 0xff00ff00).wrapping_add(b & 0xff00ff00);
+    let lo = (a & 0x00ff00ff).wrapping_add(b & 0x00ff00ff);
+    (hi & 0xff00ff00) | (lo & 0x00ff00ff)
+}
+#[inline(always)]
+fn store_pixel_u32(pixel: &mut [u8], value: u32) {
+    pixel[..4].copy_from_slice(&value.to_le_bytes());
+}
+'''
+          if marker not in s:raise SystemExit('helper marker')
+          s=s.replace(marker,marker+helpers,1)
+          def repl(name,nextname,body):
+            global s
+            a=s.index(f'pub fn apply_predictor_transform_{name}(');b=s.index(f'pub fn apply_predictor_transform_{nextname}(',a);s=s[:a]+body+s[b:]
+          if v in ('direct','both'):
+            repl(2,3,r'''pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);
+    let top=&old[range.start-width*4..];
+    for (pixel,t) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)) {
+        let out=add_pixels_u32(load_pixel_u32(pixel),load_pixel_u32(t));store_pixel_u32(pixel,out);
+    }
+}
+''')
+            repl(3,4,r'''pub fn apply_predictor_transform_3(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);
+    let tr=&old[range.start-width*4+4..];
+    for (pixel,t) in current.chunks_exact_mut(4).zip(tr.chunks_exact(4)) {
+        let out=add_pixels_u32(load_pixel_u32(pixel),load_pixel_u32(t));store_pixel_u32(pixel,out);
+    }
+}
+''')
+            repl(4,5,r'''pub fn apply_predictor_transform_4(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);
+    let tl=&old[range.start-width*4-4..];
+    for (pixel,t) in current.chunks_exact_mut(4).zip(tl.chunks_exact(4)) {
+        let out=add_pixels_u32(load_pixel_u32(pixel),load_pixel_u32(t));store_pixel_u32(pixel,out);
+    }
+}
+''')
+          if v in ('avg','both'):
+            repl(5,6,r'''pub fn apply_predictor_transform_5(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);let mut left=load_pixel_u32(&old[range.start-4..]);
+    let tr=&old[range.start-width*4+4..];let top=&old[range.start-width*4..];
+    for ((pixel,tr),t) in current.chunks_exact_mut(4).zip(tr.chunks_exact(4)).zip(top.chunks_exact(4)) {
+        let pred=average2_u32(average2_u32(left,load_pixel_u32(tr)),load_pixel_u32(t));
+        left=add_pixels_u32(load_pixel_u32(pixel),pred);store_pixel_u32(pixel,left);
+    }
+}
+''')
+            repl(6,7,r'''pub fn apply_predictor_transform_6(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);let mut left=load_pixel_u32(&old[range.start-4..]);
+    let tl=&old[range.start-width*4-4..];
+    for (pixel,tl) in current.chunks_exact_mut(4).zip(tl.chunks_exact(4)) {
+        let pred=average2_u32(left,load_pixel_u32(tl));left=add_pixels_u32(load_pixel_u32(pixel),pred);store_pixel_u32(pixel,left);
+    }
+}
+''')
+            repl(7,8,r'''pub fn apply_predictor_transform_7(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);let mut left=load_pixel_u32(&old[range.start-4..]);
+    let top=&old[range.start-width*4..];
+    for (pixel,t) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)) {
+        let pred=average2_u32(left,load_pixel_u32(t));left=add_pixels_u32(load_pixel_u32(pixel),pred);store_pixel_u32(pixel,left);
+    }
+}
+''')
+            repl(8,9,r'''pub fn apply_predictor_transform_8(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);let tl=&old[range.start-width*4-4..];let top=&old[range.start-width*4..];
+    for ((pixel,tl),t) in current.chunks_exact_mut(4).zip(tl.chunks_exact(4)).zip(top.chunks_exact(4)) {
+        let pred=average2_u32(load_pixel_u32(tl),load_pixel_u32(t));let out=add_pixels_u32(load_pixel_u32(pixel),pred);store_pixel_u32(pixel,out);
+    }
+}
+''')
+            repl(9,10,r'''pub fn apply_predictor_transform_9(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);let top=&old[range.start-width*4..];let tr=&old[range.start-width*4+4..];
+    for ((pixel,t),tr) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)).zip(tr.chunks_exact(4)) {
+        let pred=average2_u32(load_pixel_u32(t),load_pixel_u32(tr));let out=add_pixels_u32(load_pixel_u32(pixel),pred);store_pixel_u32(pixel,out);
+    }
+}
+''')
+            repl(10,11,r'''pub fn apply_predictor_transform_10(image_data: &mut [u8], range: Range<usize>, width: usize) {
+    let (old,current)=image_data[..range.end].split_at_mut(range.start);let mut left=load_pixel_u32(&old[range.start-4..]);
+    let tl=&old[range.start-width*4-4..];let top=&old[range.start-width*4..];let tr=&old[range.start-width*4+4..];
+    for (((pixel,tl),t),tr) in current.chunks_exact_mut(4).zip(tl.chunks_exact(4)).zip(top.chunks_exact(4)).zip(tr.chunks_exact(4)) {
+        let pred=average2_u32(average2_u32(left,load_pixel_u32(tl)),average2_u32(load_pixel_u32(t),load_pixel_u32(tr)));
+        left=add_pixels_u32(load_pixel_u32(pixel),pred);store_pixel_u32(pixel,left);
+    }
+}
+''')
+          p.write_text(s)
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in direct avg both;do python3 /tmp/patch.py "$v" "/tmp/$v";(cd "/tmp/$v"&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q);done
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base direct avg both;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/ppred.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example ppred -q);done
+          mapfile -t BF </tmp/files.txt;B=/tmp/base/target/release/examples/ppred
+          for v in direct avg both;do CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done;C="/tmp/$v/target/release/examples/ppred";diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp);done
+          : >/tmp/r.tsv
+          for r in {1..13};do for v in base direct avg both;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X="/tmp/$v/target/release/examples/ppred";F=();for p in "${BF[@]}";do F+=("${p/\/tmp\/base/\/tmp\/$v}");done;fi;u=$(taskset -c 0 "$X" t 70 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" t 4 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={}
+          for w,r,v,x in rows:rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# Packed VP8L predictor matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests + MSRV passed','','| workload | candidate | paired median | positive | range |','|---|---|---:|---:|---:|']
+          for w in ('corpus','large'):
+            for v in ('direct','avg','both'):
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {v} | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-packed-predictors-final.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-packed-predictors-final.md
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-packed-predictors-final.md;git commit -m 'Record packed VP8L predictors';git push origin HEAD:bench-vp8l-packed-predictors-final
