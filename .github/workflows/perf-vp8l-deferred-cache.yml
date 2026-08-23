@@ -1,0 +1,279 @@
+name: VP8L deferred color cache experiment
+
+on:
+  push:
+    branches: [ vp8l-deferred-color-cache ]
+    paths:
+      - .github/workflows/perf-vp8l-deferred-cache.yml
+
+permissions:
+  contents: write
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Apply deferred color-cache population
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/lossless/decoder/mod.rs')
+          s = path.read_text()
+
+          s = s.replace(
+              '        let mut index = 0;\n\n        let mut next_block_start = 0;',
+              '        let mut index = 0;\n        let mut last_cached = 0;\n\n        let mut next_block_start = 0;',
+              1,
+          )
+
+          old = '''                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                            color_cache.insert(value);
+                        }
+
+                        index += n;
+                        continue;'''
+          new = '''                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                            color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
+                            color_cache.insert(value);
+                        }
+
+                        index += n;
+                        last_cached = index;
+                        continue;'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                    color_cache.insert([red, green, blue, alpha]);
+                }
+                index += 1;'''
+          new = '''                index += 1;'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''                if index < dist || num_values - index < length {
+                    return Err(DecodingError::BitStreamError);
+                }
+
+                if dist == 1 {'''
+          new = '''                if index < dist || num_values - index < length {
+                    return Err(DecodingError::BitStreamError);
+                }
+
+                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
+                    color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
+                }
+                last_cached = index;
+
+                if dist == 1 {'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''                }
+                index += length;
+            } else {
+                //color cache, so use previously stored pixels to get this pixel
+                let color_cache = huffman_info
+                    .color_cache
+                    .as_mut()
+                    .ok_or(DecodingError::BitStreamError)?;
+                let color = color_cache.lookup((code - 280).into());'''
+          new = '''                }
+                index += length;
+                last_cached = index;
+            } else {
+                //color cache, so use previously stored pixels to get this pixel
+                let color_cache = huffman_info
+                    .color_cache
+                    .as_mut()
+                    .ok_or(DecodingError::BitStreamError)?;
+                color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
+                last_cached = index;
+                let color = color_cache.lookup((code - 280).into());'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''                data[index * 4..][..4].copy_from_slice(&color);
+                index += 1;
+
+                if index < next_block_start {'''
+          new = '''                data[index * 4..][..4].copy_from_slice(&color);
+                index += 1;
+                last_cached = index;
+
+                if index < next_block_start {'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''                            data[index * 4..][..4]
+                                .copy_from_slice(&color_cache.lookup((code - 280).into()));
+                            index += 1;'''
+          new = '''                            data[index * 4..][..4]
+                                .copy_from_slice(&color_cache.lookup((code - 280).into()));
+                            index += 1;
+                            last_cached = index;'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''    #[inline(always)]
+    fn lookup(&self, index: usize) -> [u8; 4] {
+        self.color_cache[index]
+    }'''
+          new = '''    #[inline]
+    fn insert_pixels(&mut self, pixels: &[u8]) {
+        debug_assert_eq!(pixels.len() % 4, 0);
+        for pixel in pixels.chunks_exact(4) {
+            self.insert([pixel[0], pixel[1], pixel[2], pixel[3]]);
+        }
+    }
+
+    #[inline(always)]
+    fn lookup(&self, index: usize) -> [u8; 4] {
+        self.color_cache[index]
+    }'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          path.write_text(s)
+          PY
+          cargo fmt -- --check || cargo fmt
+          cargo test -v
+          cargo doc -v
+          cargo clippy --all-features -- -D warnings
+          rustup toolchain install 1.80.1 --profile minimal
+          cargo +1.80.1 build -v
+
+      - name: Prepare A/B benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git worktree add /tmp/webp-base origin/performance-optimizations
+          cat >/tmp/decode_bench.rs <<'RS'
+          use image_webp::{DecodingError, WebPDecoder};
+          use std::hint::black_box;
+          use std::io::Cursor;
+          use std::time::Instant;
+
+          fn decode_once(data: &[u8]) -> u64 {
+              let mut decoder = WebPDecoder::new(Cursor::new(data)).unwrap();
+              let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+              let mut checksum = 0u64;
+              if decoder.is_animated() {
+                  loop {
+                      match decoder.read_frame(&mut buf) {
+                          Ok(duration) => {
+                              checksum = checksum.wrapping_add(u64::from(duration));
+                              checksum = checksum.wrapping_add(u64::from(buf[buf.len() / 2]));
+                          }
+                          Err(DecodingError::NoMoreFrames) => break,
+                          Err(err) => panic!("decode failed: {err:?}"),
+                      }
+                  }
+              } else {
+                  decoder.read_image(&mut buf).unwrap();
+                  checksum = checksum.wrapping_add(u64::from(buf[buf.len() / 2]));
+              }
+              black_box(checksum)
+          }
+
+          fn main() {
+              let args: Vec<_> = std::env::args().collect();
+              let data = std::fs::read(&args[1]).unwrap();
+              let iterations: usize = args[2].parse().unwrap();
+              let warmups: usize = args[3].parse().unwrap();
+              for _ in 0..warmups { black_box(decode_once(&data)); }
+              let start = Instant::now();
+              let mut sum = 0u64;
+              for _ in 0..iterations { sum = sum.wrapping_add(decode_once(&data)); }
+              black_box(sum);
+              println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64);
+          }
+          RS
+          for dir in /tmp/webp-base "$GITHUB_WORKSPACE"; do
+            mkdir -p "$dir/examples"
+            cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
+            (cd "$dir" && RUSTFLAGS='-C target-cpu=native' cargo build --release --example decode_bench)
+          done
+
+      - name: Fetch issue 119 workload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/issue119
+          curl -L --fail --retry 3 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/sample.zip -d /tmp/issue119
+          ISSUE119_FILE="$(find /tmp/issue119 -type f -iname '*.webp' | head -n 1)"
+          test -n "$ISSUE119_FILE"
+          echo "ISSUE119_FILE=$ISSUE119_FILE" >> "$GITHUB_ENV"
+
+      - name: Benchmark deferred cache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=/tmp/webp-base/target/release/examples/decode_bench
+          EXP="$GITHUB_WORKSPACE/target/release/examples/decode_bench"
+          RANDOM_FILE="$GITHUB_WORKSPACE/tests/images/animated/random_lossless.webp"
+          : >/tmp/results.tsv
+
+          taskset -c 0 "$BASE" "$RANDOM_FILE" 200 10 >/dev/null
+          taskset -c 0 "$EXP" "$RANDOM_FILE" 200 10 >/dev/null
+          taskset -c 0 "$BASE" "$ISSUE119_FILE" 1 1 >/dev/null
+          taskset -c 0 "$EXP" "$ISSUE119_FILE" 1 1 >/dev/null
+
+          for round in 1 2 3 4 5 6 7; do
+            if (( round % 2 )); then order="base exp"; else order="exp base"; fi
+            for variant in $order; do
+              if [[ "$variant" == base ]]; then bin="$BASE"; else bin="$EXP"; fi
+              value="$(taskset -c 0 "$bin" "$RANDOM_FILE" 1000 0)"
+              printf 'random_lossless\t%s\t%s\t%s\n' "$round" "$variant" "$value" >>/tmp/results.tsv
+              value="$(taskset -c 0 "$bin" "$ISSUE119_FILE" 3 0)"
+              printf 'issue119\t%s\t%s\t%s\n' "$round" "$variant" "$value" >>/tmp/results.tsv
+            done
+          done
+
+          python3 - <<'PY'
+          import csv, statistics, pathlib, subprocess
+          rows = list(csv.reader(open('/tmp/results.tsv'), delimiter='\t'))
+          groups = {}
+          for workload, round_no, variant, value in rows:
+              groups.setdefault((workload, variant), []).append(float(value))
+          base_sha = subprocess.check_output(['git','-C','/tmp/webp-base','rev-parse','HEAD'], text=True).strip()
+          lines = [
+              '# VP8L deferred color-cache benchmark', '',
+              f'- baseline: `performance-optimizations` @ `{base_sha}`',
+              '- experiment: defer literal cache insertion; preserve optimized backreference tail updates',
+              '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned CPU 0',
+              '- 7 alternating rounds; microseconds per full decode', '',
+              '| Workload | baseline median | deferred median | speedup |',
+              '|---|---:|---:|---:|',
+          ]
+          for workload in ('random_lossless','issue119'):
+              b = statistics.median(groups[(workload,'base')])
+              e = statistics.median(groups[(workload,'exp')])
+              lines.append(f'| {workload} | {b:.3f} us | {e:.3f} us | {b/e:.4f}x |')
+          lines += ['', '## Raw samples', '', '```tsv', 'workload\tround\tvariant\tus_per_decode']
+          lines += ['\t'.join(r) for r in rows]
+          lines += ['```', '']
+          pathlib.Path('benchmark-vp8l-deferred-cache.md').write_text('\n'.join(lines))
+          PY
+          cat benchmark-vp8l-deferred-cache.md
+
+      - name: Commit successful experiment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -f examples/decode_bench.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/mod.rs benchmark-vp8l-deferred-cache.md
+          git commit -m 'Experiment with deferred VP8L color-cache population'
+          git push origin HEAD:vp8l-deferred-color-cache
