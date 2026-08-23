@@ -1,0 +1,48 @@
+name: Benchmark VP8L small-pattern copies
+on:
+  push:
+    branches: [ bench-vp8l-libwebp-small-pattern ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=2d4578f05c46f7d55060ec7384d8dac654107ba1
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''                if dist == 1 {\n                    let value: [u8; 4] = data[(index - dist) * 4..][..4].try_into().unwrap();\n                    for i in 0..length {\n                        data[index * 4 + i * 4..][..4].copy_from_slice(&value);\n                    }\n                } else {\n'''
+          new='''                if dist == 1 {\n                    let value: [u8; 4] = data[(index - 1) * 4..][..4].try_into().unwrap();\n                    let pattern = [value[0], value[1], value[2], value[3], value[0], value[1], value[2], value[3]];\n                    let dst = &mut data[index * 4..(index + length) * 4];\n                    let mut pairs = dst.chunks_exact_mut(8);\n                    for pair in &mut pairs { pair.copy_from_slice(&pattern); }\n                    let rem = pairs.into_remainder();\n                    if !rem.is_empty() { rem.copy_from_slice(&value); }\n                } else if dist == 2 && length >= 4 {\n                    let src = (index - 2) * 4;\n                    let pattern: [u8; 8] = data[src..src + 8].try_into().unwrap();\n                    let dst = &mut data[index * 4..(index + length) * 4];\n                    let mut pairs = dst.chunks_exact_mut(8);\n                    for pair in &mut pairs { pair.copy_from_slice(&pattern); }\n                    let rem = pairs.into_remainder();\n                    if !rem.is_empty() { rem.copy_from_slice(&pattern[..4]); }\n                } else {\n'''
+          if old not in s: raise SystemExit('marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q)
+          sudo apt-get update -qq;sudo apt-get install -y webp
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/solid.ppm','wb') as f:f.write(f'P6\n{w} {h}\n255\n'.encode()+bytes([17,91,203])*(w*h))
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/solid.ppm -o /tmp/solid.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let a:Vec<_>=std::env::args().skip(1).collect();let x=std::fs::read(&a[1]).unwrap();if a[0]=="h"{println!("{:x}",h(&x));return}let n:usize=a[2].parse().unwrap();let t=Instant::now();for _ in 0..n{black_box(d(&x));}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/sp.rs";(cd "$d"&&cargo build --release --example sp -q);done
+          B=/tmp/base/target/release/examples/sp;C=/tmp/cand/target/release/examples/sp;test "$($B h /tmp/solid.webp 1)" = "$($C h /tmp/solid.webp 1)"
+          : >/tmp/r
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;u=$(taskset -c 0 "$X" t /tmp/solid.webp 3);printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for r,v,x in R:g.setdefault(v,[]).append(float(x));rr.setdefault(int(r),{})[v]=float(x)
+          p=[z['base']/z['cand'] for _,z in sorted(rr.items())];pathlib.Path('benchmark-vp8l-libwebp-small-pattern.md').write_text(f'# VP8L small-pattern benchmark\n\n- paired median: **{statistics.median(p):.4f}x**\n- range: {min(p):.4f}–{max(p):.4f}x\n')
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-libwebp-small-pattern.md;git commit -m 'Record small-pattern benchmark';git push origin HEAD:bench-vp8l-libwebp-small-pattern
