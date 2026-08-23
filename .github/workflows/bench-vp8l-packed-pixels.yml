@@ -1,0 +1,157 @@
+name: Benchmark VP8L packed pixel entropy buffer
+on:
+  push:
+    branches: [ bench-vp8l-packed-pixels ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build packed-pixel candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=2d4578f05c46f7d55060ec7384d8dac654107ba1
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/mod.rs');s=p.read_text()
+          a=s.index('    fn decode_image_data(\n');b=s.index('    /// Reads color cache data from the bitstream',a)
+          fn=r'''    fn decode_image_data(
+        &mut self,
+        width: u16,
+        height: u16,
+        mut huffman_info: HuffmanInfo,
+        data: &mut [u8],
+    ) -> Result<(), DecodingError> {
+        let num_values = usize::from(width) * usize::from(height);
+        let mut pixels = vec![[0u8; 4]; num_values];
+
+        let huff_index = huffman_info.get_huff_index(0, 0);
+        let mut tree = &huffman_info.huffman_code_groups[huff_index];
+        let mut index = 0;
+        let mut next_block_start = 0;
+        while index < num_values {
+            self.bit_reader.fill()?;
+            if index >= next_block_start {
+                let x = index % usize::from(width);
+                let y = index / usize::from(width);
+                next_block_start = (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))
+                    + y * usize::from(width)
+                    + 1;
+                let huff_index = huffman_info.get_huff_index(x as u16, y as u16);
+                tree = &huffman_info.huffman_code_groups[huff_index];
+                if tree[..4].iter().all(|t| t.is_single_node()) {
+                    let code = tree[GREEN].read_symbol(&mut self.bit_reader)?;
+                    if code < 256 {
+                        let n = if huffman_info.bits == 0 { num_values - index } else { next_block_start - index };
+                        let value = [tree[RED].read_symbol(&mut self.bit_reader)? as u8, code as u8,
+                                     tree[BLUE].read_symbol(&mut self.bit_reader)? as u8,
+                                     tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8];
+                        pixels[index..index + n].fill(value);
+                        if let Some(cache) = huffman_info.color_cache.as_mut() { cache.insert(value); }
+                        index += n;
+                        continue;
+                    }
+                }
+            }
+            let code = tree[GREEN].read_symbol(&mut self.bit_reader)?;
+            if code < 256 {
+                let green = code as u8;
+                let red = tree[RED].read_symbol(&mut self.bit_reader)? as u8;
+                let blue = tree[BLUE].read_symbol(&mut self.bit_reader)? as u8;
+                if self.bit_reader.nbits < 15 { self.bit_reader.fill()?; }
+                let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8;
+                let value = [red, green, blue, alpha];
+                pixels[index] = value;
+                if let Some(cache) = huffman_info.color_cache.as_mut() { cache.insert(value); }
+                index += 1;
+            } else if code < 256 + 24 {
+                let length = Self::get_copy_distance(&mut self.bit_reader, code - 256)?;
+                let dist_symbol = tree[DIST].read_symbol(&mut self.bit_reader)?;
+                let dist_code = Self::get_copy_distance(&mut self.bit_reader, dist_symbol)?;
+                let dist = Self::plane_code_to_distance(width, dist_code);
+                if index < dist || num_values - index < length { return Err(DecodingError::BitStreamError); }
+                if dist == 1 {
+                    let value = pixels[index - 1];
+                    pixels[index..index + length].fill(value);
+                } else if dist >= length {
+                    let src = index - dist;
+                    let (before, after) = pixels.split_at_mut(index);
+                    after[..length].copy_from_slice(&before[src..src + length]);
+                } else {
+                    for i in 0..length { pixels[index + i] = pixels[index + i - dist]; }
+                }
+                if dist != 1 {
+                    if let Some(cache) = huffman_info.color_cache.as_mut() {
+                        let n = length.min(dist);
+                        for &pixel in &pixels[index + length - n..index + length] { cache.insert(pixel); }
+                    }
+                }
+                index += length;
+            } else {
+                let cache = huffman_info.color_cache.as_mut().ok_or(DecodingError::BitStreamError)?;
+                pixels[index] = cache.lookup((code - 280).into());
+                index += 1;
+                if index < next_block_start {
+                    if let Some((bits, code)) = tree[GREEN].peek_symbol(&self.bit_reader) {
+                        if code >= 280 {
+                            self.bit_reader.consume(bits)?;
+                            pixels[index] = cache.lookup((code - 280).into());
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for (dst, pixel) in data.chunks_exact_mut(4).zip(pixels) { dst.copy_from_slice(&pixel); }
+        Ok(())
+    }
+
+'''
+          p.write_text(s[:a]+fn+s[b:])
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q)
+          sudo apt-get update -qq;sudo apt-get install -y webp
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            p=12;o=[]
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());r=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):i=x*3;r[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;r[i+1]=(x*2+y*7+((x*y)>>10))&255;r[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(r)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/pp.rs";(cd "$d"&&cargo build --release --example pp -q);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/pp;C=/tmp/cand/target/release/examples/pp
+          diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp)
+          : >/tmp/r
+          for r in {1..13};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 60 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;u=$(taskset -c 0 "$X" t 2 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));g={};rr={}
+          for w,r,v,x in R:g.setdefault((w,v),[]).append(float(x));rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# VP8L packed-pixel entropy benchmark','','| workload | paired median |','|---|---:|']
+          for w in ('corpus','large'):
+            p=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {statistics.median(p):.4f}x |')
+          pathlib.Path('benchmark-vp8l-packed-pixels.md').write_text('\n'.join(L+['']))
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-packed-pixels.md;git commit -m 'Record packed-pixel benchmark';git push origin HEAD:bench-vp8l-packed-pixels
