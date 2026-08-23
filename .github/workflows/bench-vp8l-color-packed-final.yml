@@ -1,0 +1,119 @@
+name: Benchmark packed VP8L color transform
+on:
+  push:
+    branches: [ bench-vp8l-color-packed-final ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/base "$BASE";for v in packed packed_exact;do git worktree add --detach "/tmp/$v" "$BASE";done
+          cat >/tmp/patch.py <<'PY'
+          import sys
+          from pathlib import Path
+          v=sys.argv[1];p=Path(sys.argv[2])/'src/lossless/decoder/reverse_transform.rs';s=p.read_text();a=s.index('pub(crate) fn apply_color_transform(');b=s.index('pub(crate) fn apply_subtract_green_transform(',a)
+          pixel=r'''#[inline(always)]
+fn inverse_color_pixel_packed(pixel: &mut [u8], red_to_blue: u8, green_to_blue: u8, green_to_red: u8) {
+    let argb = u32::from_le_bytes(pixel[..4].try_into().unwrap());
+    let green = ((argb >> 8) & 0xff) as u8;
+    let mut red = argb & 0xff;
+    let mut blue = (argb >> 16) & 0xff;
+    red += color_transform_delta(green_to_red as i8, green as i8);
+    blue += color_transform_delta(green_to_blue as i8, green as i8);
+    red &= 0xff;
+    blue += color_transform_delta(red_to_blue as i8, red as u8 as i8);
+    blue &= 0xff;
+    let out = (argb & 0xff00_ff00) | red | (blue << 16);
+    pixel[..4].copy_from_slice(&out.to_le_bytes());
+}
+
+'''
+          if v=='packed':
+            fn=r'''pub(crate) fn apply_color_transform(image_data: &mut [u8], width: u16, size_bits: u8, transform_data: &[u8]) {
+    let block_xsize=usize::from(subsample_size(width,size_bits));let width=usize::from(width);
+    for (y,row) in image_data.chunks_exact_mut(width*4).enumerate() {
+        let row_tf=&transform_data[(y>>size_bits)*block_xsize*4..];
+        for (block,transform) in row.chunks_mut(4<<size_bits).zip(row_tf.chunks_exact(4)) {
+            let rb=transform[0];let gb=transform[1];let gr=transform[2];
+            for pixel in block.chunks_exact_mut(4) { inverse_color_pixel_packed(pixel,rb,gb,gr); }
+        }
+    }
+}
+
+'''
+          else:
+            fn=r'''pub(crate) fn apply_color_transform(image_data: &mut [u8], width: u16, size_bits: u8, transform_data: &[u8]) {
+    let block_xsize=usize::from(subsample_size(width,size_bits));let width=usize::from(width);let tile=1usize<<size_bits;let safe=width & !(tile-1);
+    for (y,row) in image_data.chunks_exact_mut(width*4).enumerate() {
+        let row_tf=&transform_data[(y>>size_bits)*block_xsize*4..];
+        let (full,tail)=row.split_at_mut(safe*4);
+        for (block,transform) in full.chunks_exact_mut(tile*4).zip(row_tf.chunks_exact(4)) {
+            let rb=transform[0];let gb=transform[1];let gr=transform[2];
+            for pixel in block.chunks_exact_mut(4) { inverse_color_pixel_packed(pixel,rb,gb,gr); }
+        }
+        if !tail.is_empty() {
+            let transform=&row_tf[(safe/tile)*4..][..4];let rb=transform[0];let gb=transform[1];let gr=transform[2];
+            for pixel in tail.chunks_exact_mut(4) { inverse_color_pixel_packed(pixel,rb,gb,gr); }
+        }
+    }
+}
+
+'''
+          p.write_text(s[:a]+pixel+fn+s[b:])
+          PY
+          rustup toolchain install 1.80.1 --profile minimal
+          for v in packed packed_exact;do python3 /tmp/patch.py "$v" "/tmp/$v";(cd "/tmp/$v"&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q);done
+      - name: Benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            o=[];p=12
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
+          python3 - <<'PY'
+          w=h=2048
+          with open('/tmp/large.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                i=x*3;row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255;row[i+1]=(x*2+y*7+((x*y)>>10))&255;row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+              f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base packed packed_exact;do mkdir -p "/tmp/$v/examples";cp /tmp/b.rs "/tmp/$v/examples/cpack.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example cpack -q);done
+          mapfile -t BF </tmp/files.txt;B=/tmp/base/target/release/examples/cpack
+          for v in packed packed_exact;do CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/$v}");done;C="/tmp/$v/target/release/examples/cpack";diff -u <($B h 1 "${BF[@]}" /tmp/large.webp) <($C h 1 "${CF[@]}" /tmp/large.webp);done
+          : >/tmp/r.tsv;for r in {1..13};do for v in base packed packed_exact;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X="/tmp/$v/target/release/examples/cpack";F=();for p in "${BF[@]}";do F+=("${p/\/tmp\/base/\/tmp\/$v}");done;fi;u=$(taskset -c 0 "$X" t 70 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" t 4 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          python3 - <<'PY'
+          import csv,statistics,os;from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={}
+          for w,r,v,x in rows:rr.setdefault((w,int(r)),{})[v]=float(x)
+          L=['# Packed VP8L color-transform matrix','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests + MSRV passed','','| workload | candidate | paired median | positive | range |','|---|---|---:|---:|---:|']
+          for w in ('corpus','large'):
+            for v in ('packed','packed_exact'):
+              q=[z['base']/z[v] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {v} | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-color-packed-final.md').write_text('\n'.join(L+['']))
+          PY
+          cat benchmark-vp8l-color-packed-final.md
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-color-packed-final.md;git commit -m 'Record packed VP8L color transform';git push origin HEAD:bench-vp8l-color-packed-final
