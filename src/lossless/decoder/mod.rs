@@ -559,18 +559,28 @@ impl<R: BufRead> LosslessDecoder<R> {
                         data[index * 4 + i * 4..][..4].copy_from_slice(&value);
                     }
                 } else {
-                    if index + length + 3 <= num_values {
-                        let start = (index - dist) * 4;
-                        data.copy_within(start..start + 16, index * 4);
-
-                        if length > 4 || dist < 4 {
-                            for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {
-                                data.copy_within(start + i..start + i + 16, index * 4 + i);
-                            }
-                        }
+                    let source_start = (index - dist) * 4;
+                    let destination_start = index * 4;
+                    let byte_len = length * 4;
+                    if dist >= length {
+                        let (before_destination, destination) =
+                            data.split_at_mut(destination_start);
+                        destination[..byte_len].copy_from_slice(
+                            &before_destination[source_start..source_start + byte_len],
+                        );
                     } else {
-                        for i in 0..length * 4 {
-                            data[index * 4 + i] = data[index * 4 + i - dist * 4];
+                        let period_bytes = dist * 4;
+                        let (before_destination, destination_tail) =
+                            data.split_at_mut(destination_start);
+                        let destination = &mut destination_tail[..byte_len];
+                        destination[..period_bytes].copy_from_slice(
+                            &before_destination[source_start..source_start + period_bytes],
+                        );
+                        let mut copied = period_bytes;
+                        while copied < byte_len {
+                            let amount = copied.min(byte_len - copied);
+                            destination.copy_within(..amount, copied);
+                            copied += amount;
                         }
                     }
 
