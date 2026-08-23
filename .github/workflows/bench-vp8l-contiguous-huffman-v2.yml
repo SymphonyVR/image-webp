@@ -1,0 +1,60 @@
+name: Benchmark VP8L contiguous Huffman tables v2
+on:
+  push:
+    branches: [ bench-vp8l-contiguous-huffman-v2 ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=2d4578f05c46f7d55060ec7384d8dac654107ba1
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/huffman.rs');s=p.read_text()
+          s=s.replace('''    Tree {\n        table_mask: u16,\n        primary_table: Vec<u16>,\n        secondary_table: Vec<u16>,\n    },\n''','''    Tree {\n        table_mask: u16,\n        table: Box<[u16]>,\n    },\n''',1)
+          old='''        // Ensure indexes into the secondary table fit in 12 bits.\n        assert!(secondary_table.len() <= 4096);\n\n        Ok(Self(HuffmanTreeInner::Tree {\n            table_mask,\n            primary_table,\n            secondary_table,\n        }))\n''';new='''        assert!(secondary_table.len() <= 4096);\n        primary_table.extend_from_slice(&secondary_table);\n        Ok(Self(HuffmanTreeInner::Tree { table_mask, table: primary_table.into_boxed_slice() }))\n''';
+          if old not in s:raise SystemExit('build marker');s=s.replace(old,new,1)
+          old='''        Self(HuffmanTreeInner::Tree {\n            primary_table: vec![(1 << 12) | zero, (1 << 12) | one],\n            table_mask: 0x1,\n            secondary_table: Vec::new(),\n        })\n''';new='''        Self(HuffmanTreeInner::Tree { table: vec![(1 << 12) | zero, (1 << 12) | one].into_boxed_slice(), table_mask: 0x1 })\n''';
+          if old not in s:raise SystemExit('two marker');s=s.replace(old,new,1)
+          a=s.index('''    #[inline(never)]\n    fn read_symbol_slowpath''');b=s.index('''    /// Reads a symbol using the bit reader.''',a)
+          slow='''    #[inline(never)]\n    fn read_symbol_slowpath<R: BufRead>(table: &[u16], primary_size: usize, v: u16, primary_table_entry: u16, bit_reader: &mut BitReader<R>) -> Result<u16, DecodingError> {\n        let length = primary_table_entry >> 12;\n        let mask = (1 << (length - MAX_TABLE_BITS as u16)) - 1;\n        let secondary_index = primary_size + ((primary_table_entry & 0xfff) as usize) + ((v >> MAX_TABLE_BITS) as usize & mask as usize);\n        let secondary_entry = table[secondary_index];\n        bit_reader.consume((secondary_entry & 0xf) as u8)?;\n        Ok(secondary_entry >> 4)\n    }\n\n''';s=s[:a]+slow+s[b:]
+          old='''            HuffmanTreeInner::Tree {\n                primary_table,\n                secondary_table,\n                table_mask,\n            } => {\n                let v = bit_reader.peek_full() as u16;\n                let entry = primary_table[(v & table_mask) as usize];\n                if (entry >> 12) <= MAX_TABLE_BITS as u16 {\n                    bit_reader.consume((entry >> 12) as u8)?;\n                    return Ok(entry & 0xfff);\n                }\n\n                Self::read_symbol_slowpath(secondary_table, v, entry, bit_reader)\n            }\n''';new='''            HuffmanTreeInner::Tree { table, table_mask } => {\n                let v = bit_reader.peek_full() as u16;\n                let primary_size = usize::from(*table_mask) + 1;\n                let entry = table[(v & table_mask) as usize];\n                if (entry >> 12) <= MAX_TABLE_BITS as u16 { bit_reader.consume((entry >> 12) as u8)?; return Ok(entry & 0xfff); }\n                Self::read_symbol_slowpath(table, primary_size, v, entry, bit_reader)\n            }\n''';
+          if old not in s:raise SystemExit('read marker');s=s.replace(old,new,1)
+          old='''            HuffmanTreeInner::Tree {\n                primary_table,\n                table_mask,\n                ..\n            } => {\n                let v = bit_reader.peek_full() as u16;\n                let entry = primary_table[(v & table_mask) as usize];\n''';new='''            HuffmanTreeInner::Tree { table, table_mask } => {\n                let v = bit_reader.peek_full() as u16;\n                let entry = table[(v & table_mask) as usize];\n''';
+          if old not in s:raise SystemExit('peek marker');s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo +1.80.1 build -q)
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
+            p=12;o=[]
+            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=chunks(p.read_bytes())
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/ch.rs";(cd "$d"&&cargo build --release --example ch -q);done
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/ch;C=/tmp/cand/target/release/examples/ch;diff -u <($B h 1 "${BF[@]}") <($C h 1 "${CF[@]}")
+          : >/tmp/r;for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 100 "${F[@]}");printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));rr={}
+          for r,v,x in R:rr.setdefault(int(r),{})[v]=float(x)
+          p=[z['base']/z['cand'] for _,z in sorted(rr.items())];pathlib.Path('benchmark-vp8l-contiguous-huffman-v2.md').write_text(f'# VP8L contiguous Huffman v2\n\n- paired median: **{statistics.median(p):.4f}x**\n- range: {min(p):.4f}–{max(p):.4f}x\n')
+          PY
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add benchmark-vp8l-contiguous-huffman-v2.md;git commit -m 'Record contiguous Huffman v2 benchmark';git push origin HEAD:bench-vp8l-contiguous-huffman-v2
