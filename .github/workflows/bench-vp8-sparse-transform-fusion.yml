@@ -1,0 +1,108 @@
+name: Benchmark VP8 sparse transform reconstruction fusion
+on:
+  push:
+    branches: [ bench-vp8-sparse-transform-fusion ]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=2d4578f05c46f7d55060ec7384d8dac654107ba1
+          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossy/mod.rs');s=p.read_text()
+          marker='''#[derive(Clone, Copy)]\nstruct CoeffInfo {\n    coded: bool,\n    extent: u8,\n}\n'''
+          add=marker+'''\nstruct ResidualData {\n    blocks: [i32; 384],\n    extents: [u8; 24],\n}\n'''
+          if marker not in s:raise SystemExit('CoeffInfo marker missing');s=s.replace(marker,add,1)
+          s=s.replace('''fn intra_predict_luma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &[i32]) {''','''fn intra_predict_luma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &ResidualData) {''',1)
+          old='''            LumaMode::B => predict_4x4(&mut ws, stride, &mb.bpred, resdata),\n''';new='''            LumaMode::B => predict_4x4(\n                &mut ws,\n                stride,\n                &mb.bpred,\n                &resdata.blocks,\n                &resdata.extents[..16],\n            ),\n''';
+          if old not in s:raise SystemExit('B predict marker missing');s=s.replace(old,new,1)
+          old='''                    let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();\n                    let y0 = 1 + y * 4;\n                    let x0 = 1 + x * 4;\n\n                    add_residue(&mut ws, rb, y0, x0, stride);\n''';new='''                    let rb: &[i32; 16] =\n                        resdata.blocks[i * 16..][..16].try_into().unwrap();\n                    let y0 = 1 + y * 4;\n                    let x0 = 1 + x * 4;\n\n                    transform::idct4x4_sparse_add(\n                        rb,\n                        resdata.extents[i],\n                        &mut ws,\n                        y0,\n                        x0,\n                        stride,\n                    );\n''';
+          if old not in s:raise SystemExit('luma add marker missing');s=s.replace(old,new,1)
+          s=s.replace('''fn intra_predict_chroma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &[i32]) {''','''fn intra_predict_chroma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &ResidualData) {''',1)
+          old='''                let urb: &[i32; 16] = resdata[16 * 16 + i * 16..][..16].try_into().unwrap();\n\n                let y0 = 1 + y * 4;\n                let x0 = 1 + x * 4;\n                add_residue(&mut uws, urb, y0, x0, stride);\n\n                let vrb: &[i32; 16] = resdata[20 * 16 + i * 16..][..16].try_into().unwrap();\n\n                add_residue(&mut vws, vrb, y0, x0, stride);\n''';new='''                let u_index = 16 + i;\n                let urb: &[i32; 16] =\n                    resdata.blocks[u_index * 16..][..16].try_into().unwrap();\n\n                let y0 = 1 + y * 4;\n                let x0 = 1 + x * 4;\n                transform::idct4x4_sparse_add(\n                    urb,\n                    resdata.extents[u_index],\n                    &mut uws,\n                    y0,\n                    x0,\n                    stride,\n                );\n\n                let v_index = 20 + i;\n                let vrb: &[i32; 16] =\n                    resdata.blocks[v_index * 16..][..16].try_into().unwrap();\n\n                transform::idct4x4_sparse_add(\n                    vrb,\n                    resdata.extents[v_index],\n                    &mut vws,\n                    y0,\n                    x0,\n                    stride,\n                );\n''';
+          if old not in s:raise SystemExit('chroma marker missing');s=s.replace(old,new,1)
+          old='''    ) -> Result<[i32; 384], DecodingError> {\n        let sindex = mb.segmentid as usize;\n        let mut blocks = [0i32; 384];\n''';new='''    ) -> Result<ResidualData, DecodingError> {\n        let sindex = mb.segmentid as usize;\n        let mut blocks = [0i32; 384];\n        let mut extents = [0u8; 24];\n''';
+          if old not in s:raise SystemExit('return marker missing');s=s.replace(old,new,1)
+          old='''                if block[0] != 0 || info.coded {\n                    mb.non_zero_dct = true;\n                    let extent = info.extent.max(u8::from(block[0] != 0));\n                    transform::idct4x4_sparse(block, extent);\n                }\n''';new='''                if block[0] != 0 || info.coded {\n                    mb.non_zero_dct = true;\n                }\n                extents[i] = info.extent.max(u8::from(block[0] != 0));\n''';
+          if old not in s:raise SystemExit('luma sparse marker missing');s=s.replace(old,new,1)
+          old='''                    if block[0] != 0 || info.coded {\n                        mb.non_zero_dct = true;\n                        transform::idct4x4_sparse(block, info.extent);\n                    }\n''';new='''                    if block[0] != 0 || info.coded {\n                        mb.non_zero_dct = true;\n                    }\n                    extents[i] = info.extent.max(u8::from(block[0] != 0));\n''';
+          if old not in s:raise SystemExit('chroma sparse marker missing');s=s.replace(old,new,1)
+          if '        Ok(blocks)\n    }\n\n    /// Does loop filtering' not in s:raise SystemExit('Ok blocks marker missing')
+          s=s.replace('''        Ok(blocks)\n    }\n\n    /// Does loop filtering''','''        Ok(ResidualData { blocks, extents })\n    }\n\n    /// Does loop filtering''',1)
+          old='''                    [0i32; 384]\n                };\n''';new='''                    ResidualData {\n                        blocks: [0i32; 384],\n                        extents: [0u8; 24],\n                    }\n                };\n''';
+          if old not in s:raise SystemExit('empty residual marker missing');s=s.replace(old,new,1)
+          p.write_text(s)
+
+          p=Path('/tmp/cand/src/lossy/prediction.rs');s=p.read_text()
+          s=s.replace('use super::common::IntraMode;','use super::{common::IntraMode, transform};',1)
+          old='''pub(crate) fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32]) {''';new='''pub(crate) fn predict_4x4(\n    ws: &mut [u8],\n    stride: usize,\n    modes: &[IntraMode],\n    resdata: &[i32],\n    extents: &[u8],\n) {''';
+          if old not in s:raise SystemExit('predict signature missing');s=s.replace(old,new,1)
+          old='''            let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();\n            add_residue(ws, rb, y0, x0, stride);\n''';new='''            let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();\n            transform::idct4x4_sparse_add(rb, extents[i], ws, y0, x0, stride);\n''';
+          if old not in s:raise SystemExit('predict residue missing');s=s.replace(old,new,1);p.write_text(s)
+
+          p=Path('/tmp/cand/src/lossy/transform.rs');s=p.read_text();marker='// 14.3 inverse walsh-hadamard transform, used in decoding\n'
+          helper=r'''/// Apply the existing exact sparse inverse transform and immediately add the
+/// residual to a predicted 4x4 block. Keeping the transform local avoids
+/// materializing transformed residuals in the macroblock staging buffer.
+#[allow(clippy::manual_clamp)]
+#[inline]
+pub(crate) fn idct4x4_sparse_add(
+    block: &[i32; 16],
+    extent: u8,
+    dst: &mut [u8],
+    y0: usize,
+    x0: usize,
+    stride: usize,
+) {
+    if extent == 0 {
+        return;
+    }
+    let mut residual = *block;
+    idct4x4_sparse(&mut residual, extent);
+    let mut pos = y0 * stride + x0;
+    for row in residual.chunks_exact(4) {
+        for (pixel, &value) in dst[pos..pos + 4].iter_mut().zip(row) {
+            *pixel = (i32::from(*pixel) + value).max(0).min(255) as u8;
+        }
+        pos += stride;
+    }
+}
+
+'''
+          if marker not in s:raise SystemExit('transform marker missing');s=s.replace(marker,helper+marker,1);p.write_text(s)
+          PY
+          (cd /tmp/cand&&cargo fmt&&cargo test -q&&cargo doc -q&&cargo clippy --all-features -- -D warnings&&cargo fmt -- --check)
+          rustup toolchain install 1.80.1 --profile minimal;(cd /tmp/cand&&cargo +1.80.1 build -q)
+          echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+      - name: Benchmark issue 119
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L --fail --retry 3 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
+          unzip -q /tmp/sample.zip -d /tmp/i119
+          F=$(find /tmp/i119 -type f -iname '*.webp'|head -1);test -n "$F"
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::{DecodingError,WebPDecoder};use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->u64{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];let mut s=0;if q.is_animated(){loop{match q.read_frame(&mut b){Ok(t)=>{s^=t as u64;s^=b[b.len()/2]as u64},Err(DecodingError::NoMoreFrames)=>break,Err(e)=>panic!("{e:?}")}}}else{q.read_image(&mut b).unwrap();s=b[b.len()/2]as u64}black_box(s)}fn main(){let a:Vec<_>=std::env::args().skip(1).collect();let x=std::fs::read(&a[0]).unwrap();let n:usize=a[1].parse().unwrap();for _ in 0..1{black_box(d(&x));}let t=Instant::now();for _ in 0..n{black_box(d(&x));}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/n as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/fuse.rs";(cd "$d"&&cargo build --release --example fuse -q);done
+          B=/tmp/base/target/release/examples/fuse;C=/tmp/cand/target/release/examples/fuse;: >/tmp/r
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do [[ $v == base ]]&&X=$B||X=$C;u=$(taskset -c 0 "$X" "$F" 3);printf '%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r;done;done
+          python3 - <<'PY'
+          import csv,statistics,pathlib,os
+          R=list(csv.reader(open('/tmp/r'),delimiter='\t'));rr={};g={}
+          for r,v,x in R:rr.setdefault(int(r),{})[v]=float(x);g.setdefault(v,[]).append(float(x))
+          p=[z['base']/z['cand'] for _,z in sorted(rr.items())];pathlib.Path('benchmark-vp8-sparse-transform-fusion.md').write_text(f'# VP8 sparse transform fusion\n\n- CPU: `{os.environ["CPU"]}`\n- full verification + MSRV passed\n\n| baseline | candidate | paired median | range |\n|---:|---:|---:|---:|\n| {statistics.median(g["base"]):.3f} us | {statistics.median(g["cand"]):.3f} us | {statistics.median(p):.4f}x | {min(p):.4f}–{max(p):.4f}x |\n')
+          PY
+          cp /tmp/cand/src/lossy/mod.rs src/lossy/mod.rs;cp /tmp/cand/src/lossy/prediction.rs src/lossy/prediction.rs;cp /tmp/cand/src/lossy/transform.rs src/lossy/transform.rs
+          git config user.name github-actions[bot];git config user.email 41898282+github-actions[bot]@users.noreply.github.com;git add src/lossy/mod.rs src/lossy/prediction.rs src/lossy/transform.rs benchmark-vp8-sparse-transform-fusion.md;git commit -m 'Record VP8 sparse transform fusion benchmark';git push origin HEAD:bench-vp8-sparse-transform-fusion
