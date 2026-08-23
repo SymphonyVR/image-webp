@@ -20,132 +20,11 @@ jobs:
         with:
           components: clippy,rustfmt
 
-      - name: Apply deferred color-cache population
+      - name: Validate experiment
         shell: bash
         run: |
           set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('src/lossless/decoder/mod.rs')
-          s = path.read_text()
-
-          s = s.replace(
-              '        let mut index = 0;\n\n        let mut next_block_start = 0;',
-              '        let mut index = 0;\n        let mut last_cached = 0;\n\n        let mut next_block_start = 0;',
-              1,
-          )
-
-          old = '''                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                            color_cache.insert(value);
-                        }
-
-                        index += n;
-                        continue;'''
-          new = '''                        if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                            color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
-                            color_cache.insert(value);
-                        }
-
-                        index += n;
-                        last_cached = index;
-                        continue;'''
-          assert old in s
-          s = s.replace(old, new, 1)
-
-          old = '''                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                    color_cache.insert([red, green, blue, alpha]);
-                }
-                index += 1;'''
-          new = '''                index += 1;'''
-          assert old in s
-          s = s.replace(old, new, 1)
-
-          old = '''                if index < dist || num_values - index < length {
-                    return Err(DecodingError::BitStreamError);
-                }
-
-                if dist == 1 {'''
-          new = '''                if index < dist || num_values - index < length {
-                    return Err(DecodingError::BitStreamError);
-                }
-
-                if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                    color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
-                }
-                last_cached = index;
-
-                if dist == 1 {'''
-          assert old in s
-          s = s.replace(old, new, 1)
-
-          old = '''                }
-                index += length;
-            } else {
-                //color cache, so use previously stored pixels to get this pixel
-                let color_cache = huffman_info
-                    .color_cache
-                    .as_mut()
-                    .ok_or(DecodingError::BitStreamError)?;
-                let color = color_cache.lookup((code - 280).into());'''
-          new = '''                }
-                index += length;
-                last_cached = index;
-            } else {
-                //color cache, so use previously stored pixels to get this pixel
-                let color_cache = huffman_info
-                    .color_cache
-                    .as_mut()
-                    .ok_or(DecodingError::BitStreamError)?;
-                color_cache.insert_pixels(&data[last_cached * 4..index * 4]);
-                last_cached = index;
-                let color = color_cache.lookup((code - 280).into());'''
-          assert old in s
-          s = s.replace(old, new, 1)
-
-          old = '''                data[index * 4..][..4].copy_from_slice(&color);
-                index += 1;
-
-                if index < next_block_start {'''
-          new = '''                data[index * 4..][..4].copy_from_slice(&color);
-                index += 1;
-                last_cached = index;
-
-                if index < next_block_start {'''
-          assert old in s
-          s = s.replace(old, new, 1)
-
-          old = '''                            data[index * 4..][..4]
-                                .copy_from_slice(&color_cache.lookup((code - 280).into()));
-                            index += 1;'''
-          new = '''                            data[index * 4..][..4]
-                                .copy_from_slice(&color_cache.lookup((code - 280).into()));
-                            index += 1;
-                            last_cached = index;'''
-          assert old in s
-          s = s.replace(old, new, 1)
-
-          old = '''    #[inline(always)]
-    fn lookup(&self, index: usize) -> [u8; 4] {
-        self.color_cache[index]
-    }'''
-          new = '''    #[inline]
-    fn insert_pixels(&mut self, pixels: &[u8]) {
-        debug_assert_eq!(pixels.len() % 4, 0);
-        for pixel in pixels.chunks_exact(4) {
-            self.insert([pixel[0], pixel[1], pixel[2], pixel[3]]);
-        }
-    }
-
-    #[inline(always)]
-    fn lookup(&self, index: usize) -> [u8; 4] {
-        self.color_cache[index]
-    }'''
-          assert old in s
-          s = s.replace(old, new, 1)
-
-          path.write_text(s)
-          PY
-          cargo fmt -- --check || cargo fmt
+          cargo fmt -- --check
           cargo test -v
           cargo doc -v
           cargo clippy --all-features -- -D warnings
@@ -156,7 +35,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          git fetch origin performance-optimizations
           git worktree add /tmp/webp-base origin/performance-optimizations
+
           cat >/tmp/decode_bench.rs <<'RS'
           use image_webp::{DecodingError, WebPDecoder};
           use std::hint::black_box;
@@ -198,6 +79,7 @@ jobs:
               println!("{:.3}", start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64);
           }
           RS
+
           for dir in /tmp/webp-base "$GITHUB_WORKSPACE"; do
             mkdir -p "$dir/examples"
             cp /tmp/decode_bench.rs "$dir/examples/decode_bench.rs"
@@ -250,7 +132,7 @@ jobs:
           lines = [
               '# VP8L deferred color-cache benchmark', '',
               f'- baseline: `performance-optimizations` @ `{base_sha}`',
-              '- experiment: defer literal cache insertion; preserve optimized backreference tail updates',
+              '- experiment: defer literal cache insertion; preserve optimized backreference-tail updates',
               '- runner: `ubuntu-latest`, release, `-C target-cpu=native`, pinned CPU 0',
               '- 7 alternating rounds; microseconds per full decode', '',
               '| Workload | baseline median | deferred median | speedup |',
@@ -267,13 +149,13 @@ jobs:
           PY
           cat benchmark-vp8l-deferred-cache.md
 
-      - name: Commit successful experiment
+      - name: Persist benchmark
         shell: bash
         run: |
           set -euxo pipefail
           rm -f examples/decode_bench.rs
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/lossless/decoder/mod.rs benchmark-vp8l-deferred-cache.md
-          git commit -m 'Experiment with deferred VP8L color-cache population'
+          git add benchmark-vp8l-deferred-cache.md
+          git commit -m 'Record deferred VP8L color-cache benchmark'
           git push origin HEAD:vp8l-deferred-color-cache
