@@ -19,6 +19,17 @@ jobs:
           components: clippy,rustfmt
       - run: rustup toolchain install 1.80.1 --profile minimal
       - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Fix stack-backed code-length variant
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('tools/bench_vp8l_huffman_alloc_current.py')
+          s=p.read_text()
+          needle="""        assert old in m;m=m.replace(old,new,1)\n    if v in ('sort512','all'):\n"""
+          insertion="""        assert old in m;m=m.replace(old,new,1)\n        old_sig='''        code_length_code_lengths: Vec<u16>,\n        num_symbols: u16,\n    ) -> Result<Vec<u16>, DecodingError> {'''\n        new_sig='''        code_length_code_lengths: &[u16],\n        num_symbols: u16,\n    ) -> Result<Vec<u16>, DecodingError> {'''\n        assert old_sig in m;m=m.replace(old_sig,new_sig,1)\n        old_call='self.read_huffman_code_lengths(code_length_code_lengths, alphabet_size)?;'\n        new_call='self.read_huffman_code_lengths(&code_length_code_lengths, alphabet_size)?;'\n        assert old_call in m;m=m.replace(old_call,new_call,1)\n    if v in ('sort512','all'):\n"""
+          assert needle in s
+          p.write_text(s.replace(needle,insertion,1))
+          PY
       - run: python3 tools/bench_vp8l_huffman_alloc_current.py
       - name: Persist result
         run: |
