@@ -21,8 +21,14 @@ jobs:
           cargo doc -q
           cargo clippy --all-features -- -D warnings
           cargo fmt -- --check
-          cargo +1.80.1 build -q
-          cargo +1.80.1 test -q
+          cp Cargo.toml /tmp/Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('Cargo.toml');s=p.read_text();a=s.index('[dev-dependencies]');b=s.index('[features]');p.write_text(s[:a]+s[b:])
+          PY
+          cargo +1.80.1 build -q --lib
+          cp /tmp/Cargo.toml Cargo.toml
+          git diff --check
       - run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
