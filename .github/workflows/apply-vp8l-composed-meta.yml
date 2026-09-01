@@ -1,0 +1,31 @@
+name: Apply composed VP8L meta scan
+on:
+  push:
+    branches: [vp8l-composed-v3]
+    paths:
+      - tools/apply_vp8l_meta_run_scan.py
+      - .github/workflows/apply-vp8l-composed-meta.yml
+permissions: { contents: write }
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: python3 tools/apply_vp8l_meta_run_scan.py
+      - run: cargo fmt
+      - run: cargo test
+      - run: cargo doc --no-deps
+      - run: cargo clippy -- -D warnings
+      - run: cargo fmt -- --check
+      - run: cargo +1.80.1 build
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/mod.rs
+          git commit -m 'Skip repeated VP8L meta-Huffman groups'
+          git push origin HEAD:vp8l-composed-v3
