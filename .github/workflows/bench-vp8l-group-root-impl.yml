@@ -1,0 +1,34 @@
+name: VP8L group-root implementation smoke
+
+on:
+  push:
+    branches: [bench-vp8l-group-root-impl]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - name: Materialize candidate
+        run: |
+          python3 tools/materialize_vp8l_group_huffman.py
+          python3 tools/materialize_vp8l_group_parse.py
+          python3 tools/materialize_vp8l_group_decode.py
+          cargo fmt
+          git diff --check
+      - name: Test
+        run: cargo test --all-features
+      - name: Docs
+        run: cargo doc --no-deps --all-features
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: MSRV
+        run: cargo +1.80.1 build --all-features
