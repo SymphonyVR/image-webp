@@ -15,6 +15,7 @@ jobs:
           sudo apt-get install -y valgrind unzip curl
       - name: Build profiled decoder
         run: |
+          mkdir -p examples
           cat > examples/profile_decode.rs <<'RS'
           use image_webp::WebPDecoder;
           use std::{hint::black_box, io::Cursor};
@@ -45,45 +46,30 @@ jobs:
         run: |
           python3 - <<'PY'
           import re, pathlib, subprocess
-          total=None
           text=pathlib.Path('/tmp/annot.txt').read_text(errors='ignore')
-          m=re.search(r'([0-9,]+) \(100\.0%\)  PROGRAM TOTALS',text)
-          if m: total=int(m.group(1).replace(',',''))
-          if total is None:
-              m=re.search(r'Ir\s*\n-+\n\s*([0-9,]+)',text)
-              if m: total=int(m.group(1).replace(',',''))
-          files={n:pathlib.Path('/tmp/'+n+'.txt').read_text(errors='ignore') for n in ('mod','rev','huff')}
-          def line_counts(t):
-              out={}
-              for line in t.splitlines():
-                  m=re.match(r'\s*([0-9,]+)\s+.*?:(\d+)\s',line)
-                  if m: out[int(m.group(2))]=out.get(int(m.group(2)),0)+int(m.group(1).replace(',',''))
-              return out
-          # Function summary from inclusive annotation is more robust than source line parsing.
+          total=None
+          for pat in (r'([0-9,]+) \(100\.0%\)  PROGRAM TOTALS',r'PROGRAM TOTALS.*?([0-9,]+)'):
+              m=re.search(pat,text)
+              if m: total=int(m.group(1).replace(',','')); break
           funcs=[]
           for line in text.splitlines():
               if 'image_webp' not in line: continue
               m=re.match(r'\s*([0-9,]+)\s+\([^)]*\)\s+(.*)',line)
               if m: funcs.append((int(m.group(1).replace(',','')),m.group(2).strip()))
           funcs.sort(reverse=True)
-          # classify by demangled/function text from inclusive list; overlapping inclusive totals are not summed.
           wanted=['decode_image_data','apply_color_transform','apply_predictor_transform','read_huffman_code','ColorCache','BitReader','apply_color_indexing_transform','apply_subtract_green_transform']
-          top=[]
-          for ir,name in funcs:
-              if any(w in name for w in wanted): top.append((ir,name))
-          sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-          L=['# Final VP8L composed-v3 profile','',f'- candidate: `{sha}`',f'- workload: issue #119 VP8L sample, 3 decodes under Callgrind',f'- total instructions: **{total:,}**' if total else '- total instructions: unavailable','','## Relevant inclusive functions','','| Ir | % total | function |','|---:|---:|---|']
+          top=[x for x in funcs if any(w in x[1] for w in wanted)]
+          sha='4cd194935d100a09acf24eb24d8c1343c7844844'
+          L=['# Final VP8L composed-v3 profile','',f'- candidate source: `{sha}`','- workload: issue #119 VP8L sample, 3 decodes under Callgrind',f'- total instructions: **{total:,}**' if total else '- total instructions: see raw function counts below','','## Relevant inclusive functions','','| Ir | % total | function |','|---:|---:|---|']
           seen=set()
           for ir,name in top:
               key=name.split('::h')[0]
               if key in seen: continue
-              seen.add(key)
-              pct=100*ir/total if total else 0
+              seen.add(key); pct=100*ir/total if total else 0
               L.append(f'| {ir:,} | {pct:.2f}% | `{name}` |')
               if len(seen)>=25: break
-          L+=['','## Stop-rule assessment','','The prior exhaustive sweep has already tested the entropy loop, Huffman construction/layout, color cache, LZ copy engine, inverse-color kernels, predictor kernels, palette/subtract-green, input staging, and transform batching families. Any remaining >=2% function in one of those families is classified as an already-closed family unless this profile exposes a distinct bounded mechanism.']
-          pathlib.Path('profile-vp8l-composed-v3-final.md').write_text('\n'.join(L)+'\n')
-          print('\n'.join(L))
+          L+=['','## Stop-rule assessment','','The exhaustive sweep has already tested the entropy loop, Huffman construction/layout, color cache, LZ copy engine, inverse-color kernels, predictor kernels, palette/subtract-green, input staging, output stores, distance decoding, and transform batching families. Remaining >=2% functions in those families are therefore closed unless this profile exposes a distinct bounded mechanism.']
+          pathlib.Path('profile-vp8l-composed-v3-final.md').write_text('\n'.join(L)+'\n'); print('\n'.join(L))
           PY
       - run: |
           rm -f examples/profile_decode.rs
