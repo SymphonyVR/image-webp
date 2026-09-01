@@ -1,0 +1,39 @@
+name: VP8L composed v3 hostile validation
+on:
+  push:
+    branches: [verify-vp8l-composed-v3-hostile]
+permissions: { contents: read }
+jobs:
+  big-endian:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross
+        uses: baptiste0928/cargo-install@v1
+        with: { crate: cross }
+      - run: sudo systemctl start docker
+      - name: PowerPC big-endian tests
+        run: cross test --target powerpc-unknown-linux-gnu --verbose -v
+  minimal-versions-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo -Zminimal-versions generate-lockfile
+      - uses: dtolnay/rust-toolchain@1.80.1
+      - run: cargo build -v
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with: { feature-group: default-features }
+  miri-transform-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { components: miri }
+      - run: cargo miri setup
+      - name: Miri library tests
+        run: cargo miri test --lib
