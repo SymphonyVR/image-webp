@@ -1,0 +1,23 @@
+name: Analyze VP8L Huffman root shapes final
+on:
+  push:
+    branches: [analyze-vp8l-root-shapes-final]
+    paths: [tools/analyze_vp8l_root_shapes_final.py, .github/workflows/analyze-vp8l-root-shapes-final.yml]
+permissions: { contents: write }
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y webp
+      - run: python3 tools/analyze_vp8l_root_shapes_final.py
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add analysis-vp8l-root-shapes-final.md
+          git commit -m 'Record VP8L Huffman shape analysis'
+          git push origin HEAD:analyze-vp8l-root-shapes-final
