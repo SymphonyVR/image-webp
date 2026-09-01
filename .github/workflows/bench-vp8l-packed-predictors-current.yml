@@ -19,6 +19,10 @@ jobs:
           components: clippy,rustfmt
       - run: rustup toolchain install 1.80.1 --profile minimal
       - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Rebase harness on composed final
+        run: |
+          sed -i 's/0881ec1a66f09e11b766c309cf6e651077775bd9/6f8f7d994e2f747d46621812e01c27a29ff4be4a/' tools/bench_vp8l_packed_predictors_current.py
+          sed -i 's/#\[inline(always)\] fn average2_u32/#[allow(dead_code)] #[inline(always)] fn average2_u32/' tools/bench_vp8l_packed_predictors_current.py
       - run: python3 tools/bench_vp8l_packed_predictors_current.py
       - name: Persist result
         run: |
