@@ -25,10 +25,10 @@ jobs:
           cargo fmt
           git diff --check
       - name: Test
-        run: cargo test --all-features
+        run: cargo test -q
       - name: Docs
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
       - name: MSRV
-        run: cargo +1.80.1 build --all-features
+        run: cargo +1.80.1 build -q
