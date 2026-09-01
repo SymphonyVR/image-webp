@@ -24,20 +24,6 @@ def patch_wide_mask(root,selector):
         let table_bits = (max_length as u16).min(u16::from(max_table_bits));'''
     if old not in s: raise SystemExit('table anchor missing')
     s=s.replace(old,new,1)
-    old='''    fn read_symbol_slowpath<R: BufRead>(
-        secondary_table: &[u16],
-        v: u16,
-        primary_table_entry: u16,
-        bit_reader: &mut BitReader<R>,
-    ) -> Result<u16, DecodingError> {'''
-    new='''    fn read_symbol_slowpath<R: BufRead>(
-        secondary_table: &[u16],
-        v: u16,
-        primary_table_entry: u16,
-        bit_reader: &mut BitReader<R>,
-    ) -> Result<u16, DecodingError> {'''
-    # keep the existing 9-bit slowpath byte-for-byte; add a separate rare wide slowpath.
-    if old not in s: raise SystemExit('slowpath signature missing')
     marker='''    /// Reads a symbol using the bit reader.
 '''
     wide_fn='''    #[inline(never)]
@@ -75,7 +61,7 @@ def patch_wide_mask(root,selector):
                 if *table_mask <= 0x1ff {
                     return Self::read_symbol_slowpath(secondary_table, v, entry, bit_reader);
                 }
-                let table_bits = if *table_mask <= 0x3ff { 10 } else { 11 };
+                let table_bits: u8 = if *table_mask <= 0x3ff { 10 } else { 11 };
                 if length <= u16::from(table_bits) {
                     bit_reader.consume(length as u8)?;
                     return Ok(entry & 0xfff);
@@ -98,7 +84,7 @@ def patch_wide_mask(root,selector):
                     return Some((length as u8, entry & 0xfff));
                 }
                 if *table_mask > 0x1ff {
-                    let table_bits = if *table_mask <= 0x3ff { 10 } else { 11 };
+                    let table_bits: u8 = if *table_mask <= 0x3ff { 10 } else { 11 };
                     if length <= u16::from(table_bits) {
                         return Some((length as u8, entry & 0xfff));
                     }
