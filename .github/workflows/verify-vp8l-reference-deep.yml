@@ -1,0 +1,27 @@
+name: Deep VP8L libwebp differential
+on:
+  push:
+    branches: [verify-vp8l-reference-deep]
+    paths: [tools/verify_vp8l_reference_deep.py, .github/workflows/verify-vp8l-reference-deep.yml]
+permissions: { contents: write }
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y webp python3-pil
+      - run: python3 tools/verify_vp8l_reference_deep.py
+      - if: always()
+        run: |
+          if [ -f verification-vp8l-reference-deep.md ]; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add verification-vp8l-reference-deep.md
+            git commit -m 'Record deep VP8L differential verification' || true
+            git push origin HEAD:verify-vp8l-reference-deep
+          fi
