@@ -2,7 +2,9 @@ name: Materialize VP8L wide-mask root candidate
 on:
   push:
     branches: [vp8l-wide-mask-root-candidate]
-    paths: [.github/workflows/materialize-vp8l-wide-mask-root-candidate.yml]
+    paths:
+      - tools/materialize_vp8l_wide_mask_root_candidate.py
+      - .github/workflows/materialize-vp8l-wide-mask-root-candidate.yml
 permissions: { contents: write }
 jobs:
   materialize:
