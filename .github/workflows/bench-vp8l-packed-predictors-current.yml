@@ -19,10 +19,17 @@ jobs:
           components: clippy,rustfmt
       - run: rustup toolchain install 1.80.1 --profile minimal
       - run: sudo apt-get update -qq && sudo apt-get install -y webp
-      - name: Rebase harness on composed final
+      - name: Rebase and fix validation-only dead helpers
         run: |
-          sed -i 's/0881ec1a66f09e11b766c309cf6e651077775bd9/6f8f7d994e2f747d46621812e01c27a29ff4be4a/' tools/bench_vp8l_packed_predictors_current.py
-          sed -i 's/#\[inline(always)\] fn average2_u32/#[allow(dead_code)] #[inline(always)] fn average2_u32/' tools/bench_vp8l_packed_predictors_current.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('tools/bench_vp8l_packed_predictors_current.py')
+          s=p.read_text().replace('0881ec1a66f09e11b766c309cf6e651077775bd9','6f8f7d994e2f747d46621812e01c27a29ff4be4a')
+          old=""" for n in nums:\n  a=s.index(f'pub fn apply_predictor_transform_{n}(');b=s.index(f'pub fn apply_predictor_transform_{n+1}(',a);s=s[:a]+BODIES[n]+s[b:]\n p.write_text(s)\n"""
+          new=""" for n in nums:\n  a=s.index(f'pub fn apply_predictor_transform_{n}(');b=s.index(f'pub fn apply_predictor_transform_{n+1}(',a);s=s[:a]+BODIES[n]+s[b:]\n s=s.replace('#[inline]\nfn average2(a: u8, b: u8) -> u8 {','#[allow(dead_code)]\n#[inline]\nfn average2(a: u8, b: u8) -> u8 {',1)\n s=s.replace('#[inline(always)]\nfn average2_autovec(a: u8, b: u8) -> u8 {','#[allow(dead_code)]\n#[inline(always)]\nfn average2_autovec(a: u8, b: u8) -> u8 {',1)\n p.write_text(s)\n"""
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+          PY
       - run: python3 tools/bench_vp8l_packed_predictors_current.py
       - name: Persist result
         run: |
