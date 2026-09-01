@@ -1,0 +1,35 @@
+name: Deep VP8L wide-mask differential verification
+on:
+  push:
+    branches: [verify-vp8l-wide-mask-final]
+    paths: [.github/workflows/verify-vp8l-wide-mask-deep.yml]
+permissions: { contents: write }
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y webp python3-pil
+      - name: Run exact candidate differential harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git show origin/verify-vp8l-composed-v3-deep:tools/verify_vp8l_composed_v3_deep.py > /tmp/verify.py
+          sed -i "s/CAND='4cd194935d100a09acf24eb24d8c1343c7844844'/CAND='888f7a558f35c4c1975c7e5c048b56450233283c'/" /tmp/verify.py
+          python3 /tmp/verify.py
+          mv verification-vp8l-composed-v3-deep.md verification-vp8l-wide-mask-deep.md
+      - if: always()
+        run: |
+          if [ -f verification-vp8l-wide-mask-deep.md ]; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add verification-vp8l-wide-mask-deep.md
+            git commit -m 'Record deep VP8L wide-mask verification' || true
+            git push origin HEAD:verify-vp8l-wide-mask-final
+          fi
