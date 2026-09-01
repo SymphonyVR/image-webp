@@ -1,0 +1,31 @@
+name: VP8L group-root performance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [bench-vp8l-group-root-impl]
+    paths:
+      - tools/bench_vp8l_group_root_impl.py
+      - tools/materialize_vp8l_group_huffman.py
+      - tools/materialize_vp8l_group_parse.py
+      - tools/materialize_vp8l_group_decode.py
+      - tools/group_decode_body.txt
+      - .github/workflows/bench-vp8l-group-root-performance.yml
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install WebP tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y webp
+      - name: Benchmark group-static roots
+        run: python3 tools/bench_vp8l_group_root_impl.py
