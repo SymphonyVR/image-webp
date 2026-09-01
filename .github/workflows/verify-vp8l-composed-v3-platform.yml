@@ -1,0 +1,26 @@
+name: Verify clean VP8L composed v3 platforms
+on:
+  push:
+    branches: [verify-vp8l-composed-v3-platform]
+    paths: [.github/workflows/verify-vp8l-composed-v3-platform.yml]
+jobs:
+  stable:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: cargo test
+      - run: cargo doc --no-deps
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt -- --check
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80.1
+      - run: cargo build
