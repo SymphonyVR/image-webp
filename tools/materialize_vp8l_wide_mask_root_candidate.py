@@ -43,7 +43,7 @@ new='''                let length = entry >> 12;
                 if *table_mask <= 0x1ff {
                     return Self::read_symbol_slowpath(secondary_table, v, entry, bit_reader);
                 }
-                let table_bits = if *table_mask <= 0x3ff { 10 } else { 11 };
+                let table_bits: u8 = if *table_mask <= 0x3ff { 10 } else { 11 };
                 if length <= u16::from(table_bits) {
                     bit_reader.consume(length as u8)?;
                     return Ok(entry & 0xfff);
@@ -65,7 +65,7 @@ new='''                let length = entry >> 12;
                     return Some((length as u8, entry & 0xfff));
                 }
                 if *table_mask > 0x1ff {
-                    let table_bits = if *table_mask <= 0x3ff { 10 } else { 11 };
+                    let table_bits: u8 = if *table_mask <= 0x3ff { 10 } else { 11 };
                     if length <= u16::from(table_bits) {
                         return Some((length as u8, entry & 0xfff));
                     }
