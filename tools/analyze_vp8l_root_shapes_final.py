@@ -88,6 +88,16 @@ def main():
     for label,rows in records.items():
         def c(d): return sum(1 for r in rows if sum(r[3:])*d>=r[0])
         L.append(f'| {label} | {c(16)} | {c(8)} | {c(4)} | {c(2)} | {sum(r[1]>=12 for r in rows)} | {sum(r[1]>=13 for r in rows)} |')
+    L += ['','## Size + long-code selectors','', '| workload | n>=64 & long>=1/8 | n>=128 & long>=1/8 | n>=192 & long>=1/8 | n>=256 & long>=1/8 | n>=128 & long>=1/4 | n>=192 & long>=1/4 |','|---|---:|---:|---:|---:|---:|---:|']
+    for label,rows in records.items():
+        def sel(n,d): return sum(1 for r in rows if r[0]>=n and sum(r[3:])*d>=r[0])
+        L.append(f'| {label} | {sel(64,8)} | {sel(128,8)} | {sel(192,8)} | {sel(256,8)} | {sel(128,4)} | {sel(192,4)} |')
+    L += ['','## Detailed trees for targeted high-entropy streams','']
+    for label in ('noise-z9','noise-z0','corr-z9'):
+        L += [f'### {label}','', '| symbols | max | h9 | h10 | h11 | h12 | h13 | h14 | h15 |','|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+        for r in sorted(records[label], reverse=True):
+            if r[1]>=10: L.append('| '+' | '.join(map(str,r))+' |')
+        L.append('')
     Path('analysis-vp8l-root-shapes-final.md').write_text('\n'.join(L)+'\n')
     print('\n'.join(L))
 if __name__=='__main__': main()
