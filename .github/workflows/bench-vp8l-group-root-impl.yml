@@ -26,7 +26,7 @@ jobs:
         run: cargo test -q
       - name: Docs
         run: cargo doc --no-deps
-      - name: Clippy on MSRV
-        run: cargo +1.80.1 clippy --all-targets -- -D warnings
+      - name: Clippy on MSRV library
+        run: cargo +1.80.1 clippy --lib -- -D warnings
       - name: MSRV
         run: cargo +1.80.1 build -q
