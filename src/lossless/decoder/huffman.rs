@@ -4,7 +4,6 @@ use super::BitReader;
 use crate::decoder::DecodingError;
 
 const MAX_ALLOWED_CODE_LENGTH: usize = 15;
-const MAX_TABLE_BITS: u8 = 9;
 
 #[derive(Clone, Debug)]
 enum HuffmanTreeInner {
@@ -18,15 +17,18 @@ enum HuffmanTreeInner {
 
 /// Huffman tree
 #[derive(Clone, Debug)]
-pub(crate) struct HuffmanTree(HuffmanTreeInner);
+pub(crate) struct HuffmanTree<const TABLE_BITS: u8>(HuffmanTreeInner);
 
-impl Default for HuffmanTree {
+pub(crate) type HuffmanTree9 = HuffmanTree<9>;
+pub(crate) type HuffmanTree11 = HuffmanTree<11>;
+
+impl<const TABLE_BITS: u8> Default for HuffmanTree<TABLE_BITS> {
     fn default() -> Self {
         Self(HuffmanTreeInner::Single(0))
     }
 }
 
-impl HuffmanTree {
+impl<const TABLE_BITS: u8> HuffmanTree<TABLE_BITS> {
     /// Return the next code, or if the codeword is already all ones (which is the final code), return
     /// the same code again.
     fn next_codeword(mut codeword: u16, table_size: u16) -> u16 {
@@ -85,7 +87,7 @@ impl HuffmanTree {
         }
 
         // Calculate table/tree parameters
-        let table_bits = (max_length as u16).min(u16::from(MAX_TABLE_BITS));
+        let table_bits = (max_length as u16).min(u16::from(TABLE_BITS));
         let table_size = (1 << table_bits) as usize;
         let table_mask = table_size as u16 - 1;
         let mut primary_table = vec![0; table_size];
@@ -196,9 +198,9 @@ impl HuffmanTree {
         bit_reader: &mut BitReader<R>,
     ) -> Result<u16, DecodingError> {
         let length = primary_table_entry >> 12;
-        let mask = (1 << (length - MAX_TABLE_BITS as u16)) - 1;
-        let secondary_index = ((primary_table_entry & 0xfff) as usize)
-            + ((v >> MAX_TABLE_BITS) as usize & mask as usize);
+        let mask = (1 << (length - TABLE_BITS as u16)) - 1;
+        let secondary_index =
+            ((primary_table_entry & 0xfff) as usize) + ((v >> TABLE_BITS) as usize & mask as usize);
         let secondary_entry = secondary_table[secondary_index];
         bit_reader.consume((secondary_entry & 0xf) as u8)?;
         Ok(secondary_entry >> 4)
@@ -220,7 +222,7 @@ impl HuffmanTree {
             } => {
                 let v = bit_reader.peek_full() as u16;
                 let entry = primary_table[(v & table_mask) as usize];
-                if (entry >> 12) <= MAX_TABLE_BITS as u16 {
+                if (entry >> 12) <= TABLE_BITS as u16 {
                     bit_reader.consume((entry >> 12) as u8)?;
                     return Ok(entry & 0xfff);
                 }
@@ -244,7 +246,7 @@ impl HuffmanTree {
             } => {
                 let v = bit_reader.peek_full() as u16;
                 let entry = primary_table[(v & table_mask) as usize];
-                if (entry >> 12) <= MAX_TABLE_BITS as u16 {
+                if (entry >> 12) <= TABLE_BITS as u16 {
                     return Some(((entry >> 12) as u8, entry & 0xfff));
                 }
                 None
