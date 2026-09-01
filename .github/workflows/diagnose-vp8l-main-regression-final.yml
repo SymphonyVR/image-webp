@@ -1,0 +1,28 @@
+name: Diagnose VP8L main regression final
+on:
+  push:
+    branches: [diagnose-vp8l-main-regression-final]
+    paths:
+      - tools/diagnose_vp8l_main_regression_final.py
+      - .github/workflows/diagnose-vp8l-main-regression-final.yml
+permissions: { contents: write }
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y webp unzip curl
+      - run: python3 tools/diagnose_vp8l_main_regression_final.py
+      - if: always()
+        run: |
+          if [ -f diagnosis-vp8l-main-regression-final.md ]; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add diagnosis-vp8l-main-regression-final.md
+            git commit -m 'Record VP8L historical regression diagnosis' || true
+            git push origin HEAD:diagnose-vp8l-main-regression-final
+          fi
