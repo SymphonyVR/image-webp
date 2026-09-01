@@ -1,0 +1,31 @@
+name: Confirm low-overhead VP8L wide-root candidate
+on:
+  push:
+    branches: [confirm-vp8l-wide-mask-final]
+    paths: [.github/workflows/confirm-vp8l-wide-mask-final.yml]
+permissions: { contents: write }
+jobs:
+  confirm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y webp
+      - name: Run 3-way long confirmation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git show origin/confirm-vp8l-wide-root-final:tools/confirm_vp8l_wide_root_final.py > /tmp/confirm.py
+          sed -i "s/CAND='87f1f0c625b5169bd9162aaa02d1c97e68a20cf4'/CAND='888f7a558f35c4c1975c7e5c048b56450233283c'/" /tmp/confirm.py
+          sed -i "s@TMP=Path('/tmp/confirm-vp8l-wide-root-final')@TMP=Path('/tmp/confirm-vp8l-wide-mask-final')@" /tmp/confirm.py
+          python3 /tmp/confirm.py
+          mv benchmark-vp8l-wide-root-confirm-final.md benchmark-vp8l-wide-mask-confirm-final.md
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-wide-mask-confirm-final.md
+          git commit -m 'Record low-overhead VP8L wide-root confirmation'
+          git push origin HEAD:confirm-vp8l-wide-mask-final
