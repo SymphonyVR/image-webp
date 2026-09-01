@@ -1,0 +1,21 @@
+name: Fuzz clean VP8L composed v3
+on:
+  push:
+    branches: [verify-vp8l-composed-v3-fuzz]
+    paths: [.github/workflows/verify-vp8l-composed-v3-fuzz.yml]
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: Seed corpora
+        run: |
+          mkdir -p /tmp/still-corpus /tmp/anim-corpus
+          find tests/images -type f -name '*.webp' ! -path '*/animated/*' -exec cp {} /tmp/still-corpus/ \;
+          find tests/images/animated -type f -name '*.webp' -exec cp {} /tmp/anim-corpus/ \;
+      - name: Fuzz still decoder
+        run: cargo +nightly fuzz run decode_still /tmp/still-corpus -- -max_total_time=90 -timeout=5
+      - name: Fuzz animated decoder
+        run: cargo +nightly fuzz run decode_animated /tmp/anim-corpus -- -max_total_time=90 -timeout=5
