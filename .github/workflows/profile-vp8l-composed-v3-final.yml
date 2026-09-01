@@ -10,71 +10,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y valgrind unzip curl
-      - name: Build profiled decoder
+      - name: Build and profile exact final source
+        shell: bash
         run: |
+          set -euxo pipefail
+          sudo apt-get update -qq; sudo apt-get install -y valgrind >/dev/null
           mkdir -p examples
-          cat > examples/profile_decode.rs <<'RS'
+          cat >examples/profile_vp8l_final.rs <<'RS'
           use image_webp::WebPDecoder;
-          use std::{hint::black_box, io::Cursor};
-          fn main() {
-              let p=std::env::args().nth(1).unwrap();
-              let d=std::fs::read(p).unwrap();
-              for _ in 0..3 {
-                  let mut q=WebPDecoder::new(Cursor::new(&d)).unwrap();
-                  let mut b=vec![0;q.output_buffer_size().unwrap()];
-                  q.read_image(&mut b).unwrap(); black_box(b);
-              }
-          }
+          use std::{hint::black_box,io::Cursor};
+          fn main(){let p=std::env::args().nth(1).unwrap();let d=std::fs::read(p).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[b.len()/2]);}
           RS
-          RUSTFLAGS='-C debuginfo=2' cargo build --release --example profile_decode
-          mkdir -p /tmp/issue119
-          curl -L --fail --retry 3 -o /tmp/sample.zip https://github.com/user-attachments/files/17482915/sample.zip
-          unzip -q /tmp/sample.zip -d /tmp/issue119
-          find /tmp/issue119 -type f -iname '*.webp' | head -1 > /tmp/input_path
-      - name: Callgrind
+          CARGO_PROFILE_RELEASE_DEBUG=2 RUSTFLAGS='-C force-frame-pointers=yes' cargo build --release --example profile_vp8l_final
+          INPUT=tests/images/gallery2/3_webp_ll.webp
+          taskset -c 0 valgrind --tool=callgrind --collect-jumps=yes --callgrind-out-file=/tmp/v.callgrind target/release/examples/profile_vp8l_final "$INPUT"
+          callgrind_annotate --inclusive=no --threshold=0.01 --auto=yes /tmp/v.callgrind > /tmp/annotated.txt
+      - name: Persist symbolic profile
+        shell: bash
         run: |
-          INPUT=$(cat /tmp/input_path)
-          valgrind --tool=callgrind --callgrind-out-file=/tmp/cg ./target/release/examples/profile_decode "$INPUT"
-          callgrind_annotate --inclusive=yes --auto=yes /tmp/cg > /tmp/annot.txt
-          callgrind_annotate --inclusive=no --auto=no --show=Ir /tmp/cg src/lossless/decoder/mod.rs > /tmp/mod.txt || true
-          callgrind_annotate --inclusive=no --auto=no --show=Ir /tmp/cg src/lossless/decoder/reverse_transform.rs > /tmp/rev.txt || true
-          callgrind_annotate --inclusive=no --auto=no --show=Ir /tmp/cg src/lossless/decoder/huffman.rs > /tmp/huff.txt || true
-      - name: Summarize
-        run: |
+          set -euxo pipefail
           python3 - <<'PY'
-          import re, pathlib, subprocess
-          text=pathlib.Path('/tmp/annot.txt').read_text(errors='ignore')
-          total=None
-          for pat in (r'([0-9,]+) \(100\.0%\)  PROGRAM TOTALS',r'PROGRAM TOTALS.*?([0-9,]+)'):
-              m=re.search(pat,text)
-              if m: total=int(m.group(1).replace(',','')); break
-          funcs=[]
+          import pathlib
+          text=pathlib.Path('/tmp/annotated.txt').read_text(errors='replace')
+          interesting=[]
           for line in text.splitlines():
-              if 'image_webp' not in line: continue
-              m=re.match(r'\s*([0-9,]+)\s+\([^)]*\)\s+(.*)',line)
-              if m: funcs.append((int(m.group(1).replace(',','')),m.group(2).strip()))
-          funcs.sort(reverse=True)
-          wanted=['decode_image_data','apply_color_transform','apply_predictor_transform','read_huffman_code','ColorCache','BitReader','apply_color_indexing_transform','apply_subtract_green_transform']
-          top=[x for x in funcs if any(w in x[1] for w in wanted)]
-          sha='4cd194935d100a09acf24eb24d8c1343c7844844'
-          L=['# Final VP8L composed-v3 profile','',f'- candidate source: `{sha}`','- workload: issue #119 VP8L sample, 3 decodes under Callgrind',f'- total instructions: **{total:,}**' if total else '- total instructions: see raw function counts below','','## Relevant inclusive functions','','| Ir | % total | function |','|---:|---:|---|']
-          seen=set()
-          for ir,name in top:
-              key=name.split('::h')[0]
-              if key in seen: continue
-              seen.add(key); pct=100*ir/total if total else 0
-              L.append(f'| {ir:,} | {pct:.2f}% | `{name}` |')
-              if len(seen)>=25: break
-          L+=['','## Stop-rule assessment','','The exhaustive sweep has already tested the entropy loop, Huffman construction/layout, color cache, LZ copy engine, inverse-color kernels, predictor kernels, palette/subtract-green, input staging, output stores, distance decoding, and transform batching families. Remaining >=2% functions in those families are therefore closed unless this profile exposes a distinct bounded mechanism.']
-          pathlib.Path('profile-vp8l-composed-v3-final.md').write_text('\n'.join(L)+'\n'); print('\n'.join(L))
+              if 'PROGRAM TOTALS' in line or 'image_webp::' in line or 'src/lossless/' in line:
+                  interesting.append(line)
+              elif interesting and len(interesting)<280 and line.strip() and any(k in line for k in ('read_symbol','decode_image','color_cache','copy_within','predictor','insert','consume','fill','color_transform')):
+                  interesting.append(line)
+          out=['# Final VP8L composed-v3 symbolic Callgrind profile','', '- candidate source: `4cd194935d100a09acf24eb24d8c1343c7844844`','- fixture: `tests/images/gallery2/3_webp_ll.webp` (800x600)','- release + full debuginfo, CPU 0','','```text']+interesting[:280]+['```','','## Stop-rule assessment','','The exhaustive sweep has already tested entropy decode, Huffman construction/layout, color cache, LZ copy mechanics, inverse-color kernels, predictor kernels, palette/subtract-green, input staging, output stores, distance decoding, and transform batching. No new optimization is opened unless this final profile exposes a distinct >=2% mechanism outside those closed families.']
+          pathlib.Path('profile-vp8l-composed-v3-final.md').write_text('\n'.join(out))
           PY
-      - run: |
-          rm -f examples/profile_decode.rs
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add profile-vp8l-composed-v3-final.md
-          git commit -m 'Record final composed VP8L profile' || true
-          git push origin HEAD:profile-vp8l-composed-v3-final
+          rm -f examples/profile_vp8l_final.rs
+          cat profile-vp8l-composed-v3-final.md
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add profile-vp8l-composed-v3-final.md; git commit -m 'Record final composed VP8L symbolic profile'; git push origin HEAD:profile-vp8l-composed-v3-final
