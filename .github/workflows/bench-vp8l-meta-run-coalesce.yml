@@ -1,0 +1,25 @@
+name: VP8L meta-Huffman run coalescing
+on:
+  push:
+    branches: [bench-vp8l-meta-run-coalesce]
+    paths: [tools/bench_vp8l_meta_run_coalesce.py, .github/workflows/bench-vp8l-meta-run-coalesce.yml]
+permissions: { contents: write }
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y webp
+      - run: python3 tools/bench_vp8l_meta_run_coalesce.py
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-meta-run-coalesce.md
+          git commit -m 'Record VP8L meta-Huffman run benchmark'
+          git push origin HEAD:bench-vp8l-meta-run-coalesce
