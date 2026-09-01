@@ -1,5 +1,7 @@
 name: Materialize current VP8L cache hash optimization
-on: push
+on:
+  push:
+    branches: [materialize-vp8l-cache-hash-current]
 permissions:
   contents: write
 jobs:
@@ -19,13 +21,8 @@ jobs:
           from pathlib import Path
           p = Path('src/lossless/decoder/mod.rs')
           s = p.read_text()
-          old = """        let [r, g, b, a] = color;
-        let color_u32 =
-            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);
-"""
-          new = """        let [r, g, b, a] = color;
-        let color_u32 = u32::from_be_bytes([a, r, g, b]);
-"""
+          old = "        let [r, g, b, a] = color;\n        let color_u32 =\n            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);\n"
+          new = "        let [r, g, b, a] = color;\n        let color_u32 = u32::from_be_bytes([a, r, g, b]);\n"
           assert old in s
           p.write_text(s.replace(old, new, 1))
           PY
