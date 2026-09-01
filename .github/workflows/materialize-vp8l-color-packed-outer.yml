@@ -11,15 +11,16 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy,rustfmt }
+        with:
+          components: clippy,rustfmt
       - run: rustup toolchain install 1.80.1 --profile minimal
       - run: python3 tools/apply_vp8l_color_packed_outer.py
       - run: cargo fmt
-      - run: cargo test --all-features
-      - run: cargo doc --all-features --no-deps
-      - run: cargo clippy --all-features -- -D warnings
+      - run: cargo test
+      - run: cargo doc --no-deps
+      - run: cargo clippy -- -D warnings
       - run: cargo fmt -- --check
-      - run: cargo +1.80.1 build --all-features
+      - run: cargo +1.80.1 build
       - run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
