@@ -362,6 +362,26 @@ pub fn apply_predictor_transform_13(image_data: &mut [u8], range: Range<usize>, 
     }
 }
 
+#[inline(always)]
+fn inverse_color_pixel_packed(
+    pixel: &mut [u8],
+    red_to_blue: u8,
+    green_to_blue: u8,
+    green_to_red: u8,
+) {
+    let argb = u32::from_le_bytes(pixel[..4].try_into().unwrap());
+    let green = ((argb >> 8) & 0xff) as u8;
+    let mut red = argb & 0xff;
+    let mut blue = (argb >> 16) & 0xff;
+    red += color_transform_delta(green_to_red as i8, green as i8);
+    blue += color_transform_delta(green_to_blue as i8, green as i8);
+    red &= 0xff;
+    blue += color_transform_delta(red_to_blue as i8, red as u8 as i8);
+    blue &= 0xff;
+    let out = (argb & 0xff00_ff00) | red | (blue << 16);
+    pixel[..4].copy_from_slice(&out.to_le_bytes());
+}
+
 pub(crate) fn apply_color_transform(
     image_data: &mut [u8],
     width: u16,
@@ -373,9 +393,6 @@ pub(crate) fn apply_color_transform(
 
     for (y, row) in image_data.chunks_exact_mut(width * 4).enumerate() {
         let row_transform_data_start = (y >> size_bits) * block_xsize * 4;
-        // the length of block_tf_data should be `block_xsize * 4`, so we could slice it with [..block_xsize * 4]
-        // but there is no point - `.zip()` runs until either of the iterators is consumed,
-        // so the extra slicing operation would be doing more work for no reason
         let row_tf_data = &transform_data[row_transform_data_start..];
 
         for (block, transform) in row
@@ -387,16 +404,7 @@ pub(crate) fn apply_color_transform(
             let green_to_red = transform[2];
 
             for pixel in block.chunks_exact_mut(4) {
-                let green = u32::from(pixel[1]);
-                let mut temp_red = u32::from(pixel[0]);
-                let mut temp_blue = u32::from(pixel[2]);
-
-                temp_red += color_transform_delta(green_to_red as i8, green as i8);
-                temp_blue += color_transform_delta(green_to_blue as i8, green as i8);
-                temp_blue += color_transform_delta(red_to_blue as i8, temp_red as i8);
-
-                pixel[0] = (temp_red & 0xff) as u8;
-                pixel[2] = (temp_blue & 0xff) as u8;
+                inverse_color_pixel_packed(pixel, red_to_blue, green_to_blue, green_to_red);
             }
         }
     }
