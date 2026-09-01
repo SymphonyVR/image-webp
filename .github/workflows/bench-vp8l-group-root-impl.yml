@@ -14,9 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: rustup toolchain install 1.80.1 --profile minimal --component clippy
       - name: Materialize candidate
         run: |
           python3 tools/materialize_vp8l_group_huffman.py
@@ -28,7 +26,7 @@ jobs:
         run: cargo test -q
       - name: Docs
         run: cargo doc --no-deps
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy on MSRV
+        run: cargo +1.80.1 clippy --all-targets -- -D warnings
       - name: MSRV
         run: cargo +1.80.1 build -q
