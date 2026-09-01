@@ -101,27 +101,33 @@ pub fn apply_predictor_transform_1(image_data: &mut [u8], range: Range<usize>, _
     }
 }
 pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4]);
-        i += 1;
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let top = &old[range.start - width * 4..];
+    for (pixel, predictor) in current.chunks_exact_mut(4).zip(top.chunks_exact(4)) {
+        store_predictor_u32(
+            pixel,
+            add_predictor_u32(load_predictor_u32(pixel), load_predictor_u32(predictor)),
+        );
     }
 }
 pub fn apply_predictor_transform_3(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4 + 4]);
-        i += 1;
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let top_right = &old[range.start - width * 4 + 4..];
+    for (pixel, predictor) in current.chunks_exact_mut(4).zip(top_right.chunks_exact(4)) {
+        store_predictor_u32(
+            pixel,
+            add_predictor_u32(load_predictor_u32(pixel), load_predictor_u32(predictor)),
+        );
     }
 }
 pub fn apply_predictor_transform_4(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4 - 4]);
-        i += 1;
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let top_left = &old[range.start - width * 4 - 4..];
+    for (pixel, predictor) in current.chunks_exact_mut(4).zip(top_left.chunks_exact(4)) {
+        store_predictor_u32(
+            pixel,
+            add_predictor_u32(load_predictor_u32(pixel), load_predictor_u32(predictor)),
+        );
     }
 }
 pub fn apply_predictor_transform_5(image_data: &mut [u8], range: Range<usize>, width: usize) {
@@ -607,6 +613,23 @@ fn average2(a: u8, b: u8) -> u8 {
 /// LLVM is capable of optimizing `average2` into this but not in all cases.
 fn average2_autovec(a: u8, b: u8) -> u8 {
     (a & b) + ((a ^ b) >> 1)
+}
+
+#[inline(always)]
+fn load_predictor_u32(pixel: &[u8]) -> u32 {
+    u32::from_le_bytes(pixel[..4].try_into().unwrap())
+}
+
+#[inline(always)]
+fn store_predictor_u32(pixel: &mut [u8], value: u32) {
+    pixel[..4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[inline(always)]
+fn add_predictor_u32(a: u32, b: u32) -> u32 {
+    let hi = (a & 0xff00_ff00).wrapping_add(b & 0xff00_ff00);
+    let lo = (a & 0x00ff_00ff).wrapping_add(b & 0x00ff_00ff);
+    (hi & 0xff00_ff00) | (lo & 0x00ff_00ff)
 }
 
 /// Clamp add subtract full on one part
