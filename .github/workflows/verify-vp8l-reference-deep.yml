@@ -2,7 +2,10 @@ name: Deep VP8L libwebp differential
 on:
   push:
     branches: [verify-vp8l-reference-deep]
-    paths: [tools/verify_vp8l_reference_deep.py, .github/workflows/verify-vp8l-reference-deep.yml]
+    paths:
+      - tools/verify_vp8l_reference_deep.py
+      - tools/verify_vp8l_reference_deep_v2.py
+      - .github/workflows/verify-vp8l-reference-deep.yml
 permissions: { contents: write }
 jobs:
   verify:
@@ -15,15 +18,13 @@ jobs:
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y webp python3-pil
-      - name: Use stable test feature set
-        run: sed -i "s/'--all-features',//" tools/verify_vp8l_reference_deep.py
-      - run: python3 tools/verify_vp8l_reference_deep.py
+      - run: python3 tools/verify_vp8l_reference_deep_v2.py
       - if: always()
         run: |
-          if [ -f verification-vp8l-reference-deep.md ]; then
+          if [ -f verification-vp8l-reference-deep-v2.md ]; then
             git config user.name github-actions[bot]
             git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-            git add verification-vp8l-reference-deep.md
-            git commit -m 'Record deep VP8L differential verification' || true
+            git add verification-vp8l-reference-deep-v2.md
+            git commit -m 'Record corrected deep VP8L differential verification' || true
             git push origin HEAD:verify-vp8l-reference-deep
           fi
