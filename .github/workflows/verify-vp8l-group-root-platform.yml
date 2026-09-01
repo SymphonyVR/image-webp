@@ -1,0 +1,83 @@
+name: Verify VP8L group-static roots across platforms
+
+on:
+  push:
+    branches: [verify-vp8l-group-root-platform]
+    paths: [.github/workflows/verify-vp8l-group-root-platform.yml]
+  workflow_dispatch:
+
+jobs:
+  stable:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: windows-x64
+            os: windows-latest
+          - name: macos
+            os: macos-latest
+    name: stable-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Materialize candidate
+        run: |
+          python tools/materialize_vp8l_group_huffman.py
+          python tools/materialize_vp8l_group_parse.py
+          python tools/materialize_vp8l_group_decode.py
+          cargo fmt
+          git diff --check
+      - name: Debug tests
+        run: cargo test
+      - name: Release tests
+        run: cargo test --release
+      - name: Docs
+        run: cargo doc --no-deps
+
+  msrv:
+    name: msrv-1.80.1-linux-x64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: dtolnay/rust-toolchain@1.80.1
+      - name: Materialize candidate
+        run: |
+          python tools/materialize_vp8l_group_huffman.py
+          python tools/materialize_vp8l_group_parse.py
+          python tools/materialize_vp8l_group_decode.py
+          cargo fmt
+          git diff --check
+      - run: cargo build
+      - run: cargo build --release
+
+  big-endian:
+    name: powerpc64-big-endian
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Materialize candidate
+        run: |
+          python tools/materialize_vp8l_group_huffman.py
+          python tools/materialize_vp8l_group_parse.py
+          python tools/materialize_vp8l_group_decode.py
+          cargo fmt
+          git diff --check
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 4648ce9 --locked
+      - name: PowerPC big-endian tests
+        run: cross test --target powerpc64-unknown-linux-gnu
