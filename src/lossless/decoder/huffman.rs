@@ -5,11 +5,17 @@ use crate::decoder::DecodingError;
 
 const MAX_ALLOWED_CODE_LENGTH: usize = 15;
 const MAX_TABLE_BITS: u8 = 9;
+const WIDE_TABLE_BITS: u8 = 11;
 
 #[derive(Clone, Debug)]
 enum HuffmanTreeInner {
     Single(u16),
     Tree {
+        table_mask: u16,
+        primary_table: Vec<u16>,
+        secondary_table: Vec<u16>,
+    },
+    WideTree {
         table_mask: u16,
         primary_table: Vec<u16>,
         secondary_table: Vec<u16>,
@@ -85,7 +91,14 @@ impl HuffmanTree {
         }
 
         // Calculate table/tree parameters
-        let table_bits = (max_length as u16).min(u16::from(MAX_TABLE_BITS));
+        let long_symbols: usize = histogram[10..=MAX_ALLOWED_CODE_LENGTH].iter().sum();
+        let use_wide = num_symbols >= 256 && long_symbols * 8 >= num_symbols;
+        let max_table_bits = if use_wide {
+            WIDE_TABLE_BITS
+        } else {
+            MAX_TABLE_BITS
+        };
+        let table_bits = (max_length as u16).min(u16::from(max_table_bits));
         let table_size = (1 << table_bits) as usize;
         let table_mask = table_size as u16 - 1;
         let mut primary_table = vec![0; table_size];
@@ -165,11 +178,20 @@ impl HuffmanTree {
         // Ensure indexes into the secondary table fit in 12 bits.
         assert!(secondary_table.len() <= 4096);
 
-        Ok(Self(HuffmanTreeInner::Tree {
-            table_mask,
-            primary_table,
-            secondary_table,
-        }))
+        let inner = if use_wide && table_bits > u16::from(MAX_TABLE_BITS) {
+            HuffmanTreeInner::WideTree {
+                table_mask,
+                primary_table,
+                secondary_table,
+            }
+        } else {
+            HuffmanTreeInner::Tree {
+                table_mask,
+                primary_table,
+                secondary_table,
+            }
+        };
+        Ok(Self(inner))
     }
 
     pub(crate) const fn build_single_node(symbol: u16) -> Self {
@@ -204,6 +226,22 @@ impl HuffmanTree {
         Ok(secondary_entry >> 4)
     }
 
+    #[inline(never)]
+    fn read_symbol_wide_slowpath<R: BufRead>(
+        secondary_table: &[u16],
+        v: u16,
+        primary_table_entry: u16,
+        bit_reader: &mut BitReader<R>,
+    ) -> Result<u16, DecodingError> {
+        let length = primary_table_entry >> 12;
+        let mask = (1 << (length - WIDE_TABLE_BITS as u16)) - 1;
+        let secondary_index = ((primary_table_entry & 0xfff) as usize)
+            + ((v >> WIDE_TABLE_BITS) as usize & mask as usize);
+        let secondary_entry = secondary_table[secondary_index];
+        bit_reader.consume((secondary_entry & 0xf) as u8)?;
+        Ok(secondary_entry >> 4)
+    }
+
     /// Reads a symbol using the bit reader.
     ///
     /// You must call call `bit_reader.fill()` before calling this function or it may erroroneosly
@@ -227,6 +265,19 @@ impl HuffmanTree {
 
                 Self::read_symbol_slowpath(secondary_table, v, entry, bit_reader)
             }
+            HuffmanTreeInner::WideTree {
+                primary_table,
+                secondary_table,
+                table_mask,
+            } => {
+                let v = bit_reader.peek_full() as u16;
+                let entry = primary_table[(v & table_mask) as usize];
+                if (entry >> 12) <= WIDE_TABLE_BITS as u16 {
+                    bit_reader.consume((entry >> 12) as u8)?;
+                    return Ok(entry & 0xfff);
+                }
+                Self::read_symbol_wide_slowpath(secondary_table, v, entry, bit_reader)
+            }
             HuffmanTreeInner::Single(symbol) => Ok(*symbol),
         }
     }
@@ -245,6 +296,18 @@ impl HuffmanTree {
                 let v = bit_reader.peek_full() as u16;
                 let entry = primary_table[(v & table_mask) as usize];
                 if (entry >> 12) <= MAX_TABLE_BITS as u16 {
+                    return Some(((entry >> 12) as u8, entry & 0xfff));
+                }
+                None
+            }
+            HuffmanTreeInner::WideTree {
+                primary_table,
+                table_mask,
+                ..
+            } => {
+                let v = bit_reader.peek_full() as u16;
+                let entry = primary_table[(v & table_mask) as usize];
+                if (entry >> 12) <= WIDE_TABLE_BITS as u16 {
                     return Some(((entry >> 12) as u8, entry & 0xfff));
                 }
                 None
