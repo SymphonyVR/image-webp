@@ -38,7 +38,6 @@
             match &groups[huff_index] {
                 HuffmanCodeGroup::Normal(tree) => self.decode_image_data_block::<9>(
                     width,
-                    num_values,
                     data,
                     tree,
                     color_cache,
@@ -47,7 +46,6 @@
                 )?,
                 HuffmanCodeGroup::Wide(tree) => self.decode_image_data_block::<11>(
                     width,
-                    num_values,
                     data,
                     tree,
                     color_cache,
@@ -64,13 +62,13 @@
     fn decode_image_data_block<const TABLE_BITS: u8>(
         &mut self,
         width: u16,
-        num_values: usize,
         data: &mut [u8],
         tree: &[HuffmanTree<TABLE_BITS>; HUFFMAN_CODES_PER_META_CODE],
         color_cache: &mut Option<ColorCache>,
         index: &mut usize,
         block_end: usize,
     ) -> Result<(), DecodingError> {
+        let num_values = data.len() / 4;
         debug_assert!(*index < block_end);
 
         if tree[..4].iter().all(|t| t.is_single_node()) {
@@ -178,4 +176,3 @@
 
         Ok(())
     }
-
