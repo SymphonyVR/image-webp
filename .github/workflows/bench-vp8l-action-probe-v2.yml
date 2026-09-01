@@ -1,0 +1,13 @@
+name: VP8L action probe v2
+
+on:
+  push:
+    branches:
+      - bench-vp8l-action-probe-v2
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo ACTIONS_OK
