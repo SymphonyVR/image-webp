@@ -67,8 +67,8 @@ old = '''        for _i in 0..num_huff_groups {
 '''
 new = '''        for _i in 0..num_huff_groups {
             let mut specs = Vec::with_capacity(HUFFMAN_CODES_PER_META_CODE);
-            for j in 0..HUFFMAN_CODES_PER_META_CODE {
-                let mut alphabet_size = ALPHABET_SIZE[j];
+            for (j, &base_alphabet_size) in ALPHABET_SIZE.iter().enumerate() {
+                let mut alphabet_size = base_alphabet_size;
                 if j == 0 {
                     if let Some(color_cache) = color_cache.as_ref() {
                         alphabet_size += 1 << color_cache.color_cache_bits;
