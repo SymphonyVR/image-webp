@@ -1,95 +1,27 @@
 name: Benchmark scratchless VP8L palette current final
 on:
   push:
-    branches: [ bench-vp8l-palette-noscratch-current ]
-    paths: [ .github/workflows/bench-vp8l-palette-noscratch-current.yml ]
-permissions: { contents: write }
+    branches: [bench-vp8l-palette-noscratch-current]
+    paths:
+      - tools/bench_vp8l_palette_noscratch_current.py
+      - .github/workflows/bench-vp8l-palette-noscratch-current.yml
+permissions:
+  contents: write
 jobs:
   bench:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy,rustfmt }
-      - name: Build candidate
-        shell: bash
-        run: |
-          set -euxo pipefail
-          BASE=$(git rev-parse HEAD^);echo "BASE=$BASE" >> "$GITHUB_ENV";echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
-          git worktree add --detach /tmp/base "$BASE";git worktree add --detach /tmp/cand "$BASE"
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('/tmp/cand/src/lossless/decoder/reverse_transform.rs');s=p.read_text()
-          a=s.index('    let mut packed_indices_for_row: Vec<u8> = vec![0; packed_image_width_in_blocks];')
-          b=s.index('\n}\n\n//predictor functions',a)
-          new='''    for y_rev_idx in 0..height as usize {
-        let y = height as usize - 1 - y_rev_idx;
-        let packed_row_input_global_offset = y * input_stride_bytes_packed;
-        let output_row_global_offset = y * output_stride_bytes_expanded;
-
-        for block_index in (0..packed_image_width_in_blocks).rev() {
-            let packed_index = image_data[packed_row_input_global_offset + block_index * 4 + 1];
-            let output_offset = output_row_global_offset + block_index * EXP_ENTRY_SIZE;
-            let is_final = block_index + 1 == packed_image_width_in_blocks;
-            if is_final && final_block_expanded_size_bytes != EXP_ENTRY_SIZE {
-                image_data[output_offset..output_offset + final_block_expanded_size_bytes]
-                    .copy_from_slice(&expanded_lookup_table_array[packed_index as usize][..final_block_expanded_size_bytes]);
-            } else {
-                let dst: &mut [u8; EXP_ENTRY_SIZE] = image_data[output_offset..output_offset + EXP_ENTRY_SIZE]
-                    .try_into().unwrap();
-                *dst = expanded_lookup_table_array[packed_index as usize];
-            }
-        }
-    }
-'''
-          p.write_text(s[:a]+new+s[b:])
-          PY
-          rustup toolchain install 1.80.1 --profile minimal
-          cd /tmp/cand;cargo fmt;cargo test -q;cargo test --release -q;cargo doc --no-deps -q;cargo clippy -- -D warnings;cargo fmt -- --check;cargo +1.80.1 build -q
-      - name: Benchmark
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 - <<'PY' >/tmp/files.txt
-          from pathlib import Path
-          def chunks(d):
-            if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return []
-            o=[];p=12
-            while p+8<=len(d):f=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(f);p+=8+n+(n&1)
-            return o
-          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
-            c=chunks(p.read_bytes())
-            if b'VP8L' in c and b'ANIM' not in c:print(p)
-          PY
-          sudo apt-get update -qq;sudo apt-get install -y webp >/dev/null
-          python3 - <<'PY'
-          w=h=2048;colors=[(10,20,30),(230,40,80),(20,220,60),(80,90,240),(240,210,20),(160,30,200),(30,200,210),(245,245,245)]
-          with open('/tmp/palette.ppm','wb') as f:
-            f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
-            for y in range(h):
-              for x in range(w):
-                c=colors[((x>>5)+(y>>5)*3)&7];i=x*3;row[i:i+3]=bytes(c)
-              f.write(row)
-          PY
-          cwebp -quiet -lossless -z 9 /tmp/palette.ppm -o /tmp/palette.webp
-          cat >/tmp/b.rs <<'RS'
-          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
-          RS
-          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/palc.rs";(cd "$d"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example palc -q);done
-          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/palc;C=/tmp/cand/target/release/examples/palc;diff -u <($B h 1 "${BF[@]}" /tmp/palette.webp) <($C h 1 "${CF[@]}" /tmp/palette.webp)
-          : >/tmp/r.tsv;for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 60 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" t 4 /tmp/palette.webp);printf 'palette\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
-          python3 - <<'PY'
-          import csv,statistics,os;from pathlib import Path
-          R=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={}
-          for w,r,v,x in R:rr.setdefault((w,int(r)),{})[v]=float(x)
-          L=['# VP8L scratchless palette current-final benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests + release tests + docs + Clippy + fmt + MSRV passed','','| workload | paired median | positive | range |','|---|---:|---:|---:|']
-          for w in ('corpus','palette'):
-            q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | {statistics.median(q):.4f}x | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
-          Path('benchmark-vp8l-palette-noscratch-current.md').write_text('\n'.join(L+['']))
-          PY
-          cat benchmark-vp8l-palette-noscratch-current.md
-      - name: Persist
+        with:
+          components: clippy,rustfmt
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Benchmark current final
+        run: python3 tools/bench_vp8l_palette_noscratch_current.py
+      - name: Persist result
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
