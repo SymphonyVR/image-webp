@@ -4,5 +4,5 @@
 
 | fixture | transforms | has color transform |
 |---|---|---|
-| large.webp | [] | False |
-| color.webp | [] | False |
+| large.webp | [0, 1] | True |
+| color.webp | [2, 0, 1] | True |
