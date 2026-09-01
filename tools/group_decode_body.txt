@@ -1,0 +1,181 @@
+    /// Decodes the image data using the huffman trees and either of the 3 methods of decoding
+    fn decode_image_data(
+        &mut self,
+        width: u16,
+        height: u16,
+        mut huffman_info: HuffmanInfo,
+        data: &mut [u8],
+    ) -> Result<(), DecodingError> {
+        let num_values = usize::from(width) * usize::from(height);
+        let width_usize = usize::from(width);
+        let mut index = 0usize;
+
+        while index < num_values {
+            let (huff_index, block_end) = if huffman_info.bits == 0 {
+                (0usize, num_values)
+            } else {
+                let y = index / width_usize;
+                let x = index - y * width_usize;
+                let meta_width = usize::from(huffman_info.xsize);
+                let meta_x = x >> huffman_info.bits;
+                let meta_y = y >> huffman_info.bits;
+                let pos = meta_y * meta_width + meta_x;
+                let huff_index = usize::from(huffman_info.image[pos]);
+                let row_end = (meta_y + 1) * meta_width;
+                let mut end_pos = pos + 1;
+                while end_pos < row_end
+                    && usize::from(huffman_info.image[end_pos]) == huff_index
+                {
+                    end_pos += 1;
+                }
+                let run_end_meta = end_pos - meta_y * meta_width;
+                let run_end_x = (run_end_meta << huffman_info.bits).min(width_usize);
+                (huff_index, y * width_usize + run_end_x)
+            };
+
+            let groups = &huffman_info.huffman_code_groups;
+            let color_cache = &mut huffman_info.color_cache;
+            match &groups[huff_index] {
+                HuffmanCodeGroup::Normal(tree) => self.decode_image_data_block::<9>(
+                    width,
+                    num_values,
+                    data,
+                    tree,
+                    color_cache,
+                    &mut index,
+                    block_end,
+                )?,
+                HuffmanCodeGroup::Wide(tree) => self.decode_image_data_block::<11>(
+                    width,
+                    num_values,
+                    data,
+                    tree,
+                    color_cache,
+                    &mut index,
+                    block_end,
+                )?,
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn decode_image_data_block<const TABLE_BITS: u8>(
+        &mut self,
+        width: u16,
+        num_values: usize,
+        data: &mut [u8],
+        tree: &[HuffmanTree<TABLE_BITS>; HUFFMAN_CODES_PER_META_CODE],
+        color_cache: &mut Option<ColorCache>,
+        index: &mut usize,
+        block_end: usize,
+    ) -> Result<(), DecodingError> {
+        debug_assert!(*index < block_end);
+
+        if tree[..4].iter().all(|t| t.is_single_node()) {
+            self.bit_reader.fill()?;
+            let code = tree[GREEN].read_symbol(&mut self.bit_reader)?;
+            if code < 256 {
+                let n = block_end - *index;
+                let red = tree[RED].read_symbol(&mut self.bit_reader)?;
+                let blue = tree[BLUE].read_symbol(&mut self.bit_reader)?;
+                let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)?;
+                let value = [red as u8, code as u8, blue as u8, alpha as u8];
+                let byte_start = *index * 4;
+                let byte_end = (*index + n) * 4;
+                for pixel in data[byte_start..byte_end].chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&value);
+                }
+                if let Some(color_cache) = color_cache.as_mut() {
+                    color_cache.insert(value);
+                }
+                *index += n;
+                return Ok(());
+            }
+        }
+
+        while *index < num_values && *index < block_end {
+            self.bit_reader.fill()?;
+            let code = tree[GREEN].read_symbol(&mut self.bit_reader)?;
+
+            if code < 256 {
+                let green = code as u8;
+                let red = tree[RED].read_symbol(&mut self.bit_reader)? as u8;
+                let blue = tree[BLUE].read_symbol(&mut self.bit_reader)? as u8;
+                if self.bit_reader.nbits < 15 {
+                    self.bit_reader.fill()?;
+                }
+                let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8;
+
+                data[*index * 4] = red;
+                data[*index * 4 + 1] = green;
+                data[*index * 4 + 2] = blue;
+                data[*index * 4 + 3] = alpha;
+
+                if let Some(color_cache) = color_cache.as_mut() {
+                    color_cache.insert([red, green, blue, alpha]);
+                }
+                *index += 1;
+            } else if code < 256 + 24 {
+                let length_symbol = code - 256;
+                let length = Self::get_copy_distance(&mut self.bit_reader, length_symbol)?;
+                let dist_symbol = tree[DIST].read_symbol(&mut self.bit_reader)?;
+                let dist_code = Self::get_copy_distance(&mut self.bit_reader, dist_symbol)?;
+                let dist = Self::plane_code_to_distance(width, dist_code);
+
+                if *index < dist || num_values - *index < length {
+                    return Err(DecodingError::BitStreamError);
+                }
+
+                if dist == 1 {
+                    let value: [u8; 4] = data[(*index - dist) * 4..][..4].try_into().unwrap();
+                    for i in 0..length {
+                        data[*index * 4 + i * 4..][..4].copy_from_slice(&value);
+                    }
+                } else {
+                    if *index + length + 3 <= num_values {
+                        let start = (*index - dist) * 4;
+                        data.copy_within(start..start + 16, *index * 4);
+                        if length > 4 || dist < 4 {
+                            for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {
+                                data.copy_within(start + i..start + i + 16, *index * 4 + i);
+                            }
+                        }
+                    } else {
+                        for i in 0..length * 4 {
+                            data[*index * 4 + i] = data[*index * 4 + i - dist * 4];
+                        }
+                    }
+
+                    if let Some(color_cache) = color_cache.as_mut() {
+                        let cache_pixels = length.min(dist);
+                        let cache_start = *index + length - cache_pixels;
+                        for pixel in data[cache_start * 4..][..cache_pixels * 4].chunks_exact(4) {
+                            color_cache.insert(pixel.try_into().unwrap());
+                        }
+                    }
+                }
+                *index += length;
+            } else {
+                let color_cache = color_cache.as_mut().ok_or(DecodingError::BitStreamError)?;
+                let color = color_cache.lookup((code - 280).into());
+                data[*index * 4..][..4].copy_from_slice(&color);
+                *index += 1;
+
+                if *index < block_end {
+                    if let Some((bits, code)) = tree[GREEN].peek_symbol(&self.bit_reader) {
+                        if code >= 280 {
+                            self.bit_reader.consume(bits)?;
+                            data[*index * 4..][..4]
+                                .copy_from_slice(&color_cache.lookup((code - 280).into()));
+                            *index += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
