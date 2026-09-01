@@ -16,7 +16,11 @@ def patch(root):
  old='''                    let x = index % usize::from(width);\n                    let y = index / usize::from(width);\n                    next_block_start = (x | usize::from(huffman_info.mask))\n                        .min(usize::from(width - 1))\n                        + y * usize::from(width)\n                        + 1;\n                    huffman_info.get_huff_index(x as u16, y as u16)\n'''
  new='''                    let width = usize::from(width);\n                    let x = index % width;\n                    let y = index / width;\n                    let block_x = x >> huffman_info.bits;\n                    let block_y = y >> huffman_info.bits;\n                    let huff_xsize = usize::from(huffman_info.xsize);\n                    let row_start = block_y * huff_xsize;\n                    let huff_index = usize::from(huffman_info.image[row_start + block_x]);\n                    let mut run_end = block_x + 1;\n                    while run_end < huff_xsize\n                        && usize::from(huffman_info.image[row_start + run_end]) == huff_index\n                    {\n                        run_end += 1;\n                    }\n                    next_block_start = (y * width + (run_end << huffman_info.bits).min(width))\n                        .min(num_values);\n                    huff_index\n'''
  if old not in s:raise SystemExit('dispatch marker missing')
- p.write_text(s.replace(old,new,1))
+ s=s.replace(old,new,1)
+ s=s.replace('''    mask: u16,\n''','',1)
+ s=s.replace('''            mask: huffman_mask,\n''','',1)
+ s=s.replace('''        let huffman_mask = if huffman_bits == 0 {\n            !0\n        } else {\n            (1 << huffman_bits) - 1\n        };\n\n''','',1)
+ p.write_text(s)
 def prep(name):
  r=TMP/name;run(['git','worktree','add','--detach',str(r),BASE])
  if name=='cand':patch(r);run(['cargo','fmt'],cwd=r);run(['cargo','test','-q'],cwd=r);run(['cargo','doc','-q'],cwd=r);run(['cargo','clippy','--all-features','--','-D','warnings'],cwd=r);run(['cargo','fmt','--','--check'],cwd=r);run(['cargo','+1.80.1','build','-q'],cwd=r)
