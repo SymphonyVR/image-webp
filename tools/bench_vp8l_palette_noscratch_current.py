@@ -12,15 +12,13 @@ NEW=r'''    for y_rev_idx in 0..height as usize {
         for block_index in (0..packed_image_width_in_blocks).rev() {
             let packed_index = image_data[packed_row_input_global_offset + block_index * 4 + 1];
             let output_offset = output_row_global_offset + block_index * EXP_ENTRY_SIZE;
-            let is_final = block_index + 1 == packed_image_width_in_blocks;
-            if is_final && final_block_expanded_size_bytes != EXP_ENTRY_SIZE {
-                image_data[output_offset..output_offset + final_block_expanded_size_bytes]
-                    .copy_from_slice(&expanded_lookup_table_array[packed_index as usize][..final_block_expanded_size_bytes]);
+            let copy_len = if block_index + 1 == packed_image_width_in_blocks {
+                final_block_expanded_size_bytes
             } else {
-                let dst: &mut [u8; EXP_ENTRY_SIZE] = image_data[output_offset..output_offset + EXP_ENTRY_SIZE]
-                    .try_into().unwrap();
-                *dst = expanded_lookup_table_array[packed_index as usize];
-            }
+                EXP_ENTRY_SIZE
+            };
+            image_data[output_offset..output_offset + copy_len]
+                .copy_from_slice(&expanded_lookup_table_array[packed_index as usize][..copy_len]);
         }
     }
 '''
