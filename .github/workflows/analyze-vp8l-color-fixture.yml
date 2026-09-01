@@ -2,7 +2,7 @@ name: VP8L color fixture analysis
 on:
   push:
     branches: [analyze-vp8l-color-fixture]
-    paths: [tools/analyze_vp8l_color_fixture.py, .github/workflows/analyze-vp8l-color-fixture.yml]
+    paths: [tools/analyze_vp8l_color_fixture_fixed.py, .github/workflows/analyze-vp8l-color-fixture.yml]
 permissions: { contents: write }
 jobs:
   analyze:
@@ -14,7 +14,7 @@ jobs:
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y webp
-      - run: python3 tools/analyze_vp8l_color_fixture.py
+      - run: python3 tools/analyze_vp8l_color_fixture_fixed.py
       - run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
