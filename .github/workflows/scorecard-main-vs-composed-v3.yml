@@ -3,7 +3,7 @@ on:
   push:
     branches: [scorecard-main-vs-composed-v3]
     paths:
-      - tools/scorecard_main_vs_composed_v3.py
+      - tools/scorecard_main_vs_composed_v3_v2.py
       - .github/workflows/scorecard-main-vs-composed-v3.yml
 permissions: { contents: write }
 jobs:
@@ -16,9 +16,7 @@ jobs:
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y webp unzip curl
-      - name: Pin current main
-        run: sed -i 's/bfa862cec91203ff894d9b37fa3df3f88384a549/f4d80bd965df2c81e65b6f43c1f70e0750bd4b0f/' tools/scorecard_main_vs_composed_v3.py
-      - run: python3 tools/scorecard_main_vs_composed_v3.py
+      - run: python3 tools/scorecard_main_vs_composed_v3_v2.py
       - if: always()
         run: |
           if [ -f scorecard-main-vs-composed-v3.md ]; then
