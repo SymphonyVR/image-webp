@@ -1,0 +1,35 @@
+name: VP8L transform closure v2
+
+on:
+  push:
+    branches:
+      - bench-vp8l-transform-closure-v2
+    paths:
+      - tools/bench_vp8l_transform_closure.py
+      - .github/workflows/bench-vp8l-transform-closure-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install benchmark dependencies
+        run: |
+          rustup toolchain install 1.80.1 --profile minimal
+          sudo apt-get update -qq
+          sudo apt-get install -y webp
+      - name: Run closure matrix
+        run: python3 tools/bench_vp8l_transform_closure.py
+      - name: Persist results
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-transform-closure-v2.md
+          git commit -m 'Record VP8L transform closure matrix'
+          git push origin HEAD:bench-vp8l-transform-closure-v2
