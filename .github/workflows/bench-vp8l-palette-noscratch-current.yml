@@ -20,7 +20,9 @@ jobs:
       - run: rustup toolchain install 1.80.1 --profile minimal
       - run: sudo apt-get update -qq && sudo apt-get install -y webp
       - name: Benchmark current final
-        run: python3 tools/bench_vp8l_palette_noscratch_current.py
+        run: |
+          sed -i 's/0881ec1a66f09e11b766c309cf6e651077775bd9/6f8f7d994e2f747d46621812e01c27a29ff4be4a/' tools/bench_vp8l_palette_noscratch_current.py
+          python3 tools/bench_vp8l_palette_noscratch_current.py
       - name: Persist result
         run: |
           git config user.name github-actions[bot]
