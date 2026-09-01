@@ -1,0 +1,44 @@
+name: Current platform verification matrix
+on:
+  push:
+    branches: [verify-current-platform-matrix]
+    paths: [.github/workflows/verify-current-platform-matrix.yml]
+jobs:
+  stable:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: windows-x64
+            os: windows-latest
+          - name: macos
+            os: macos-latest
+    name: stable-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - name: Toolchain identity
+        run: rustc -vV
+      - name: Tests
+        run: cargo test --all-features
+      - name: Docs
+        run: cargo doc --all-features --no-deps
+      - name: Clippy
+        run: cargo clippy --all-features -- -D warnings
+      - name: Format
+        run: cargo fmt -- --check
+  msrv:
+    name: msrv-1.80.1-linux-x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80.1
+      - run: rustc -vV
+      - run: cargo build --all-features
+      - run: cargo test --all-features
