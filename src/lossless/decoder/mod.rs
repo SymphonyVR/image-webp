@@ -322,19 +322,12 @@ impl<R: BufRead> LosslessDecoder<R> {
             hufftree_groups.push(group);
         }
 
-        let huffman_mask = if huffman_bits == 0 {
-            !0
-        } else {
-            (1 << huffman_bits) - 1
-        };
-
         let info = HuffmanInfo {
             xsize: huffman_xsize,
             _ysize: huffman_ysize,
             color_cache,
             image: entropy_image,
             bits: huffman_bits,
-            mask: huffman_mask,
             huffman_code_groups: hufftree_groups,
         };
 
@@ -476,13 +469,25 @@ impl<R: BufRead> LosslessDecoder<R> {
                     next_block_start = num_values;
                     0
                 } else {
-                    let x = index % usize::from(width);
-                    let y = index / usize::from(width);
-                    next_block_start = (x | usize::from(huffman_info.mask))
-                        .min(usize::from(width - 1))
-                        + y * usize::from(width)
-                        + 1;
-                    huffman_info.get_huff_index(x as u16, y as u16)
+                    let width_usize = usize::from(width);
+                    let y = index / width_usize;
+                    let x = index - y * width_usize;
+                    let meta_width = usize::from(huffman_info.xsize);
+                    let meta_x = x >> huffman_info.bits;
+                    let meta_y = y >> huffman_info.bits;
+                    let pos = meta_y * meta_width + meta_x;
+                    let huff_index = usize::from(huffman_info.image[pos]);
+                    let row_end = (meta_y + 1) * meta_width;
+                    let mut end_pos = pos + 1;
+                    while end_pos < row_end
+                        && usize::from(huffman_info.image[end_pos]) == huff_index
+                    {
+                        end_pos += 1;
+                    }
+                    let run_end_meta = end_pos - meta_y * meta_width;
+                    let run_end_x = (run_end_meta << huffman_info.bits).min(width_usize);
+                    next_block_start = y * width_usize + run_end_x;
+                    huff_index
                 };
                 tree = &huffman_info.huffman_code_groups[huff_index];
 
@@ -667,7 +672,6 @@ struct HuffmanInfo {
     color_cache: Option<ColorCache>,
     image: Vec<u16>,
     bits: u8,
-    mask: u16,
     huffman_code_groups: Vec<HuffmanCodeGroup>,
 }
 
