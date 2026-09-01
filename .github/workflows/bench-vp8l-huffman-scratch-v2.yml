@@ -2,7 +2,7 @@ name: VP8L Huffman scratch v2
 on:
   push:
     branches: [bench-vp8l-huffman-scratch-v2]
-    paths: [tools/bench_vp8l_huffman_scratch.py, .github/workflows/bench-vp8l-huffman-scratch-v2.yml]
+    paths: [tools/bench_vp8l_huffman_scratch_fixed.py, .github/workflows/bench-vp8l-huffman-scratch-v2.yml]
 permissions: { contents: write }
 jobs:
   bench:
@@ -15,7 +15,7 @@ jobs:
           rustup toolchain install 1.80.1 --profile minimal
           sudo apt-get update -qq
           sudo apt-get install -y webp
-      - run: python3 tools/bench_vp8l_huffman_scratch.py
+      - run: python3 tools/bench_vp8l_huffman_scratch_fixed.py
       - run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
