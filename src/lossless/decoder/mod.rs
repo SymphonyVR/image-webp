@@ -741,8 +741,7 @@ impl ColorCache {
     #[inline(always)]
     fn insert(&mut self, color: [u8; 4]) {
         let [r, g, b, a] = color;
-        let color_u32 =
-            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);
+        let color_u32 = u32::from_be_bytes([a, r, g, b]);
         let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);
         self.color_cache[index as usize] = color;
     }
