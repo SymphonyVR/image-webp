@@ -1,0 +1,58 @@
+name: Profile VP8L reverse-transform lines
+on:
+  push:
+    branches: [profile-vp8l-reverse-lines-current]
+    paths: [.github/workflows/profile-vp8l-reverse-lines-current.yml]
+permissions: { contents: write }
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Profile annotated source lines
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y valgrind >/dev/null
+          mkdir -p examples
+          cat >examples/profile_reverse.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor};fn main(){let d=std::fs::read("tests/images/gallery2/3_webp_ll.webp").unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[b.len()/2]);}
+          RS
+          CARGO_PROFILE_RELEASE_DEBUG=2 RUSTFLAGS='-C force-frame-pointers=yes' cargo build --release --example profile_reverse
+          taskset -c 0 valgrind --tool=callgrind --collect-jumps=yes --callgrind-out-file=/tmp/v.callgrind target/release/examples/profile_reverse
+          callgrind_annotate --inclusive=no --threshold=0.0 --auto=yes /tmp/v.callgrind >/tmp/annotated.txt
+          echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+      - name: Persist reverse-transform section
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,re,pathlib
+          text=pathlib.Path('/tmp/annotated.txt').read_text(errors='replace').splitlines()
+          hits=[]
+          for i,line in enumerate(text):
+            if 'Auto-annotated source: src/lossless/decoder/reverse_transform.rs' in line:
+              hits.append(i)
+          out=['# VP8L reverse-transform line profile','', '- baseline: `4f322d44fb38747659451db3d7f1dac7ff8ff21f`',f'- CPU: `{os.environ["CPU"]}`','- fixture: gallery2/3 lossless, 800x600','','```text']
+          if not hits:
+            out += ['reverse_transform.rs annotation section not found']
+          else:
+            start=hits[0]
+            section=text[start:start+900]
+            # Keep source context plus every line with a nonzero instruction count.
+            for line in section:
+              if line.startswith('-- Auto-annotated source:') and line != text[start]: break
+              m=re.match(r'\s*([0-9,]+|\.)\s',line)
+              if m and m.group(1) != '.': out.append(line)
+              elif any(k in line for k in ('apply_predictor_transform_', 'apply_color_transform', 'inverse_color_pixel_packed', 'apply_subtract_green_transform')): out.append(line)
+          out += ['```','']
+          pathlib.Path('profile-vp8l-reverse-lines-current.md').write_text('\n'.join(out))
+          PY
+          cat profile-vp8l-reverse-lines-current.md
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add profile-vp8l-reverse-lines-current.md
+          git commit -m 'Record VP8L reverse-transform line profile'
+          git push origin HEAD:profile-vp8l-reverse-lines-current
