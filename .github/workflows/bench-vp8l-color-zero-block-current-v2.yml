@@ -1,0 +1,37 @@
+name: Benchmark VP8L zero-coefficient color transform v2
+on:
+  push:
+    branches: [bench-vp8l-color-zero-block-current]
+    paths: [.github/workflows/bench-vp8l-color-zero-block-current-v2.yml]
+permissions: { contents: write }
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: "clippy,rustfmt"
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Run repaired matrix
+        shell: bash
+        run: |
+          cp tools/bench_vp8l_color_zero_block_current.py /tmp/zero.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/zero.py');s=p.read_text()
+          old=" assert old in s;p.write_text(s.replace(old,new,1))"
+          new=""" assert old in s\n s=s.replace(old,new,1)\n if v=='mask':\n  a=s.index('#[inline(always)]\\nfn inverse_color_pixel_packed(')\n  b=s.index('\\n}\\n\\n#[inline(always)]\\nfn inverse_color_pixel_masked',a)+2\n  s=s[:a]+s[b:]\n p.write_text(s)"""
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+          PY
+          python3 /tmp/zero.py
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-color-zero-block-current.md
+          git commit -m 'Record VP8L zero-coefficient color benchmark'
+          git push origin HEAD:bench-vp8l-color-zero-block-current
