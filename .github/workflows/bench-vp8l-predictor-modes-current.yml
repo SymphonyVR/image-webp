@@ -33,14 +33,20 @@ jobs:
           s=s.replace("VS=('base','direct','avg','both')", "VS=('base','p3','p4','p5','p6','p7','p8','p9','p10')")
           a=s.index('def patch(r,v):')
           b=s.index('def inv(',a)
-          new=r'''def patch(r,v):
- p=r/'src/lossless/decoder/reverse_transform.rs';s=p.read_text();marker='''fn average2_autovec(a: u8, b: u8) -> u8 {\n    (a & b) + ((a ^ b) >> 1)\n}\n''';assert marker in s
- helpers=HELPERS.replace('#[inline(always)] fn average2_u32','#[allow(dead_code)]\n#[inline(always)] fn average2_u32')
- s=s.replace(marker,marker+helpers,1)
- n=int(v[1:])
- a=s.index(f'pub fn apply_predictor_transform_{n}(');b=s.index(f'pub fn apply_predictor_transform_{n+1}(',a);s=s[:a]+BODIES[n]+s[b:]
- p.write_text(s)
-'''
+          new='\n'.join([
+              'def patch(r,v):',
+              " p=r/'src/lossless/decoder/reverse_transform.rs';s=p.read_text()",
+              " marker='fn average2_autovec(a: u8, b: u8) -> u8 {\\n    (a & b) + ((a ^ b) >> 1)\\n}\\n'",
+              ' assert marker in s',
+              " helpers=HELPERS.replace('#[inline(always)] fn average2_u32','#[allow(dead_code)]\\n#[inline(always)] fn average2_u32')",
+              ' s=s.replace(marker,marker+helpers,1)',
+              ' n=int(v[1:])',
+              " a=s.index(f'pub fn apply_predictor_transform_{n}(')",
+              " b=s.index(f'pub fn apply_predictor_transform_{n+1}(',a)",
+              ' s=s[:a]+BODIES[n]+s[b:]',
+              ' p.write_text(s)',
+              '',
+          ])
           s=s[:a]+new+s[b:]
           s=s.replace('for n in range(17):','for n in range(13):')
           s=s.replace('benchmark-vp8l-packed-predictors-current.md','benchmark-vp8l-predictor-modes-current.md')
