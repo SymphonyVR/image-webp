@@ -1,0 +1,115 @@
+name: Benchmark redundant VP8L cache store skip
+on:
+  push:
+    branches: [bench-vp8l-cache-equal-skip-current]
+    paths:
+      - .github/workflows/bench-vp8l-cache-equal-skip-current.yml
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Build candidates and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=$(git rev-parse HEAD^)
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          for v in base skip; do git worktree add --detach "/tmp/$v" "$BASE"; done
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/skip/src/lossless/decoder/mod.rs');s=p.read_text()
+          old='''        let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);\n        self.color_cache[index as usize] = color;\n'''
+          new='''        let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);\n        let slot = &mut self.color_cache[index as usize];\n        if *slot != color {\n            *slot = color;\n        }\n'''
+          assert old in s;p.write_text(s.replace(old,new,1))
+          PY
+          cd /tmp/skip
+          cargo fmt
+          cargo test -q
+          cargo test --release -q
+          cargo doc --no-deps -q
+          cargo clippy -- -D warnings
+          cargo fmt -- --check
+          cargo +1.80.1 build -q
+          cargo +1.80.1 build --release -q
+          cd "$GITHUB_WORKSPACE"
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def chunks(d):
+              if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP': return []
+              o=[];p=12
+              while p+8<=len(d):
+                  t=d[p:p+4];n=int.from_bytes(d[p+4:p+8],'little');o.append(t);p+=8+n+(n&1)
+              return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+              c=chunks(p.read_bytes())
+              if b'VP8L' in c and b'ANIM' not in c: print(p)
+          PY
+          python3 - <<'PY'
+          w=h=2048
+          for kind in ('large','repeat'):
+              with open(f'/tmp/{kind}.ppm','wb') as f:
+                  f.write(f'P6\n{w} {h}\n255\n'.encode());row=bytearray(w*3)
+                  for y in range(h):
+                      for x in range(w):
+                          i=x*3
+                          if kind=='repeat':
+                              q=((x>>4)+(y>>4)*3)&15; c=((q*37)&255,(q*73)&255,(q*109)&255)
+                              row[i:i+3]=bytes(c)
+                          else:
+                              row[i]=(x*3+y*5+((x>>5)^(y>>4))*17)&255
+                              row[i+1]=(x*2+y*7+((x*y)>>10))&255
+                              row[i+2]=(x*11+y*3+((x+y)>>3)*9)&255
+                      f.write(row)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/large.ppm -o /tmp/large.webp
+          cwebp -quiet -lossless -z 9 /tmp/repeat.ppm -o /tmp/repeat.webp
+          cat >/tmp/bench.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};
+          fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}
+          fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}
+          fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:016x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for v in base skip; do mkdir -p "/tmp/$v/examples";cp /tmp/bench.rs "/tmp/$v/examples/cacheeq.rs";(cd "/tmp/$v"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example cacheeq -q);done
+          mapfile -t BF </tmp/files.txt;SF=();for p in "${BF[@]}";do SF+=("${p/\/tmp\/base/\/tmp\/skip}");done
+          B=/tmp/base/target/release/examples/cacheeq;S=/tmp/skip/target/release/examples/cacheeq
+          diff -u <($B h 1 "${BF[@]}" /tmp/large.webp /tmp/repeat.webp) <($S h 1 "${SF[@]}" /tmp/large.webp /tmp/repeat.webp)
+          : >/tmp/r.tsv
+          for r in {1..17};do
+            if ((r%2));then O='base skip';else O='skip base';fi
+            for v in $O;do
+              if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$S;F=("${SF[@]}");fi
+              u=$(taskset -c 0 "$X" t 70 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+              u=$(taskset -c 0 "$X" t 4 /tmp/large.webp);printf 'large\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+              u=$(taskset -c 0 "$X" t 4 /tmp/repeat.webp);printf 'repeat\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv
+            done
+          done
+          python3 - <<'PY'
+          import csv,statistics,os
+          from pathlib import Path
+          rows=list(csv.reader(open('/tmp/r.tsv'),delimiter='\t'));rr={}
+          for w,r,v,x in rows:rr.setdefault((w,int(r)),{})[v]=float(x)
+          out=['# VP8L redundant color-cache store skip benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- hashes + tests + release tests + docs + Clippy + fmt + MSRV debug/release passed','','| workload | paired median | positive | range |','|---|---:|---:|---:|']
+          for w in ('corpus','large','repeat'):
+              q=[z['base']/z['skip'] for (ww,_),z in sorted(rr.items()) if ww==w]
+              out.append(f'| {w} | **{statistics.median(q):.4f}x** | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-cache-equal-skip-current.md').write_text('\n'.join(out)+'\n')
+          PY
+          cat benchmark-vp8l-cache-equal-skip-current.md
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-cache-equal-skip-current.md
+          git commit -m 'Record redundant cache store benchmark'
+          git push origin HEAD:bench-vp8l-cache-equal-skip-current
