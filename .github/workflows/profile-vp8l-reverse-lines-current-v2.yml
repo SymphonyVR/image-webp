@@ -1,0 +1,50 @@
+name: Profile VP8L reverse-transform lines v2
+on:
+  push:
+    branches: [profile-vp8l-reverse-lines-current-v2]
+    paths: [.github/workflows/profile-vp8l-reverse-lines-current-v2.yml]
+permissions: { contents: write }
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Profile explicit source file
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y valgrind >/dev/null
+          mkdir -p examples
+          cat >examples/profile_reverse_v2.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor};fn main(){let d=std::fs::read("tests/images/gallery2/3_webp_ll.webp").unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[b.len()/2]);}
+          RS
+          CARGO_PROFILE_RELEASE_DEBUG=2 RUSTFLAGS='-C force-frame-pointers=yes' cargo build --release --example profile_reverse_v2
+          taskset -c 0 valgrind --tool=callgrind --collect-jumps=yes --callgrind-out-file=/tmp/v.callgrind target/release/examples/profile_reverse_v2
+          callgrind_annotate --inclusive=no --threshold=0.0 /tmp/v.callgrind src/lossless/decoder/reverse_transform.rs >/tmp/reverse.txt
+          echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+      - name: Persist hot source lines
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,re,pathlib
+          lines=pathlib.Path('/tmp/reverse.txt').read_text(errors='replace').splitlines()
+          kept=[]
+          for line in lines:
+              m=re.match(r'\s*([0-9,]+)\s+(.+)$',line)
+              if m and int(m.group(1).replace(',',''))>0:
+                  kept.append((int(m.group(1).replace(',','')),line))
+              elif any(k in line for k in ('apply_predictor_transform','apply_color_transform','inverse_color_pixel_packed','apply_subtract_green_transform','fn average','clamp_add_subtract')):
+                  kept.append((0,line))
+          hot=sorted((x for x in kept if x[0]>0),reverse=True)[:160]
+          out=['# VP8L reverse-transform explicit source profile v2','', '- baseline: `4f322d44fb38747659451db3d7f1dac7ff8ff21f`',f'- CPU: `{os.environ["CPU"]}`','- fixture: gallery2/3 lossless, 800x600','- explicit Callgrind source annotation; top nonzero instruction lines','','```text']+[line for _,line in hot]+['```','']
+          pathlib.Path('profile-vp8l-reverse-lines-current-v2.md').write_text('\n'.join(out))
+          PY
+          cat profile-vp8l-reverse-lines-current-v2.md
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add profile-vp8l-reverse-lines-current-v2.md
+          git commit -m 'Record VP8L reverse-transform source profile v2'
+          git push origin HEAD:profile-vp8l-reverse-lines-current-v2
