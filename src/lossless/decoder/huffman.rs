@@ -129,7 +129,11 @@ impl<const TABLE_BITS: u8> HuffmanTree<TABLE_BITS> {
         }
 
         // Populate the secondary decoding table.
-        let mut secondary_table = Vec::new();
+        let mut secondary_table = if max_length > primary_table_bits {
+            Vec::with_capacity(128)
+        } else {
+            Vec::new()
+        };
         if max_length > primary_table_bits {
             let mut subtable_start = 0;
             let mut subtable_prefix = !0;
