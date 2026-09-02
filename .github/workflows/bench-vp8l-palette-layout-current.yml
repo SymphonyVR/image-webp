@@ -1,0 +1,27 @@
+name: Benchmark VP8L small-palette layout
+on:
+  push:
+    branches: [bench-vp8l-palette-layout-current]
+    paths:
+      - tools/bench_vp8l_palette_layout_current.py
+      - .github/workflows/bench-vp8l-palette-layout-current.yml
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - run: python3 tools/bench_vp8l_palette_layout_current.py
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-palette-layout-current.md
+          git commit -m 'Record VP8L small-palette layout benchmark'
+          git push origin HEAD:bench-vp8l-palette-layout-current
