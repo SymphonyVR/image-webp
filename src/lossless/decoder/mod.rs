@@ -345,10 +345,11 @@ impl<R: BufRead> LosslessDecoder<R> {
                 .collect::<Vec<u16>>();
         }
 
-        let mut hufftree_groups = Vec::new();
+        let mut hufftree_groups = Vec::with_capacity(num_huff_groups as usize);
 
         for _i in 0..num_huff_groups {
-            let mut specs = Vec::with_capacity(HUFFMAN_CODES_PER_META_CODE);
+            let mut specs: [Option<HuffmanCodeSpec>; HUFFMAN_CODES_PER_META_CODE] =
+                [None, None, None, None, None];
             for (j, &base_alphabet_size) in ALPHABET_SIZE.iter().enumerate() {
                 let mut alphabet_size = base_alphabet_size;
                 if j == 0 {
@@ -356,25 +357,30 @@ impl<R: BufRead> LosslessDecoder<R> {
                         alphabet_size += 1 << color_cache.color_cache_bits;
                     }
                 }
-                specs.push(self.read_huffman_code_spec(alphabet_size)?);
+                specs[j] = Some(self.read_huffman_code_spec(alphabet_size)?);
             }
 
-            let use_wide_root = specs.iter().any(HuffmanCodeSpec::prefers_wide_root);
+            let use_wide_root = specs
+                .iter()
+                .filter_map(Option::as_ref)
+                .any(HuffmanCodeSpec::prefers_wide_root);
             if use_wide_root {
-                let trees: Vec<HuffmanTree11> = specs
-                    .into_iter()
-                    .map(HuffmanCodeSpec::build::<11>)
-                    .collect::<Result<_, _>>()?;
-                let group: HuffmanCodeGroup11 =
-                    trees.try_into().map_err(|_| DecodingError::HuffmanError)?;
+                let group: HuffmanCodeGroup11 = [
+                    specs[0].take().unwrap().build::<11>()?,
+                    specs[1].take().unwrap().build::<11>()?,
+                    specs[2].take().unwrap().build::<11>()?,
+                    specs[3].take().unwrap().build::<11>()?,
+                    specs[4].take().unwrap().build::<11>()?,
+                ];
                 hufftree_groups.push(HuffmanCodeGroup::Wide(group));
             } else {
-                let trees: Vec<HuffmanTree9> = specs
-                    .into_iter()
-                    .map(HuffmanCodeSpec::build::<9>)
-                    .collect::<Result<_, _>>()?;
-                let group: HuffmanCodeGroup9 =
-                    trees.try_into().map_err(|_| DecodingError::HuffmanError)?;
+                let group: HuffmanCodeGroup9 = [
+                    specs[0].take().unwrap().build::<9>()?,
+                    specs[1].take().unwrap().build::<9>()?,
+                    specs[2].take().unwrap().build::<9>()?,
+                    specs[3].take().unwrap().build::<9>()?,
+                    specs[4].take().unwrap().build::<9>()?,
+                ];
                 hufftree_groups.push(HuffmanCodeGroup::Normal(group));
             }
         }
@@ -414,14 +420,14 @@ impl<R: BufRead> LosslessDecoder<R> {
                 Ok(HuffmanCodeSpec::Two(zero_symbol, one_symbol))
             }
         } else {
-            let mut code_length_code_lengths = vec![0; CODE_LENGTH_CODES];
+            let mut code_length_code_lengths = [0u16; CODE_LENGTH_CODES];
             let num_code_lengths = 4 + self.bit_reader.read_bits::<usize>(4)?;
             for i in 0..num_code_lengths {
                 code_length_code_lengths[CODE_LENGTH_CODE_ORDER[i]] =
                     self.bit_reader.read_bits(3)?;
             }
             let code_lengths =
-                self.read_huffman_code_lengths(code_length_code_lengths, alphabet_size)?;
+                self.read_huffman_code_lengths(&code_length_code_lengths, alphabet_size)?;
             Ok(HuffmanCodeSpec::Implicit(code_lengths))
         }
     }
@@ -429,7 +435,7 @@ impl<R: BufRead> LosslessDecoder<R> {
     /// Reads huffman code lengths
     fn read_huffman_code_lengths(
         &mut self,
-        code_length_code_lengths: Vec<u16>,
+        code_length_code_lengths: &[u16],
         num_symbols: u16,
     ) -> Result<Vec<u16>, DecodingError> {
         let table = HuffmanTree9::build_implicit(code_length_code_lengths)?;
