@@ -1,0 +1,38 @@
+name: Materialize VP8L secondary reserve
+on:
+  push:
+    branches: [materialize-vp8l-secondary-reserve-current]
+    paths: [.github/workflows/materialize-vp8l-secondary-reserve-current.yml]
+permissions: { contents: write }
+jobs:
+  materialize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - name: Patch and verify
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/huffman.rs');s=p.read_text();old='''        let mut secondary_table = Vec::new();\n        if max_length > primary_table_bits {\n''';new='''        let mut secondary_table = if max_length > primary_table_bits {\n            Vec::with_capacity(128)\n        } else {\n            Vec::new()\n        };\n        if max_length > primary_table_bits {\n''';assert old in s;p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          cargo test -q
+          cargo test --release -q
+          cargo doc --no-deps -q
+          cargo clippy -- -D warnings
+          cargo fmt -- --check
+          cargo +1.80.1 build -q
+          cargo +1.80.1 build --release -q
+      - name: Commit source
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/huffman.rs
+          git commit -m 'Preallocate VP8L secondary Huffman tables'
+          git push origin HEAD:materialize-vp8l-secondary-reserve-current
