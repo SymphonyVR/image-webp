@@ -25,10 +25,36 @@ jobs:
           p=Path('/tmp/pal.py');s=p.read_text()
           s=s.replace("BASE='84d8d20753fce0a9972e8a244fdf929b5a55671c'","BASE='4f322d44fb38747659451db3d7f1dac7ff8ff21f'")
           s=s.replace("TMP=Path('/tmp/vp8l-palette-layout')","TMP=Path('/tmp/vp8l-palette-layout-v2')")
-          old='''                let dst: &mut [u8; EXP_ENTRY_SIZE] = image_data\n                    [output_offset..output_offset + EXP_ENTRY_SIZE]\n                    .try_into()\n                    .unwrap();\n                *dst = expanded_lookup_table_array[packed_index as usize];'''
-          new='''                image_data[output_offset..output_offset + EXP_ENTRY_SIZE]\n                    .copy_from_slice(&expanded_lookup_table_array[packed_index as usize]);'''
-          assert old in s
-          s=s.replace(old,new)
+          a=s.index('def patch_reverse(s):')
+          b=s.index('def patch(r,v):',a)
+          replacement=r'''def patch_reverse(s):
+ a=s.index('    let mut packed_indices_for_row: Vec<u8> = vec![0; packed_image_width_in_blocks];')
+ b=s.index('\n}\n\n//predictor functions',a)
+ new=''' + "'''" + r'''    for y_rev_idx in 0..height as usize {
+        let y = height as usize - 1 - y_rev_idx;
+        let packed_row_input_global_offset = y * input_stride_bytes_packed;
+        let output_row_global_offset = y * output_stride_bytes_expanded;
+
+        for block_index in (0..packed_image_width_in_blocks).rev() {
+            let packed_index = image_data[packed_row_input_global_offset + block_index * 4 + 1];
+            let output_offset = output_row_global_offset + block_index * EXP_ENTRY_SIZE;
+            let is_final = block_index + 1 == packed_image_width_in_blocks;
+            if is_final && final_block_expanded_size_bytes != EXP_ENTRY_SIZE {
+                image_data[output_offset..output_offset + final_block_expanded_size_bytes]
+                    .copy_from_slice(
+                        &expanded_lookup_table_array[packed_index as usize]
+                            [..final_block_expanded_size_bytes],
+                    );
+            } else {
+                image_data[output_offset..output_offset + EXP_ENTRY_SIZE]
+                    .copy_from_slice(&expanded_lookup_table_array[packed_index as usize]);
+            }
+        }
+    }
+''' + "'''" + r'''
+ return s[:a]+new+s[b:]
+'''
+          s=s[:a]+replacement+s[b:]
           s=s.replace('VP8L small-palette layout current-tree matrix','VP8L small-palette layout current-tree matrix v2')
           s=s.replace('benchmark-vp8l-palette-layout-current.md','benchmark-vp8l-palette-layout-current-v2.md')
           p.write_text(s)
