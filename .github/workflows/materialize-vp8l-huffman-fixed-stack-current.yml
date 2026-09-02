@@ -1,0 +1,37 @@
+name: Materialize composed VP8L Huffman allocation changes
+on:
+  push:
+    branches: [materialize-vp8l-huffman-fixed-stack-current]
+    paths:
+      - tools/materialize_vp8l_huffman_fixed_stack_current.py
+      - .github/workflows/materialize-vp8l-huffman-fixed-stack-current.yml
+permissions:
+  contents: write
+jobs:
+  materialize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - name: Patch and validate
+        run: |
+          python3 tools/materialize_vp8l_huffman_fixed_stack_current.py
+          cargo fmt
+          git diff --check
+          cargo test -q
+          cargo test --release -q
+          cargo doc --no-deps -q
+          cargo clippy -- -D warnings
+          cargo fmt -- --check
+          cargo +1.80.1 build -q
+          cargo +1.80.1 build --release -q
+      - name: Persist source
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/huffman.rs src/lossless/decoder/mod.rs
+          git commit -m 'Reduce VP8L Huffman setup allocations'
+          git push origin HEAD:materialize-vp8l-huffman-fixed-stack-current
