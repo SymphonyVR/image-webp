@@ -1,0 +1,44 @@
+name: Confirm VP8L palette stack precision
+on:
+  push:
+    branches: [confirm-vp8l-palette-stack-long2]
+    paths: [.github/workflows/confirm-vp8l-palette-stack-long2.yml]
+permissions: { contents: write }
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: "clippy,rustfmt"
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Run high-iteration palette confirmation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L --fail --silent --show-error https://raw.githubusercontent.com/SymphonyVR/image-webp/bench-vp8l-palette-layout-current-v2/tools/bench_vp8l_palette_layout_current_v2.py -o /tmp/confirm.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/confirm.py');s=p.read_text()
+          s=s.replace("TMP = Path('/tmp/vp8l-palette-layout-v2')","TMP = Path('/tmp/vp8l-palette-stack-long2')")
+          s=s.replace("VS = ('base', 'stack', 'reverse', 'both')","VS = ('base', 'stack')")
+          old="for name,files,iters in [('corpus',corpus,60),('palette',{v:[palette] for v in VS},4)]:"
+          new="for name,files,iters in [('palette',{v:[palette] for v in VS},24)]:"
+          assert old in s
+          s=s.replace(old,new)
+          s=s.replace('for n in range(17):','for n in range(25):')
+          s=s.replace('# VP8L small-palette layout current-tree matrix v2','# VP8L small-palette stack high-iteration confirmation')
+          s=s.replace('benchmark-vp8l-palette-layout-current-v2.md','benchmark-vp8l-palette-stack-long2.md')
+          p.write_text(s)
+          PY
+          python3 /tmp/confirm.py
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-palette-stack-long2.md
+          git commit -m 'Record VP8L palette-stack precision confirmation'
+          git push origin HEAD:confirm-vp8l-palette-stack-long2
