@@ -1,0 +1,68 @@
+name: Analyze VP8L predictor modes v2
+on:
+  push:
+    branches: [analyze-vp8l-predictor-modes-current-v2]
+    paths: [.github/workflows/analyze-vp8l-predictor-modes-current-v2.yml]
+permissions: { contents: write }
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Instrument predictor modes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/reverse_transform.rs');s=p.read_text()
+          old='''    for y in 1..height {\n        for block_x in 0..block_xsize {'''
+          new='''    let mut mode_pixels = [0usize; 14];\n    for y in 1..height {\n        for block_x in 0..block_xsize {'''
+          assert old in s;s=s.replace(old,new,1)
+          old='''            let end_index = (y * width + ((block_x + 1) << size_bits).min(width)) * 4;\n\n            match predictor {'''
+          new='''            let end_index = (y * width + ((block_x + 1) << size_bits).min(width)) * 4;\n            if usize::from(predictor) < mode_pixels.len() {\n                mode_pixels[usize::from(predictor)] += (end_index - start_index) / 4;\n            }\n\n            match predictor {'''
+          assert old in s;s=s.replace(old,new,1)
+          old='''    }\n\n    Ok(())\n}\npub fn apply_predictor_transform_0'''
+          new='''    }\n    eprintln!("PRED_MODES {:?}", mode_pixels);\n\n    Ok(())\n}\npub fn apply_predictor_transform_0'''
+          assert old in s;s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          mkdir -p examples
+          cat >examples/pred_mode_probe.rs <<'RS'
+          use image_webp::WebPDecoder;use std::io::Cursor;fn main(){for p in std::env::args().skip(1){eprintln!("FILE {p}");let d=std::fs::read(&p).unwrap();let mut q=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();}}
+          RS
+          cargo build --release --example pred_mode_probe -q
+          python3 - <<'PY'
+          from pathlib import Path
+          def chunks(p):
+              d=p.read_bytes();o=[];q=12
+              if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return o
+              while q+8<=len(d):t=d[q:q+4];n=int.from_bytes(d[q+4:q+8],'little');o.append(t);q+=8+n+(n&1)
+              return o
+          ps=[p for p in sorted(Path('tests/images').rglob('*.webp')) if b'VP8L' in chunks(p) and b'ANIM' not in chunks(p)]
+          Path('/tmp/files.txt').write_text('\n'.join(map(str,ps)))
+          PY
+          mapfile -t FILES </tmp/files.txt
+          target/release/examples/pred_mode_probe "${FILES[@]}" 2>/tmp/probe.txt
+      - name: Persist analysis
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ast,pathlib
+          rows=[];cur=None;tot=[0]*14
+          for l in pathlib.Path('/tmp/probe.txt').read_text().splitlines():
+              if l.startswith('FILE '):cur=l[5:]
+              elif l.startswith('PRED_MODES '):
+                  a=ast.literal_eval(l[11:]);rows.append((cur,a));tot=[x+y for x,y in zip(tot,a)]
+          n=sum(tot);out=['# VP8L predictor mode pixel distribution','', '- baseline: `4f322d44fb38747659451db3d7f1dac7ff8ff21f`',f'- interior pixels observed: {n}','','| mode | pixels | share |','|---:|---:|---:|']
+          for i,x in enumerate(tot):out.append(f'| {i} | {x} | {x/n:.1%} |' if n else f'| {i} | {x} | - |')
+          out+=['','| file | mode counts |','|---|---|']+[f'| {f} | `{a}` |' for f,a in rows]
+          pathlib.Path('analysis-vp8l-predictor-modes-current-v2.md').write_text('\n'.join(out)+'\n')
+          PY
+          cat analysis-vp8l-predictor-modes-current-v2.md
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add analysis-vp8l-predictor-modes-current-v2.md
+          git commit -m 'Record VP8L predictor mode distribution'
+          git push origin HEAD:analyze-vp8l-predictor-modes-current-v2
