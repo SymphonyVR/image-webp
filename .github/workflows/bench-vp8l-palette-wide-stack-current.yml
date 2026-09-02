@@ -1,0 +1,89 @@
+name: Benchmark VP8L wide-palette stack table
+on:
+  push:
+    branches: [bench-vp8l-palette-wide-stack-current]
+    paths: [.github/workflows/bench-vp8l-palette-wide-stack-current.yml]
+permissions: { contents: write }
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: "clippy,rustfmt"
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Build and benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=4f322d44fb38747659451db3d7f1dac7ff8ff21f
+          git worktree add --detach /tmp/base "$BASE"
+          git worktree add --detach /tmp/cand "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/cand/src/lossless/decoder/reverse_transform.rs');s=p.read_text()
+          old='''        // convert the table of colors into a Vec of color values that can be directly indexed\n        let mut table: Vec<[u8; 4]> = table_data\n            .chunks_exact(4)\n            // convince the compiler that each chunk is 4 bytes long, important for optimizations in the loop below\n            .map(|c| TryInto::<[u8; 4]>::try_into(c).unwrap())\n            .collect();\n        // pad the table to 256 values if it's smaller than that so we could index into it by u8 without bounds checks\n        // also required for correctness: WebP spec requires out-of-bounds indices to be treated as [0,0,0,0]\n        table.resize(256, [0; 4]);\n        // convince the compiler that the length of the table is 256 to avoid bounds checks in the loop below\n        let table: &[[u8; 4]; 256] = table.as_slice().try_into().unwrap();\n'''
+          new='''        // Keep the complete 8-bit index space in a fixed table. This avoids a heap\n        // allocation while preserving zero entries for out-of-range palette indices.\n        let mut table = [[0u8; 4]; 256];\n        for (dst, src) in table.iter_mut().zip(table_data.chunks_exact(4)) {\n            dst.copy_from_slice(src);\n        }\n'''
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+          PY
+          cd /tmp/cand
+          cargo fmt
+          cargo test -q
+          cargo test --release -q
+          cargo doc --no-deps -q
+          cargo clippy -- -D warnings
+          cargo fmt -- --check
+          cargo +1.80.1 build -q
+          cargo +1.80.1 build --release -q
+          cat >/tmp/b.rs <<'RS'
+          use image_webp::WebPDecoder;use std::{hint::black_box,io::Cursor,time::Instant};fn d(x:&[u8])->Vec<u8>{let mut q=WebPDecoder::new(Cursor::new(x)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();b}fn h(x:&[u8])->u64{d(x).iter().fold(0xcbf29ce484222325u64,|a,&z|(a^z as u64).wrapping_mul(1099511628211))}fn main(){let mut a=std::env::args().skip(1);let m=a.next().unwrap();let n:usize=a.next().unwrap().parse().unwrap();let ps:Vec<_>=a.collect();let ds:Vec<Vec<u8>>=ps.iter().map(std::fs::read).collect::<Result<_,_>>().unwrap();if m=="h"{for x in&ds{println!("{:016x}",h(x))}return}for x in&ds{black_box(d(x));}let t=Instant::now();for _ in 0..n{for x in&ds{black_box(d(x));}}println!("{:.3}",t.elapsed().as_secs_f64()*1e6/(n*ds.len())as f64)}
+          RS
+          for d in /tmp/base /tmp/cand;do mkdir -p "$d/examples";cp /tmp/b.rs "$d/examples/pwide.rs";(cd "$d"&&RUSTFLAGS='-C target-cpu=native' cargo build --release --example pwide -q);done
+          python3 - <<'PY' >/tmp/files.txt
+          from pathlib import Path
+          def ch(p):
+            d=p.read_bytes();o=[];q=12
+            if len(d)<12 or d[:4]!=b'RIFF'or d[8:12]!=b'WEBP':return o
+            while q+8<=len(d):t=d[q:q+4];n=int.from_bytes(d[q+4:q+8],'little');o.append(t);q+=8+n+(n&1)
+            return o
+          for p in sorted(Path('/tmp/base/tests/images').rglob('*.webp')):
+            c=ch(p)
+            if b'VP8L' in c and b'ANIM' not in c:print(p)
+          PY
+          python3 - <<'PY'
+          w=h=2048
+          colors=[((i*37)&255,(i*73)&255,(i*109)&255) for i in range(64)]
+          with open('/tmp/palette64.ppm','wb') as f:
+            f.write(f'P6\n{w} {h}\n255\n'.encode());r=bytearray(w*3)
+            for y in range(h):
+              for x in range(w):
+                c=colors[((x>>4)+3*(y>>4))&63];i=x*3;r[i:i+3]=bytes(c)
+              f.write(r)
+          PY
+          cwebp -quiet -lossless -z 9 /tmp/palette64.ppm -o /tmp/palette64.webp
+          mapfile -t BF </tmp/files.txt;CF=();for p in "${BF[@]}";do CF+=("${p/\/tmp\/base/\/tmp\/cand}");done;B=/tmp/base/target/release/examples/pwide;C=/tmp/cand/target/release/examples/pwide
+          diff -u <($B h 1 "${BF[@]}" /tmp/palette64.webp) <($C h 1 "${CF[@]}" /tmp/palette64.webp)
+          : >/tmp/r.tsv
+          for r in {1..17};do if ((r%2));then O='base cand';else O='cand base';fi;for v in $O;do if [[ $v == base ]];then X=$B;F=("${BF[@]}");else X=$C;F=("${CF[@]}");fi;u=$(taskset -c 0 "$X" t 70 "${F[@]}");printf 'corpus\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;u=$(taskset -c 0 "$X" t 5 /tmp/palette64.webp);printf 'palette64\t%s\t%s\t%s\n' "$r" "$v" "$u">>/tmp/r.tsv;done;done
+          cd "$GITHUB_WORKSPACE"
+          BASE="$BASE" python3 - <<'PY'
+          import csv,statistics,os,subprocess;from pathlib import Path
+          rr={}
+          for w,r,v,x in csv.reader(open('/tmp/r.tsv'),delimiter='\t'):rr.setdefault((w,int(r)),{})[v]=float(x)
+          cpu=subprocess.check_output("lscpu|sed -n 's/^Model name:[[:space:]]*//p'",shell=True,text=True).strip()
+          L=['# VP8L wide-palette fixed-table benchmark','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{cpu}`','- fixed [[u8;4];256] palette table; hashes + full verification passed','','| workload | paired median | positive | range |','|---|---:|---:|---:|']
+          for w in ('corpus','palette64'):
+            q=[z['base']/z['cand'] for (ww,_),z in sorted(rr.items()) if ww==w];L.append(f'| {w} | **{statistics.median(q):.4f}x** | {sum(x>1 for x in q)}/{len(q)} | {min(q):.4f}–{max(q):.4f}x |')
+          Path('benchmark-vp8l-palette-wide-stack-current.md').write_text('\n'.join(L)+'\n');print('\n'.join(L))
+          PY
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-palette-wide-stack-current.md
+          git commit -m 'Record VP8L wide-palette fixed-table benchmark'
+          git push origin HEAD:bench-vp8l-palette-wide-stack-current
