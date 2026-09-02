@@ -1,0 +1,44 @@
+name: Confirm VP8L entropy block bound
+on:
+  push:
+    branches: [confirm-vp8l-block-bound-current]
+    paths: [.github/workflows/confirm-vp8l-block-bound-current.yml]
+permissions: { contents: write }
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: "clippy,rustfmt"
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Run current-tree confirmation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L --fail --silent --show-error https://raw.githubusercontent.com/SymphonyVR/image-webp/bench-vp8l-huffman-repeat-fill-current/tools/bench_vp8l_huffman_repeat_fill_current.py -o /tmp/b.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/b.py');s=p.read_text()
+          s=s.replace("BASE='84d8d20753fce0a9972e8a244fdf929b5a55671c'","BASE='4f322d44fb38747659451db3d7f1dac7ff8ff21f'")
+          s=s.replace("TMP=Path('/tmp/vp8l-huffman-repeat-fill')","TMP=Path('/tmp/vp8l-block-bound-confirm')")
+          a=s.index('def patch(r):');b=s.index('def inv(',a)
+          new='''def patch(r):\n p=r/'src/lossless/decoder/mod.rs';s=p.read_text();old='while *index < num_values && *index < block_end {';new='while *index < block_end {';assert s.count(old)==1;p.write_text(s.replace(old,new,1))\n'''
+          s=s[:a]+new+s[b:]
+          s=s.replace('range(17)','range(25)')
+          s=s.replace('VP8L Huffman repeat-fill current-tree benchmark','VP8L block-bound current-tree long confirmation')
+          s=s.replace('replaces scalar repeat-code writes with slice fill; full verification passed','removes redundant image-end comparison from entropy block loop; full verification passed')
+          s=s.replace('benchmark-vp8l-huffman-repeat-fill-current.md','benchmark-vp8l-block-bound-confirm.md')
+          p.write_text(s)
+          PY
+          python3 /tmp/b.py
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-block-bound-confirm.md
+          git commit -m 'Record VP8L block-bound confirmation'
+          git push origin HEAD:confirm-vp8l-block-bound-current
