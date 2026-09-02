@@ -1,0 +1,40 @@
+name: Confirm VP8L Huffman symbol stack
+on:
+  push:
+    branches: [confirm-vp8l-huffman-symbol-stack-current]
+    paths: [.github/workflows/confirm-vp8l-huffman-symbol-stack-current.yml]
+permissions: { contents: write }
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: "clippy,rustfmt"
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Run 25-round current-tree confirmation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L --fail --silent --show-error https://raw.githubusercontent.com/SymphonyVR/image-webp/bench-vp8l-huffman-symbol-stack-current/tools/bench_vp8l_huffman_symbol_stack_current.py -o /tmp/confirm.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/confirm.py');s=p.read_text()
+          s=s.replace("TMP=Path('/tmp/vp8l-huffman-symbol-stack')","TMP=Path('/tmp/vp8l-huffman-symbol-stack-confirm')")
+          s=s.replace("VS=('base','s256','s512')","VS=('base','s512')")
+          s=s.replace('for n in range(13):','for n in range(25):')
+          s=s.replace('# VP8L Huffman symbol-stack current-tree matrix','# VP8L Huffman symbol-stack current-tree long confirmation')
+          s=s.replace('benchmark-vp8l-huffman-symbol-stack-current.md','benchmark-vp8l-huffman-symbol-stack-confirm.md')
+          p.write_text(s)
+          PY
+          python3 /tmp/confirm.py
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-huffman-symbol-stack-confirm.md
+          git commit -m 'Record VP8L Huffman symbol-stack confirmation'
+          git push origin HEAD:confirm-vp8l-huffman-symbol-stack-current
