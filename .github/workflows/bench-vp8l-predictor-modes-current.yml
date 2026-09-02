@@ -1,0 +1,57 @@
+name: Benchmark individual packed VP8L predictor modes
+on:
+  push:
+    branches: [bench-vp8l-predictor-modes-current]
+    paths:
+      - .github/workflows/bench-vp8l-predictor-modes-current.yml
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Build per-mode harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L --fail --silent --show-error \
+            https://raw.githubusercontent.com/SymphonyVR/image-webp/bench-vp8l-packed-predictors-current/tools/bench_vp8l_packed_predictors_current.py \
+            -o /tmp/modes.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/modes.py')
+          s=p.read_text()
+          s=s.replace("BASE='0881ec1a66f09e11b766c309cf6e651077775bd9'", "BASE='c52de05b9c902a6743941b998c96d5e4d3ba3609'")
+          s=s.replace("VS=('base','direct','avg','both')", "VS=('base','p3','p4','p5','p6','p7','p8','p9','p10')")
+          a=s.index('def patch(r,v):')
+          b=s.index('def inv(',a)
+          new=r'''def patch(r,v):
+ p=r/'src/lossless/decoder/reverse_transform.rs';s=p.read_text();marker='''fn average2_autovec(a: u8, b: u8) -> u8 {\n    (a & b) + ((a ^ b) >> 1)\n}\n''';assert marker in s
+ helpers=HELPERS.replace('#[inline(always)] fn average2_u32','#[allow(dead_code)]\n#[inline(always)] fn average2_u32')
+ s=s.replace(marker,marker+helpers,1)
+ n=int(v[1:])
+ a=s.index(f'pub fn apply_predictor_transform_{n}(');b=s.index(f'pub fn apply_predictor_transform_{n+1}(',a);s=s[:a]+BODIES[n]+s[b:]
+ p.write_text(s)
+'''
+          s=s[:a]+new+s[b:]
+          s=s.replace('for n in range(17):','for n in range(13):')
+          s=s.replace('benchmark-vp8l-packed-predictors-current.md','benchmark-vp8l-predictor-modes-current.md')
+          s=s.replace('# Packed VP8L predictors current-final matrix','# Individual packed VP8L predictor modes current-final matrix')
+          p.write_text(s)
+          PY
+      - run: python3 /tmp/modes.py
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-predictor-modes-current.md
+          git commit -m 'Record current predictor mode matrix'
+          git push origin HEAD:bench-vp8l-predictor-modes-current
