@@ -19,7 +19,8 @@ jobs:
           components: clippy,rustfmt
       - run: rustup toolchain install 1.80.1 --profile minimal
       - run: sudo apt-get update -qq && sudo apt-get install -y webp
-      - run: python3 tools/bench_vp8l_huffman_dense_sort_current.py
+      - name: Run dense symbol-sort benchmark
+        run: python3 tools/bench_vp8l_huffman_dense_sort_current.py
       - name: Persist result
         run: |
           git config user.name github-actions[bot]
