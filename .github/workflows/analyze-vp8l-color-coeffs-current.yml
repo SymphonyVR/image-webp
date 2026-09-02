@@ -1,0 +1,71 @@
+name: Analyze VP8L color coefficients
+on:
+  push:
+    branches: [analyze-vp8l-color-coeffs-current]
+    paths: [.github/workflows/analyze-vp8l-color-coeffs-current.yml]
+permissions: { contents: write }
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Instrument and decode lossless corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/reverse_transform.rs');s=p.read_text()
+          old='''    for (y, row) in image_data.chunks_exact_mut(width * 4).enumerate() {\n        let row_transform_data_start = (y >> size_bits) * block_xsize * 4;'''
+          new='''    let mut stat_pixels = 0usize;\n    let mut stat_rtb0 = 0usize;\n    let mut stat_gtb0 = 0usize;\n    let mut stat_gtr0 = 0usize;\n    let mut stat_all0 = 0usize;\n    for (y, row) in image_data.chunks_exact_mut(width * 4).enumerate() {\n        let row_transform_data_start = (y >> size_bits) * block_xsize * 4;'''
+          assert old in s;s=s.replace(old,new,1)
+          old='''            let red_to_blue = transform[0];\n            let green_to_blue = transform[1];\n            let green_to_red = transform[2];\n\n            for pixel in block.chunks_exact_mut(4) {'''
+          new='''            let red_to_blue = transform[0];\n            let green_to_blue = transform[1];\n            let green_to_red = transform[2];\n            let n = block.len() / 4;\n            stat_pixels += n;\n            stat_rtb0 += n * usize::from(red_to_blue == 0);\n            stat_gtb0 += n * usize::from(green_to_blue == 0);\n            stat_gtr0 += n * usize::from(green_to_red == 0);\n            stat_all0 += n * usize::from(red_to_blue == 0 && green_to_blue == 0 && green_to_red == 0);\n\n            for pixel in block.chunks_exact_mut(4) {'''
+          assert old in s;s=s.replace(old,new,1)
+          needle='''    }\n}\n\npub(crate) fn apply_subtract_green_transform'''
+          repl='''    }\n    eprintln!("COLOR_COEFF pixels={} rtb0={} gtb0={} gtr0={} all0={}", stat_pixels, stat_rtb0, stat_gtb0, stat_gtr0, stat_all0);\n}\n\npub(crate) fn apply_subtract_green_transform'''
+          assert needle in s;s=s.replace(needle,repl,1)
+          p.write_text(s)
+          PY
+          mkdir -p examples
+          cat >examples/color_coeff_probe.rs <<'RS'
+          use image_webp::WebPDecoder;use std::io::Cursor;fn main(){for p in std::env::args().skip(1){eprintln!("FILE {p}");let d=std::fs::read(&p).unwrap();let mut q=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;q.output_buffer_size().unwrap()];q.read_image(&mut b).unwrap();}}
+          RS
+          cargo build --release --example color_coeff_probe -q
+          python3 - <<'PY'
+          from pathlib import Path
+          def chunks(p):
+              d=p.read_bytes();o=[];q=12
+              if len(d)<12 or d[:4]!=b'RIFF' or d[8:12]!=b'WEBP':return o
+              while q+8<=len(d):
+                  t=d[q:q+4];n=int.from_bytes(d[q+4:q+8],'little');o.append(t);q+=8+n+(n&1)
+              return o
+          ps=[p for p in sorted(Path('tests/images').rglob('*.webp')) if b'VP8L' in chunks(p) and b'ANIM' not in chunks(p)]
+          Path('/tmp/files.txt').write_text('\n'.join(map(str,ps)))
+          PY
+          mapfile -t FILES </tmp/files.txt
+          target/release/examples/color_coeff_probe "${FILES[@]}" 2>/tmp/probe.txt
+      - name: Persist analysis
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re,pathlib
+          lines=pathlib.Path('/tmp/probe.txt').read_text().splitlines();cur=None;rows=[];tot=[0]*5
+          for l in lines:
+              if l.startswith('FILE '):cur=l[5:]
+              m=re.match(r'COLOR_COEFF pixels=(\d+) rtb0=(\d+) gtb0=(\d+) gtr0=(\d+) all0=(\d+)',l)
+              if m:
+                  z=list(map(int,m.groups()));rows.append((cur,*z));tot=[a+b for a,b in zip(tot,z)]
+          p,rtb,gtb,gtr,all0=tot
+          out=['# VP8L color coefficient sparsity','', '- baseline: `4f322d44fb38747659451db3d7f1dac7ff8ff21f`',f'- transform pixels observed: {p}',f'- red→blue zero: {rtb}/{p} ({rtb/p:.1%})' if p else '- none',f'- green→blue zero: {gtb}/{p} ({gtb/p:.1%})' if p else '- none',f'- green→red zero: {gtr}/{p} ({gtr/p:.1%})' if p else '- none',f'- all three zero: {all0}/{p} ({all0/p:.1%})' if p else '- none','','| file | pixels | rtb=0 | gtb=0 | gtr=0 | all=0 |','|---|---:|---:|---:|---:|---:|']
+          for r in rows:out.append(f'| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |')
+          pathlib.Path('analysis-vp8l-color-coeffs-current.md').write_text('\n'.join(out)+'\n')
+          PY
+          cat analysis-vp8l-color-coeffs-current.md
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add analysis-vp8l-color-coeffs-current.md
+          git commit -m 'Record VP8L color coefficient sparsity'
+          git push origin HEAD:analyze-vp8l-color-coeffs-current
