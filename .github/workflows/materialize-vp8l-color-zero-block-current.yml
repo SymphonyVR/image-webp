@@ -1,0 +1,47 @@
+name: Materialize VP8L zero-block source candidate
+on:
+  push:
+    branches: [materialize-vp8l-color-zero-block-current]
+    paths: [.github/workflows/materialize-vp8l-color-zero-block-current.yml]
+permissions: { contents: write }
+jobs:
+  materialize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Create clean source-only candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE=4f322d44fb38747659451db3d7f1dac7ff8ff21f
+          git checkout --detach "$BASE"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/reverse_transform.rs');s=p.read_text()
+          old='''            let red_to_blue = transform[0];
+            let green_to_blue = transform[1];
+            let green_to_red = transform[2];
+
+            for pixel in block.chunks_exact_mut(4) {
+                inverse_color_pixel_packed(pixel, red_to_blue, green_to_blue, green_to_red);
+            }'''
+          new='''            let red_to_blue = transform[0];
+            let green_to_blue = transform[1];
+            let green_to_red = transform[2];
+
+            if red_to_blue == 0 && green_to_blue == 0 && green_to_red == 0 {
+                continue;
+            }
+            for pixel in block.chunks_exact_mut(4) {
+                inverse_color_pixel_packed(pixel, red_to_blue, green_to_blue, green_to_red);
+            }'''
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git config user.name Symphony
+          git config user.email 47229536+SymphonyVR@users.noreply.github.com
+          git add src/lossless/decoder/reverse_transform.rs
+          git commit -m 'Skip zero-coefficient VP8L color blocks'
+          git push --force origin HEAD:candidate-vp8l-color-zero-block-current
