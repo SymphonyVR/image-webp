@@ -1,0 +1,48 @@
+name: Profile current VP8L tree v5
+on:
+  push:
+    branches: [profile-vp8l-current-v5]
+    paths: [.github/workflows/profile-vp8l-current-v5.yml]
+permissions: { contents: write }
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Profile current composed source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "BASE=4f322d44fb38747659451db3d7f1dac7ff8ff21f" >> "$GITHUB_ENV"
+          echo "CPU=$(lscpu|sed -n 's/^Model name:[[:space:]]*//p')" >> "$GITHUB_ENV"
+          sudo apt-get update -qq
+          sudo apt-get install -y valgrind >/dev/null
+          mkdir -p examples
+          cat >examples/profile_vp8l_v5.rs <<'RS'
+          use image_webp::WebPDecoder;
+          use std::{hint::black_box,io::Cursor};
+          fn main(){let p=std::env::args().nth(1).unwrap();let d=std::fs::read(p).unwrap();let mut x=WebPDecoder::new(Cursor::new(d)).unwrap();let mut b=vec![0;x.output_buffer_size().unwrap()];x.read_image(&mut b).unwrap();black_box(b[b.len()/2]);}
+          RS
+          CARGO_PROFILE_RELEASE_DEBUG=2 RUSTFLAGS='-C force-frame-pointers=yes' cargo build --release --example profile_vp8l_v5
+          INPUT=tests/images/gallery2/3_webp_ll.webp
+          taskset -c 0 valgrind --tool=callgrind --collect-jumps=yes --callgrind-out-file=/tmp/v.callgrind target/release/examples/profile_vp8l_v5 "$INPUT"
+          callgrind_annotate --inclusive=no --threshold=0.01 --auto=yes /tmp/v.callgrind >/tmp/annotated.txt
+      - name: Persist profile
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,pathlib
+          text=pathlib.Path('/tmp/annotated.txt').read_text(errors='replace')
+          keys=('image_webp::','src/lossless/','read_symbol','decode_image','ColorCache','color_cache','copy_within','predictor','insert','consume','fill','build_implicit','read_huffman','color_transform','subtract_green','secondary_table','sorted_symbols')
+          lines=[line for line in text.splitlines() if 'PROGRAM TOTALS' in line or any(k in line for k in keys)]
+          out=['# Current VP8L symbolic Callgrind profile v5','',f'- baseline: `{os.environ["BASE"]}`',f'- CPU: `{os.environ["CPU"]}`','- fixture: `tests/images/gallery2/3_webp_ll.webp` (800x600)','- release + full debuginfo, CPU 0','','```text']+lines[:420]+['```','']
+          pathlib.Path('profile-vp8l-current-v5.md').write_text('\n'.join(out))
+          PY
+          cat profile-vp8l-current-v5.md
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add profile-vp8l-current-v5.md
+          git commit -m 'Record current VP8L profile v5'
+          git push origin HEAD:profile-vp8l-current-v5
