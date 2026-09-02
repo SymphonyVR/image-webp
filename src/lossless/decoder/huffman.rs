@@ -45,7 +45,8 @@ impl<const TABLE_BITS: u8> HuffmanTree<TABLE_BITS> {
 
     /// Builds a tree implicitly, just from code lengths
     #[allow(clippy::needless_range_loop)]
-    pub(crate) fn build_implicit(code_lengths: Vec<u16>) -> Result<Self, DecodingError> {
+    pub(crate) fn build_implicit(code_lengths: impl AsRef<[u16]>) -> Result<Self, DecodingError> {
+        let code_lengths = code_lengths.as_ref();
         // Count symbols and build histogram
         let mut num_symbols = 0;
         let mut histogram = [0; MAX_ALLOWED_CODE_LENGTH + 1];
