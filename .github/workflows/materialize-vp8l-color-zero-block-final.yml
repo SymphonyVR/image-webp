@@ -17,25 +17,15 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           p=Path('src/lossless/decoder/reverse_transform.rs');s=p.read_text()
-          old='''            let red_to_blue = transform[0];
-            let green_to_blue = transform[1];
-            let green_to_red = transform[2];
-
-            for pixel in block.chunks_exact_mut(4) {
-                inverse_color_pixel_packed(pixel, red_to_blue, green_to_blue, green_to_red);
-            }'''
-          new='''            let red_to_blue = transform[0];
-            let green_to_blue = transform[1];
-            let green_to_red = transform[2];
+          marker='            let green_to_red = transform[2];\n'
+          pos=s.index(marker, s.index('pub(crate) fn apply_color_transform(')) + len(marker)
+          guard='''
 
             if red_to_blue == 0 && green_to_blue == 0 && green_to_red == 0 {
                 continue;
-            }
-            for pixel in block.chunks_exact_mut(4) {
-                inverse_color_pixel_packed(pixel, red_to_blue, green_to_blue, green_to_red);
             }'''
-          assert old in s
-          p.write_text(s.replace(old,new,1))
+          assert 'if red_to_blue == 0 && green_to_blue == 0 && green_to_red == 0' not in s
+          p.write_text(s[:pos]+guard+s[pos:])
           PY
           cargo fmt
           git diff --check
