@@ -403,6 +403,9 @@ pub(crate) fn apply_color_transform(
             let green_to_blue = transform[1];
             let green_to_red = transform[2];
 
+            if red_to_blue == 0 && green_to_blue == 0 && green_to_red == 0 {
+                continue;
+            }
             for pixel in block.chunks_exact_mut(4) {
                 inverse_color_pixel_packed(pixel, red_to_blue, green_to_blue, green_to_red);
             }
