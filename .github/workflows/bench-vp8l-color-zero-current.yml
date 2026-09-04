@@ -1,0 +1,26 @@
+name: Benchmark VP8L color zero coefficients current
+on:
+  push:
+    branches: [bench-vp8l-color-zero-current]
+    paths:
+      - tools/bench_vp8l_color_zero_current.py
+      - .github/workflows/bench-vp8l-color-zero-current.yml
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: python3 tools/bench_vp8l_color_zero_current.py
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-color-zero-current.md
+          git commit -m 'Record color zero-coefficient matrix'
+          git push origin HEAD:bench-vp8l-color-zero-current
