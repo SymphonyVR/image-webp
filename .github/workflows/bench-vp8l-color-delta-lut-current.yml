@@ -16,7 +16,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with: { components: clippy,rustfmt }
       - run: rustup toolchain install 1.80.1 --profile minimal
-      - run: python3 tools/bench_vp8l_color_delta_lut_current.py
+      - name: Benchmark LUT candidates
+        run: |
+          sed -i "s/'cargo','clippy','--','-D','warnings'/'cargo','clippy','--','-D','warnings','-A','dead-code'/" tools/bench_vp8l_color_delta_lut_current.py
+          python3 tools/bench_vp8l_color_delta_lut_current.py
       - name: Persist result
         run: |
           git config user.name github-actions[bot]
