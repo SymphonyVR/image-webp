@@ -1,0 +1,30 @@
+name: Confirm batched VP8L literal Huffman current
+on:
+  push:
+    branches: [confirm-vp8l-literal-batch-current]
+    paths: [.github/workflows/confirm-vp8l-literal-batch-current.yml]
+permissions: { contents: write }
+jobs:
+  confirm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Run 25-round confirmation
+        run: |
+          sed -i "s/VS=('base','rgb','rgba')/VS=('base','rgb')/" tools/bench_vp8l_literal_batch_current.py
+          sed -i 's/range(17)/range(25)/g' tools/bench_vp8l_literal_batch_current.py
+          sed -i 's/# VP8L batched literal Huffman current-tree matrix/# VP8L batched literal Huffman long confirmation/' tools/bench_vp8l_literal_batch_current.py
+          python3 tools/bench_vp8l_literal_batch_current.py
+          mv benchmark-vp8l-literal-batch-current.md benchmark-vp8l-literal-batch-confirm.md
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-literal-batch-confirm.md
+          git commit -m 'Record batched literal Huffman long confirmation'
+          git push origin HEAD:confirm-vp8l-literal-batch-current
