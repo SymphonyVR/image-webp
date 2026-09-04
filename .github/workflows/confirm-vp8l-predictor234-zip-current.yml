@@ -1,0 +1,30 @@
+name: Confirm VP8L predictor zip current
+on:
+  push:
+    branches: [confirm-vp8l-predictor234-zip-current]
+    paths: [.github/workflows/confirm-vp8l-predictor234-zip-current.yml]
+permissions: { contents: write }
+jobs:
+  confirm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - run: sudo apt-get update -qq && sudo apt-get install -y webp
+      - name: Run 25-round confirmation
+        run: |
+          sed -i "s/VS=('base','p2','p3','p4','all')/VS=('base','p4','all')/" tools/bench_vp8l_predictor234_zip_current.py
+          sed -i 's/range(17)/range(25)/g' tools/bench_vp8l_predictor234_zip_current.py
+          sed -i "s/# VP8L predictor 2\/3\/4 disjoint-zip current-tree matrix/# VP8L predictor 2\/3\/4 disjoint-zip long confirmation/" tools/bench_vp8l_predictor234_zip_current.py
+          python3 tools/bench_vp8l_predictor234_zip_current.py
+          mv benchmark-vp8l-predictor234-zip-current.md benchmark-vp8l-predictor234-zip-confirm.md
+      - name: Persist result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmark-vp8l-predictor234-zip-confirm.md
+          git commit -m 'Record predictor zip long confirmation'
+          git push origin HEAD:confirm-vp8l-predictor234-zip-current
