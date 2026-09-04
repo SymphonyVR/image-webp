@@ -1,0 +1,57 @@
+name: Materialize verified VP8L zero color block optimization
+on:
+  push:
+    branches: [materialize-vp8l-color-zero-block-final]
+    paths: [.github/workflows/materialize-vp8l-color-zero-block-final.yml]
+permissions: { contents: write }
+jobs:
+  materialize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt }
+      - run: rustup toolchain install 1.80.1 --profile minimal
+      - name: Patch source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lossless/decoder/reverse_transform.rs');s=p.read_text()
+          old='''            let red_to_blue = transform[0];
+            let green_to_blue = transform[1];
+            let green_to_red = transform[2];
+
+            for pixel in block.chunks_exact_mut(4) {
+                inverse_color_pixel_packed(pixel, red_to_blue, green_to_blue, green_to_red);
+            }'''
+          new='''            let red_to_blue = transform[0];
+            let green_to_blue = transform[1];
+            let green_to_red = transform[2];
+
+            if red_to_blue == 0 && green_to_blue == 0 && green_to_red == 0 {
+                continue;
+            }
+            for pixel in block.chunks_exact_mut(4) {
+                inverse_color_pixel_packed(pixel, red_to_blue, green_to_blue, green_to_red);
+            }'''
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt
+          git diff --check
+      - name: Validate
+        run: |
+          cargo test -q
+          cargo test --release -q
+          cargo doc --no-deps -q
+          cargo clippy -- -D warnings
+          cargo fmt -- --check
+          cargo +1.80.1 build -q
+          cargo +1.80.1 build --release -q
+      - name: Persist source
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lossless/decoder/reverse_transform.rs
+          git commit -m 'Skip zero-coefficient VP8L color blocks'
+          git push origin HEAD:materialize-vp8l-color-zero-block-final
